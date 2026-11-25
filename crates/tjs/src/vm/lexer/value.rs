@@ -23,17 +23,6 @@ pub(crate) enum Value {
     Octet { offset: u32, len: u32 },
 }
 
-impl Value {
-    /// The value with its sign flipped.
-    pub fn negated(self) -> Self {
-        match self {
-            Self::Integer(value) => Self::Integer(value.wrapping_neg()),
-            Self::Real(value) => Self::Real(-value),
-            other => other,
-        }
-    }
-}
-
 /// A value the analyser produced, borrowed from its buffers.
 ///
 /// A script string is not a sequence of bytes and not a sequence of

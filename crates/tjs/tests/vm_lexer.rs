@@ -186,8 +186,11 @@ fn a_number_with_a_fraction_is_a_real() {
 
 #[test]
 fn an_exponent_without_digits_is_the_number_before_it() {
-    // reference/cpp/core/tjs2/tjsLex.cpp:404-430 — the exponent is read
-    // while it has digits, so `1e` is the number `1`.
+    // reference/cpp/core/tjs2/tjsConfig.cpp:801-804 — a mark with no digit
+    // after it leaves the conversion at its `done` label, past the exponent
+    // and past the scale the decimal point contributes, and that scale is
+    // computed from the point alone (`:810-842`). The digits are the value:
+    // `1e` is 1, and `1.5e` is 15.
     assert_eq!(value("1e"), Value::Real(1.0));
 }
 

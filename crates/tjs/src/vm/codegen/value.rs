@@ -16,9 +16,8 @@
 //! it meets one.
 
 use std::fmt;
-use std::num::IntErrorKind;
 
-use crate::vm::lexer::engine_real;
+use crate::vm::runtime::number;
 
 /// The identity of an object.
 ///
@@ -513,126 +512,19 @@ enum Number {
     Real(f64),
 }
 
-/// The number the text holds, when the text holds a number.
+/// The number the text is read as, when it begins with a number.
 ///
-/// `TJSParseNumber`: an optional sign, then `true`, `false`, `NaN`,
-/// `Infinity`, or a number in the base its prefix names.
+/// The rule is the runtime's: an optional sign with the spaces after
+/// it, then a base its prefix names or a decimal number, and the text
+/// is read as a prefix, so what follows the number belongs to nobody.
+/// A text that begins with no number at all has no value here.
 fn parse_number(text: &str) -> Option<Number> {
-    let mut rest = text;
-    let mut negative = false;
-    if let Some(first) = rest.chars().next()
-        && (first == '+' || first == '-')
-    {
-        negative = first == '-';
-        rest = &rest[first.len_utf8()..];
-        rest = rest.trim_start();
-    }
-    let value = parse_number_body(rest)?;
-    Some(if negative {
-        match value {
-            Number::Integer(number) => Number::Integer(number.wrapping_neg()),
-            Number::Real(number) => Number::Real(-number),
-        }
-    } else {
-        value
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let parsed = number::parse(&units).ok()?;
+    Some(match parsed.number {
+        number::Number::Integer(value) => Number::Integer(value),
+        number::Number::Real(value) => Number::Real(value),
     })
-}
-
-/// The number the text holds, without a sign.
-fn parse_number_body(text: &str) -> Option<Number> {
-    // the words that are read as numbers
-    if starts_with_word(text, "true") {
-        return Some(Number::Integer(1));
-    }
-    if starts_with_word(text, "false") {
-        return Some(Number::Integer(0));
-    }
-    if starts_with_word(text, "NaN") {
-        return Some(Number::Real(f64::NAN));
-    }
-    if starts_with_word(text, "Infinity") {
-        return Some(Number::Real(f64::INFINITY));
-    }
-
-    // the numbers a prefix names
-    for (prefix, base) in [
-        ("0x", 16),
-        ("0X", 16),
-        ("0b", 2),
-        ("0B", 2),
-        ("0o", 8),
-        ("0O", 8),
-    ] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            let digits: String = rest
-                .chars()
-                .take_while(char::is_ascii_alphanumeric)
-                .collect();
-            return i64::from_str_radix(&digits, base).ok().map(Number::Integer);
-        }
-    }
-
-    // the octal number a leading zero names
-    if text.len() > 1 && text.starts_with('0') {
-        let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.len() > 1 && digits.chars().all(|c| ('0'..='7').contains(&c)) {
-            return i64::from_str_radix(&digits, 8).ok().map(Number::Integer);
-        }
-    }
-
-    // the decimal number: the longest prefix that reads as one
-    let bytes = text.as_bytes();
-    let mut end = 0;
-    let mut digits = false;
-    let mut point = false;
-    let mut exponent = false;
-    while end < bytes.len() {
-        let byte = bytes[end];
-        if byte.is_ascii_digit() {
-            digits = true;
-            end += 1;
-        } else if byte == b'.' && !point && !exponent {
-            point = true;
-            end += 1;
-        } else if (byte == b'e' || byte == b'E') && digits && !exponent {
-            exponent = true;
-            end += 1;
-            if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
-                end += 1;
-            }
-        } else {
-            break;
-        }
-    }
-    if !digits {
-        return None;
-    }
-    let number = &text[..end];
-    if point || exponent {
-        Some(Number::Real(engine_real(number)))
-    } else {
-        // the text is a run of digits, so the only failure an integer
-        // parse can have is an overflow, and a literal too large for an
-        // integer is a real
-        match number.parse::<i64>() {
-            Ok(value) => Some(Number::Integer(value)),
-            Err(error) => match error.kind() {
-                IntErrorKind::PosOverflow | IntErrorKind::NegOverflow => {
-                    Some(Number::Real(engine_real(number)))
-                }
-                _ => None,
-            },
-        }
-    }
-}
-
-/// Whether the text starts with the word.
-///
-/// The word is compared without cutting the text at a byte that may not
-/// be the end of a character.
-fn starts_with_word(text: &str, word: &str) -> bool {
-    text.get(..word.len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(word))
 }
 
 /// The text of a real number.

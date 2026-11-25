@@ -30,8 +30,8 @@ pub use value::ValueRef;
 
 pub(crate) use value::Value;
 
+use crate::vm::runtime::string::TjsString;
 use literal::StringEnd;
-pub(crate) use number::engine_real;
 
 /// The code unit that stands in for the carriage return of a newline pair.
 ///
@@ -123,28 +123,6 @@ impl Cursor {
             .position(|&unit| !is_space(unit) && unit != SKIP_CODE)
             .unwrap_or(units.len());
         position + length
-    }
-
-    /// The word at the current position, if it is there.
-    ///
-    /// The word is matched exactly, and it must not run into a name: the
-    /// word `in` is not the word `instanceof`.
-    pub fn match_word(&mut self, word: &str) -> bool {
-        let start = self.position;
-        for expected in word.bytes() {
-            if self.current() != Some(u16::from(expected)) {
-                self.move_to(start);
-                return false;
-            }
-            self.advance();
-        }
-        if let Some(unit) = self.current()
-            && (is_letter(unit) || unit == u16::from(b'_'))
-        {
-            self.move_to(start);
-            return false;
-        }
-        true
     }
 
     /// Step over a comment, if there is one at the cursor.
@@ -305,15 +283,6 @@ impl Digits {
                 0x31 => Some(1),
                 _ => None,
             },
-        }
-    }
-
-    /// The number of bits one digit of this set carries.
-    pub fn bits(self) -> u32 {
-        match self {
-            Self::Decimal | Self::Hexadecimal => 4,
-            Self::Octal => 3,
-            Self::Binary => 1,
         }
     }
 }
@@ -1034,7 +1003,7 @@ impl Lexer {
     fn invalid_character(&self, character: u16) -> LexError {
         LexError::InvalidCharacter {
             position: self.cursor.position(),
-            character: error::escape_characters(&[character]),
+            character: TjsString::from(vec![character]).escape_c().to_string(),
         }
     }
 
