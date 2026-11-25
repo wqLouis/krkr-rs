@@ -580,6 +580,11 @@ fn main() {
     // The hash table's order-list helper: it is only called from the crate's
     // tests, so the linker leaves it out of every other binary.
     sources.push(manifest_dir.join("cpp/hash_order_test.cpp"));
+    // The value layer's measurement shim: every entry is called from the
+    // crate's ignored bench, so the linker leaves it out of every binary that
+    // does not name one. It compiles at the same optimisation level as the
+    // tree it times, which is what makes the comparison one at a time.
+    sources.push(manifest_dir.join("cpp/value_bench.cpp"));
 
     let failed = std::sync::Arc::new(AtomicUsize::new(0));
     let lock = std::sync::Arc::new(Mutex::new(()));

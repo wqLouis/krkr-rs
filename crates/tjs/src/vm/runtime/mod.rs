@@ -26,13 +26,27 @@
 //! and the variant are next, and the interpreter after them, because it
 //! owns the runtime's globals and executes the object model's dispatch.
 //!
+//! # The measurement
+//!
+//! Each part of the layer is measured against the vendored primitive it
+//! stands for, over the same corpus and in the same build: the `bench`
+//! module (test only, and ignored) prints one line per primitive with both
+//! sides' nanoseconds per operation and the ratio. It is a measurement, not
+//! a test, and its documentation carries the command and the corpus.
+//!
 //! # The unsafe code
 //!
 //! This module denies `unsafe`: the value layer is ordinary safe Rust, and
 //! a part that cannot be written without `unsafe` is a part whose shape is
-//! wrong.
+//! wrong. The measurement is no exception: `bench` calls the C entry points
+//! through the safe wrapper at the crate root, which is where the one
+//! `unsafe` block and its safety note live, so this module and everything
+//! under it stay free of `unsafe`.
 #![deny(unsafe_code)]
 
 pub mod hash;
 pub mod number;
 pub mod string;
+
+#[cfg(test)]
+mod bench;

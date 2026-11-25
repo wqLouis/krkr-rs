@@ -854,6 +854,53 @@ int tjs2_register_native_builtin_static_members(
  * Pair with tjs2_free_string. */
 void *tjs2_malloc(size_t size);
 
+/* ------------------------------------------------------------------------ */
+/* The value layer's measurement                                             */
+/* ------------------------------------------------------------------------ */
+/*
+ * One entry per primitive of the Rust value layer and of the vendored tree it
+ * replaces. Each entry times its primitive over a corpus it builds before the
+ * timed region, answers the elapsed nanoseconds of `iterations` operations
+ * (the table entries take the number of keys instead), and writes the
+ * checksum that loop fed through `out_checksum`. The checksum is the only
+ * thing that keeps the optimiser from deleting the work, and comparing the
+ * two sides' checksums proves they did the same work.
+ *
+ * These entries exist for the measurement only (the ignored bench in
+ * crates/tjs/src/vm/runtime/bench.rs); no engine path calls them.
+ */
+
+/* Times the concatenation of two texts. */
+long long tjs2_bench_string_concat(long long iterations,
+                                   unsigned long long *out_checksum);
+/* Times the construction of a text from a literal. */
+long long tjs2_bench_string_construct(long long iterations,
+                                      unsigned long long *out_checksum);
+/* Times the ordinal comparison of two texts out of the member-name corpus. */
+long long tjs2_bench_string_compare(long long iterations,
+                                    unsigned long long *out_checksum);
+/* Times the member hash over the member-name corpus. */
+long long tjs2_bench_string_hash(long long iterations,
+                                 unsigned long long *out_checksum);
+/* Times the escape rule over a text with control units and quotes. */
+long long tjs2_bench_string_escape(long long iterations,
+                                   unsigned long long *out_checksum);
+/* Times the text-to-number rule over the number corpus. */
+long long tjs2_bench_number_parse(long long iterations,
+                                  unsigned long long *out_checksum);
+/* Times the number-to-text rule over the format corpus. */
+long long tjs2_bench_number_format(long long iterations,
+                                   unsigned long long *out_checksum);
+/* Times `count` insertions into an empty member table. */
+long long tjs2_bench_table_insert(long long count,
+                                  unsigned long long *out_checksum);
+/* Times `count` lookups in a filled member table. */
+long long tjs2_bench_table_find(long long count,
+                                unsigned long long *out_checksum);
+/* Times `count` removals from a filled member table. */
+long long tjs2_bench_table_remove(long long count,
+                                  unsigned long long *out_checksum);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

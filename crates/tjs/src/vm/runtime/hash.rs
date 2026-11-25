@@ -47,21 +47,23 @@
 //!
 //! # The bookkeeping
 //!
-//! A link — a bucket head, a chain step, an order step — is an index into one
-//! arena of entries, and the arena owns every key and every value exactly
-//! once. There is no raw pointer in the table and no allocation per link. A
-//! removed entry's slot is reused by a later insertion; the slot index is not
-//! an identity and nothing outside the table sees it.
+//! A link — a bucket head, a chain step, an order step — is a 32-bit index
+//! into one arena of entries, and the arena is dense: every slot holds a live
+//! entry, so a link can only name an entry that exists. There is no raw
+//! pointer in the table, no allocation per link and no empty slot to test for.
+//! A removal moves the arena's last entry into the freed slot and points every
+//! link that named the last entry at the slot it now occupies; the slot an
+//! entry lives in is not an identity and nothing outside the table sees it.
 //!
 //! # Why there is no order check
 //!
 //! The order list cannot fall out of step with the live entries, so there is
 //! no check that walks the whole table and no repair that rebuilds the list. A
 //! link is an index into the arena, so it names an entry that exists or it is
-//! absent; the two ends of the list are fields of the table; and the links, the
-//! two ends and the entry count change in the same two operations, one that
-//! links a new entry at the front and one that unlinks an entry. A walk would
-//! only re-derive what the type already maintains.
+//! absent; the two ends of the list are fields of the table; and the links and
+//! the two ends change in the same two operations, one that links a new entry
+//! at the front and one that unlinks an entry, while the count is the arena's
+//! own length. A walk would only re-derive what the type already maintains.
 
 /// The number of buckets the table files keys into.
 pub const BUCKET_COUNT: usize = 64;
@@ -101,29 +103,34 @@ impl TableKey for u64 {
     }
 }
 
+/// The link value that names no entry.
+///
+/// A link is an index into the arena, so the greatest index is the end of every
+/// chain and of the order list.
+const NO_ENTRY: u32 = u32::MAX;
+
 /// One stored key and value, with the links that place it in the table.
+///
+/// The fields a chain step reads — the hash, the next chain link and the key —
+/// are declared first and together, so a walk over a long bucket chain reads
+/// one part of an entry.
 struct Entry<K, V> {
     /// The hash the key was filed under, kept so a probe can reject a
     /// candidate without comparing the keys.
     hash: u32,
+    /// The next entry of this bucket's chain, or `NO_ENTRY` at the end of it.
+    chain: u32,
+    /// The entry before it in the chain, or `NO_ENTRY` when the bucket's own
+    /// link points at it.
+    chain_prev: u32,
     /// The stored key.
     key: K,
     /// The stored value.
     value: V,
-    /// The next entry of this bucket's chain, if any.
-    chain: Option<usize>,
-    /// The next entry in the order list, if any, towards the back.
-    order_next: Option<usize>,
-    /// The previous entry in the order list, if any, towards the front.
-    order_prev: Option<usize>,
-}
-
-/// The link inside a bucket chain that points at an entry.
-enum ChainLink {
-    /// The bucket's own first link.
-    Bucket(usize),
-    /// The chain step of the entry that precedes it.
-    Entry(usize),
+    /// The next entry in the order list, or `NO_ENTRY` towards the back.
+    order_next: u32,
+    /// The previous entry in the order list, or `NO_ENTRY` towards the front.
+    order_prev: u32,
 }
 
 /// A table of keys and values, searched by hash and enumerated in the order
@@ -133,18 +140,15 @@ enum ChainLink {
 /// documentation for the enumeration order, the bucket policy and the
 /// ownership of the entries.
 pub struct HashTable<K, V> {
-    /// One slot per bucket: the index of the bucket's first entry.
-    buckets: Vec<Option<usize>>,
-    /// Every entry, live or not; a removed entry leaves an empty slot.
-    entries: Vec<Option<Entry<K, V>>>,
-    /// The indices of the empty slots, most recently freed last.
-    free: Vec<usize>,
-    /// The index of the entry the enumeration starts at.
-    order_first: Option<usize>,
-    /// The index of the entry the enumeration ends at.
-    order_last: Option<usize>,
-    /// The number of live entries.
-    len: usize,
+    /// One slot per bucket: the index of the bucket's first entry, or
+    /// `NO_ENTRY` when the bucket is empty.
+    buckets: [u32; BUCKET_COUNT],
+    /// Every live entry; the arena has no empty slot.
+    entries: Vec<Entry<K, V>>,
+    /// The index of the entry the enumeration starts at, or `NO_ENTRY`.
+    order_first: u32,
+    /// The index of the entry the enumeration ends at, or `NO_ENTRY`.
+    order_last: u32,
 }
 
 /// The bucket a key with `hash` is filed in.
@@ -156,33 +160,29 @@ impl<K, V> HashTable<K, V> {
     /// Creates an empty table.
     pub fn new() -> Self {
         Self {
-            buckets: vec![None; BUCKET_COUNT],
+            buckets: [NO_ENTRY; BUCKET_COUNT],
             entries: Vec::new(),
-            free: Vec::new(),
-            order_first: None,
-            order_last: None,
-            len: 0,
+            order_first: NO_ENTRY,
+            order_last: NO_ENTRY,
         }
     }
 
     /// The number of entries in the table.
     pub fn len(&self) -> usize {
-        self.len
+        self.entries.len()
     }
 
     /// Whether the table holds no entry.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.entries.is_empty()
     }
 
     /// Removes every entry, keeping the bucket array at its size.
     pub fn clear(&mut self) {
-        self.buckets.fill(None);
+        self.buckets = [NO_ENTRY; BUCKET_COUNT];
         self.entries.clear();
-        self.free.clear();
-        self.order_first = None;
-        self.order_last = None;
-        self.len = 0;
+        self.order_first = NO_ENTRY;
+        self.order_last = NO_ENTRY;
     }
 
     /// The live entries, most recently written first.
@@ -194,94 +194,134 @@ impl<K, V> HashTable<K, V> {
     }
 
     /// The entry at `index`.
-    fn entry(&self, index: usize) -> &Entry<K, V> {
-        self.entries[index]
-            .as_ref()
-            .expect("a table link names a live entry")
+    ///
+    /// A link that points past the end of the arena is a broken table, and the
+    /// arena's own bounds check is the one test a link pays.
+    fn entry(&self, index: u32) -> &Entry<K, V> {
+        &self.entries[index as usize]
     }
 
     /// The entry at `index` for change.
-    fn entry_mut(&mut self, index: usize) -> &mut Entry<K, V> {
-        self.entries[index]
-            .as_mut()
-            .expect("a table link names a live entry")
+    fn entry_mut(&mut self, index: u32) -> &mut Entry<K, V> {
+        &mut self.entries[index as usize]
     }
 
     /// Links the entry at `index` at the front of the enumeration order.
-    fn link_at_front(&mut self, index: usize) {
+    fn link_at_front(&mut self, index: u32) {
         let first = self.order_first;
-        let entry = self.entry_mut(index);
-        entry.order_prev = None;
-        entry.order_next = first;
-        match first {
-            Some(first) => self.entry_mut(first).order_prev = Some(index),
-            None => self.order_last = Some(index),
+        {
+            let entry = self.entry_mut(index);
+            entry.order_prev = NO_ENTRY;
+            entry.order_next = first;
         }
-        self.order_first = Some(index);
+        if first != NO_ENTRY {
+            self.entry_mut(first).order_prev = index;
+        } else {
+            self.order_last = index;
+        }
+        self.order_first = index;
     }
 
     /// Unlinks the entry at `index` from the enumeration order.
-    fn unlink_from_order(&mut self, index: usize) {
+    fn unlink_from_order(&mut self, index: u32) {
         let entry = self.entry(index);
         let previous = entry.order_prev;
         let next = entry.order_next;
-        match previous {
-            Some(previous) => self.entry_mut(previous).order_next = next,
-            None => self.order_first = next,
+        if previous != NO_ENTRY {
+            self.entry_mut(previous).order_next = next;
+        } else {
+            self.order_first = next;
         }
-        match next {
-            Some(next) => self.entry_mut(next).order_prev = previous,
-            None => self.order_last = previous,
+        if next != NO_ENTRY {
+            self.entry_mut(next).order_prev = previous;
+        } else {
+            self.order_last = previous;
         }
     }
 
     /// Moves the entry at `index` to the front of the enumeration order.
-    fn move_to_front(&mut self, index: usize) {
-        if self.order_first == Some(index) {
+    fn move_to_front(&mut self, index: u32) {
+        if self.order_first == index {
             return;
         }
         self.unlink_from_order(index);
         self.link_at_front(index);
     }
 
-    /// The link that points at the entry at `index` from its bucket chain.
-    fn chain_link_to(&self, index: usize, hash: u32) -> Option<ChainLink> {
-        let bucket = bucket_of(hash);
-        let mut previous: Option<usize> = None;
-        let mut link = self.buckets[bucket];
-        while let Some(current) = link {
-            if current == index {
-                return Some(match previous {
-                    Some(previous) => ChainLink::Entry(previous),
-                    None => ChainLink::Bucket(bucket),
-                });
-            }
-            previous = Some(current);
-            link = self.entry(current).chain;
-        }
-        None
-    }
-
     /// Removes the entry at `index` and answers its key and value.
     ///
-    /// The entry is unlinked from its bucket chain and from the enumeration
-    /// order, and its slot is freed for a later insertion.
-    fn take_entry(&mut self, index: usize, hash: u32) -> (K, V) {
-        let link = self
-            .chain_link_to(index, hash)
-            .expect("a live entry is in the chain of its bucket");
-        let chain = self.entry(index).chain;
-        match link {
-            ChainLink::Bucket(bucket) => self.buckets[bucket] = chain,
-            ChainLink::Entry(previous) => self.entry_mut(previous).chain = chain,
+    /// The entry leaves its bucket chain and the enumeration order, and the
+    /// arena's last entry takes the freed slot, so the arena stays dense and no
+    /// link ever names an empty slot.
+    fn take_entry(&mut self, index: u32) -> (K, V) {
+        let (hash, chain, chain_prev, order_prev, order_next) = {
+            let entry = self.entry(index);
+            (
+                entry.hash,
+                entry.chain,
+                entry.chain_prev,
+                entry.order_prev,
+                entry.order_next,
+            )
+        };
+        if chain_prev != NO_ENTRY {
+            self.entry_mut(chain_prev).chain = chain;
+        } else {
+            self.buckets[bucket_of(hash)] = chain;
         }
-        self.unlink_from_order(index);
-        self.len -= 1;
-        let entry = self.entries[index]
-            .take()
-            .expect("a table link names a live entry");
-        self.free.push(index);
-        (entry.key, entry.value)
+        if chain != NO_ENTRY {
+            self.entry_mut(chain).chain_prev = chain_prev;
+        }
+        if order_prev != NO_ENTRY {
+            self.entry_mut(order_prev).order_next = order_next;
+        } else {
+            self.order_first = order_next;
+        }
+        if order_next != NO_ENTRY {
+            self.entry_mut(order_next).order_prev = order_prev;
+        } else {
+            self.order_last = order_prev;
+        }
+        let last = u32::try_from(self.entries.len() - 1).expect("an entry index fits a u32");
+        if index != last {
+            self.relocate(last, index);
+        }
+        let removed = self.entries.swap_remove(index as usize);
+        (removed.key, removed.value)
+    }
+
+    /// Moves the entry at `from` to the slot at `to`, relinking every link that
+    /// named it: its bucket or chain predecessor, its chain successor and its
+    /// two order-list neighbours.
+    fn relocate(&mut self, from: u32, to: u32) {
+        let (hash, chain, chain_prev, order_prev, order_next) = {
+            let entry = self.entry(from);
+            (
+                entry.hash,
+                entry.chain,
+                entry.chain_prev,
+                entry.order_prev,
+                entry.order_next,
+            )
+        };
+        if chain_prev != NO_ENTRY {
+            self.entry_mut(chain_prev).chain = to;
+        } else {
+            self.buckets[bucket_of(hash)] = to;
+        }
+        if chain != NO_ENTRY {
+            self.entry_mut(chain).chain_prev = to;
+        }
+        if order_prev != NO_ENTRY {
+            self.entry_mut(order_prev).order_next = to;
+        } else {
+            self.order_first = to;
+        }
+        if order_next != NO_ENTRY {
+            self.entry_mut(order_next).order_prev = to;
+        } else {
+            self.order_last = to;
+        }
     }
 }
 
@@ -299,28 +339,22 @@ impl<K: TableKey, V> HashTable<K, V> {
         }
 
         let bucket = bucket_of(hash);
-        let entry = Entry {
+        let head = self.buckets[bucket];
+        let index = u32::try_from(self.entries.len()).expect("an entry index fits a u32");
+        self.entries.push(Entry {
             hash,
+            chain: head,
+            chain_prev: NO_ENTRY,
             key,
             value,
-            chain: self.buckets[bucket],
-            order_next: None,
-            order_prev: None,
-        };
-        let index = match self.free.pop() {
-            Some(index) => {
-                self.entries[index] = Some(entry);
-                index
-            }
-            None => {
-                let index = self.entries.len();
-                self.entries.push(Some(entry));
-                index
-            }
-        };
-        self.buckets[bucket] = Some(index);
+            order_next: NO_ENTRY,
+            order_prev: NO_ENTRY,
+        });
+        if head != NO_ENTRY {
+            self.entry_mut(head).chain_prev = index;
+        }
+        self.buckets[bucket] = index;
         self.link_at_front(index);
-        self.len += 1;
         None
     }
 
@@ -352,7 +386,7 @@ impl<K: TableKey, V> HashTable<K, V> {
         let Some(index) = self.find(key, hash) else {
             return false;
         };
-        self.take_entry(index, hash);
+        self.take_entry(index);
         true
     }
 
@@ -361,21 +395,28 @@ impl<K: TableKey, V> HashTable<K, V> {
     /// The oldest entry is the back of the enumeration order. `None` is
     /// returned when the table is empty.
     pub fn chop_last(&mut self) -> Option<(K, V)> {
-        let index = self.order_last?;
-        let hash = self.entry(index).hash;
-        Some(self.take_entry(index, hash))
+        let index = self.order_last;
+        if index == NO_ENTRY {
+            return None;
+        }
+        Some(self.take_entry(index))
     }
 
     /// The index of the entry stored under `key` with `hash`, if the key is
     /// present.
-    fn find(&self, key: &K, hash: u32) -> Option<usize> {
-        let mut link = self.buckets[bucket_of(hash)];
-        while let Some(index) = link {
+    ///
+    /// A step loads one entry and compares its hash. The arena holds no empty
+    /// slot, so the load is the whole test: a link that points into the arena
+    /// names a live entry, and a link that points past it is caught by the
+    /// arena's own bounds check.
+    fn find(&self, key: &K, hash: u32) -> Option<u32> {
+        let mut index = self.buckets[bucket_of(hash)];
+        while index != NO_ENTRY {
             let entry = self.entry(index);
             if entry.hash == hash && &entry.key == key {
                 return Some(index);
             }
-            link = entry.chain;
+            index = entry.chain;
         }
         None
     }
@@ -391,16 +432,18 @@ impl<K, V> Default for HashTable<K, V> {
 pub struct Iter<'a, K, V> {
     /// The table the entries belong to.
     table: &'a HashTable<K, V>,
-    /// The index of the entry the next call yields.
-    next: Option<usize>,
+    /// The index of the entry the next call yields, or `NO_ENTRY`.
+    next: u32,
 }
 
 impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let index = self.next?;
-        let entry = self.table.entry(index);
+        if self.next == NO_ENTRY {
+            return None;
+        }
+        let entry = self.table.entry(self.next);
         self.next = entry.order_next;
         Some((&entry.key, &entry.value))
     }

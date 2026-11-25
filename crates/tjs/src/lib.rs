@@ -732,6 +732,54 @@ unsafe extern "C" {
     /// repaired it. Returns an empty string when the bookkeeping is
     /// consistent, and a message naming the broken invariant otherwise.
     fn tjs2_test_hash_order_repair() -> *const c_char;
+
+    // The value layer's measurement shim. One entry per
+    // primitive: each times `iterations` operations over a corpus it builds
+    // before the timed region, writes the checksum the loop fed through
+    // `out_checksum`, and answers the elapsed nanoseconds (`long long`). The
+    // table entries take the number of keys instead of an iteration count.
+    // Measurement only: the ignored bench
+    // (`vm::runtime::bench`) is the only caller.
+    /// Times the concatenation of two texts.
+    fn tjs2_bench_string_concat(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times the construction of a text from a literal.
+    fn tjs2_bench_string_construct(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times the ordinal comparison of two texts out of the member-name
+    /// corpus.
+    fn tjs2_bench_string_compare(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times the member hash over the member-name corpus.
+    fn tjs2_bench_string_hash(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times the escape rule over a text with control units and quotes.
+    fn tjs2_bench_string_escape(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times the text-to-number rule over the number corpus.
+    fn tjs2_bench_number_parse(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times the number-to-text rule over the format corpus.
+    fn tjs2_bench_number_format(iterations: i64, out_checksum: *mut u64) -> i64;
+    /// Times `count` insertions into an empty member table.
+    fn tjs2_bench_table_insert(count: i64, out_checksum: *mut u64) -> i64;
+    /// Times `count` lookups in a filled member table.
+    fn tjs2_bench_table_find(count: i64, out_checksum: *mut u64) -> i64;
+    /// Times `count` removals from a filled member table.
+    fn tjs2_bench_table_remove(count: i64, out_checksum: *mut u64) -> i64;
+}
+
+/// Runs one measurement entry of the value layer and answers its pair: the
+/// elapsed nanoseconds and the checksum the entry fed.
+///
+/// Test-only: the value layer's ignored bench is the only caller, and the
+/// entries exist for that measurement alone. Keeping the call here is what
+/// lets the bench module stay under the runtime's `deny(unsafe_code)`.
+#[cfg(test)]
+pub(crate) fn run_bench_entry(
+    entry: unsafe extern "C" fn(i64, *mut u64) -> i64,
+    operations: i64,
+) -> (i64, u64) {
+    let mut checksum: u64 = 0;
+    // SAFETY: `entry` is one of the measurement entries declared above; each
+    // writes the checksum through the pointer (valid for the duration of the
+    // call) and answers its elapsed nanoseconds.
+    let ns = unsafe { entry(operations, &mut checksum) };
+    (ns, checksum)
 }
 
 /// Opaque per-engine id of a retained script value (mirror of the C
