@@ -1731,17 +1731,23 @@ deleted, and each needs its own oracle first:
   surface is six calls — `onig_new`, `onig_search`, `onig_region_new`/`free`/
   `clear`, `onig_error_code_to_str`, `onig_free`, `onig_end` — and it is
   reached from `String.replace`, the `RegExp` object and every pattern a game's
-  scripts carry. Pure-Rust candidates exist and are evaluated in this order:
-  `rusty_expressions` (states match-equivalence to Oniguruma 6.9.10, and
-  per-regex UTF-16 encodings, which is what a `tjs_char` is), `ferroni`
-  (Oniguruma in pure Rust, driven by TextMate grammars, 2.x), `fancy-regex`
-  (Oniguruma-compatible mode, but no callouts, absent operator or
-  subexpression calls). The binding crates — `onig`, `onig_sys`,
-  `oniguruma` — are not candidates: they keep the C library. The proof is the
-  number rule's: inventory the patterns the games ship (needs the game
-  directory), record the engine's own match results over them, compare, and
-  only then delete `tjsRegExp.cpp` and `libonig`. An adapter seam
-  (`compile`/`search`/`error`) keeps the choice replaceable.
+  scripts carry. The candidates are chosen by **usage and maintenance, not by
+  the claim on the tin**: `regex` (1.45e9 downloads, rust-lang, linear-time
+  matching on every input) for everything it can express, `fancy-regex`
+  (3.25e8 downloads, since 2017, layered on `regex-automata`) for the
+  backreference and lookaround patterns `regex` cannot take. The Oniguruma
+  clones are **rejected on that bar**, however close their stated
+  compatibility: `ferroni` has 60 000 downloads and `rusty_expressions` 1 300,
+  both first published this year, against a game's save path. The binding
+  crates — `onig`, `onig_sys`, `oniguruma` — are not candidates either: they
+  keep the C library. What the two chosen engines do not implement is stated
+  rather than discovered: callouts, the absent operator, subexpression calls
+  and `\G`. The proof is the number rule's: inventory the patterns the games
+  ship (needs the game directory), record the engine's own match results over
+  them, compare, and only then delete `tjsRegExp.cpp` and `libonig`. An adapter
+  seam (`compile`/`search`/`error`) keeps the choice replaceable, and if the
+  inventory turns up a pattern that needs an Oniguruma-only construct, that is
+  a recorded gap with its pattern, not a silent difference.
 * **the date grammar and its word map** (`bison/tjsdate.y` and
   `script/create_world_map.py`). The whole unit is 800 lines plus a 99-line
   generator; a ported parser retires bison, a Rust build step retires python3,
