@@ -1685,6 +1685,46 @@ page.
   target directory on a local filesystem.
 
 
+### 12.1 The runtime half in Rust: what is left, and the order
+
+The front end is Rust (`crates/tjs/src/vm/{lexer,parser,codegen}`) and the
+vendored analyser, grammar and generator are gone. Everything behind the one
+compile seam is still the vendored tree — roughly 32 000 lines across 73
+files, plus the C ABI shim (`cpp/tjs2_abi.cpp`, 3 917 lines) and
+`cpp/streams.cpp`. The runtime is built bottom up in
+`crates/tjs/src/vm/runtime/`, one part per change, and the part a change
+replaces is deleted from the vendored tree in that same change:
+
+| part | the Rust module | what it deletes |
+|---|---|---|
+| R1 the value layer — **landed** | `runtime/{string,number,hash}.rs` | `tjsVariantString`, `tjsNumberParse`, the table in `tjsHashSearch.h` |
+| R2 the variant | `runtime/variant.rs`: the tagged value, the closure, the coercions | `tjsVariant.{h,cpp}` |
+| R3 the object model | `runtime/object.rs`: the custom object, its member map, the dispatch | `tjsObject.{h,cpp}`, `tjsNative.{h,cpp}` |
+| R4 the containers | `runtime/{array,dictionary,octet}.rs` | `tjsArray`, `tjsDictionary`, `tjsOctPack` |
+| R5 the interpreter | `runtime/exec.rs`: the contexts, the code stream, the globals | `tjsInterCodeExec.cpp`, `tjsInterCodeContext.*`, `tjs.cpp` |
+| R6 the builtin natives | `runtime/natives/`: `Math`, `Date`, `RandomGenerator`, `RegExp`, `String`, `Exception`, `Config` | `tjsMath`, `tjsDate`, `tjsRandomGenerator`, `tjsRegExp`, `tjsString`, `tjsConfig`, `tjsError` |
+| R7 the seam goes | `crates/vm` drives the Rust engine directly | `cpp/tjs2_abi.{h,cpp}`, the `extern` block in `crates/tjs/src/lib.rs`, `build.rs`'s zig/bison/python/oniguruma chain, `streams.cpp` |
+
+**The member map is not the keyed table.** `tTJSCustomObject` does not store
+its members in `tTJSHashTable`: it keeps a power-of-two symbol array with its
+own `RebuildHash` (`tjsObject.cpp:325-340`, `:649-756`) and enumerates it in
+bucket order (`:1094-1127`), which is the order a dictionary's structured
+save follows (`tjsDictionary.cpp:433`, `:499`, `:508`). `runtime::hash`
+enumerates newest-first insertion order (`tjsHashSearch.h:507-518`), which is
+what the message map and the script cache rely on (`tjsMessage.cpp:64`). R3
+therefore ports the member map from the object itself, and R1's table serves
+the message map, the script cache and the values map (`tjs.cpp:88`).
+
+**A part is done on two measurements, not one.** Its behaviour is proven by
+reference-cited unit tests for the rules, and — for everything a script can
+observe — by a differential harness that drives the vendored engine through
+`Tjs2Engine::eval` and records its answers, the way the corpus digest records
+what the front end produced; the recorded answers are the permanent net R7's
+deletion is checked against. Its **speed** is proven by the A/B harness of
+`docs/perf.md` §6.5: the same inputs, the same work, the same optimisation
+level, the load average reported with the numbers. A part merely as fast as the
+original is not done.
+
 ## 13. GPU memory
 
 Open: the config-cycle growth is explained; the fixed descriptor pool is not.

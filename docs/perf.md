@@ -1130,6 +1130,88 @@ slightly less work there.
 
 ---
 
+### 6.5 The runtime's value layer (R1) — the harness lives in the tree
+
+**Status: landed.** `crates/tjs/src/vm/runtime/`; the page is
+[`code/tjs/runtime.md`](code/tjs/runtime.md).
+
+**Method.** Unlike §6.1–§6.4, this harness is in the tree and reproducible:
+`crates/tjs/src/vm/runtime/bench.rs` (the Rust twin) against
+`crates/tjs/cpp/value_bench.cpp` (a shim over the vendored primitives), one
+`extern "C"` entry per primitive, the same inputs on both sides, and each loop
+feeding a checksum written through an out-parameter so neither side can be
+optimised into measuring nothing. The corpora are built outside the timed
+region, one warm-up pass per side is discarded, and the best of three measured
+passes is reported. Both sides run at `-O2`: the vendored tree's `TJS2_OPT`
+default, against `CARGO_PROFILE_RELEASE_OPT_LEVEL=2`. The table prints the two
+sides' checksums beside the times, because a row whose sides disagree is not a
+measurement — every row below says `same`.
+
+```sh
+CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \\
+    cargo test -p tjs --release --lib vm::runtime::bench -- --ignored --nocapture
+```
+
+**The machine.** Load 1.04 with a runqueue of 0 and 82 % idle on 12 CPUs. The
+load average on this host carries desktop and mount traffic, so the runqueue and
+the idle share are reported with it: what a single-threaded benchmark needs is
+an idle CPU, not a small load figure. Between runs the vendored column moves by
+up to about 10 % in absolute nanoseconds while a ratio holds to about 2 %, so a
+ratio within a few percent of 1.0 is a wash and not a win.
+
+| primitive | vendored ns | Rust ns | ratio |
+|---|---|---|---|
+| string concatenation | 60.5 | 22.0 | 0.364 |
+| string construction | 27.3 | 18.9 | 0.694 |
+| string comparison | 5.51 | 3.39 | 0.616 |
+| member hash | 7.73 | 7.33 | 0.948 |
+| string escape | 431.8 | 112.6 | 0.261 |
+| text to number | 101.7 | 33.7 | 0.331 |
+| number to text | 90.0 | 83.9 | 0.932 |
+| table insert, 16 384 keys | 1 050.2 | 726.9 | 0.692 |
+| table find, 16 384 keys | 1 017.3 | 780.0 | 0.767 |
+| table remove, 16 384 keys | 1 059.1 | 734.9 | 0.694 |
+| table insert, 512 keys | 45.1 | 24.2 | 0.537 |
+| table find, 512 keys | 23.3 | 21.2 | 0.908 |
+| table remove, 512 keys | 44.9 | 25.6 | 0.571 |
+
+**What each row is.** The table's two sizes are the two shapes it is used in: a
+big class's member map (512 keys, chains of about 8) and a dictionary (16 384
+keys, chains of about 256 — the original's fixed 64 buckets, reproduced as they
+are, so the walk dominates both sides equally). Concatenation and construction
+are one allocation each now: the original's short string comes out of a pool
+slot, which is the one place it has a structural advantage and the port still
+wins. Comparison lowers to a vectorised slice compare where the original walks
+unit by unit. **The member hash row is the control** — the same algorithm on
+both sides, so it must come out near 1.0, and it decides the member enumeration
+order a script can see. Escaping writes into one sized buffer where the original
+appends per unit. Reading a number beats the original's per-unit string build.
+Writing a real goes through the shortest round-trip form when that form is
+exactly the fifteen-digit rounding (see the module page), and through the exact
+big-integer path when it is a sixteen- or seventeen-digit value or a subnormal.
+
+**What the rows do not say.**
+
+* The checksum reads are cheaper on this side — an out-of-line `GetLen()`
+  against an inlined slice length, a couple of nanoseconds *against* the
+  vendored side. A ratio within a few percent of 1.0 is therefore a wash.
+* The table's allocation policy is measured as it is: the original allocates an
+  element per insertion, this side keeps an arena and reuses its slots. That is
+  a design difference, not a harness artefact, and it is one of the reasons the
+  table rows moved.
+* Both sides chain a hit in the same bucket, compare the same hash first and
+  walk the same average chain length; the order within a chain differs and is
+  not observable.
+* `TJS2_OPT=-O3` is the second opinion, holding both sides at one level rather
+  than at each side's own shipped level.
+* **These are primitives, not a frame.** The value layer is the first part of
+  the runtime column and nothing has been cut over to it yet, so this is not a
+  claim that a game runs faster. It is the claim the column's bar makes: each
+  primitive that will be used is faster than the one it replaces, on the same
+  work, measured rather than assumed.
+
+---
+
 ## 7. The render path
 
 ### 7.1 The dirty region: a pixel write must not re-upload the whole image
