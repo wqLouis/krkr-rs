@@ -24,6 +24,9 @@ unwinding into C++.
 | the code generator | `crates/tjs/src/vm/codegen/` — the node tree to bytecode |
 | the image | `crates/tjs/src/vm/codegen/ffi.rs` and `crates/tjs/cpp/tjs2_codegen.h` — the shape the compile entry hands back, and the header the C++ side reads |
 
+The runtime the code runs on is the next set of columns, in
+[`runtime.md`](runtime.md); the value layer it starts from is landed.
+
 The two columns that have a page of their own:
 [`parser.md`](parser.md) carries the grammar's productions, and
 [`generator.md`](generator.md) carries the rules the generator
