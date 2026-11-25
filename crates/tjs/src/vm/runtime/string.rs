@@ -9,8 +9,8 @@
 //!
 //! A value's text ends at the first zero code unit. A script string cannot
 //! carry a zero — the escape that writes one ends the text it was written in
-//! — and every construction here applies that rule in one place, so the
-//! length, the units, the comparison and the hash all agree.
+//! — and every construction here applies that rule, so the length, the
+//! units, the comparison and the hash all agree.
 //!
 //! # Comparison
 //!
@@ -42,14 +42,29 @@ pub struct TjsString {
 impl TjsString {
     /// The empty string.
     pub fn new() -> Self {
-        Self::from_units(Vec::new())
+        Self::from_units(&[])
     }
 
     /// The string of the given code units, cut at the first zero.
     ///
-    /// This is the one place a value is built, so the zero rule holds for
-    /// every construction.
-    fn from_units(mut units: Vec<u16>) -> Self {
+    /// The units are written once, straight into the shared allocation: no
+    /// buffer stands between the caller's text and the value.
+    fn from_units(units: &[u16]) -> Self {
+        let end = units
+            .iter()
+            .position(|&unit| unit == 0)
+            .unwrap_or(units.len());
+        Self {
+            units: Arc::from_iter(units[..end].iter().copied()),
+        }
+    }
+
+    /// The string of the given code units, cut at the first zero, taking the
+    /// buffer the caller already owns.
+    ///
+    /// The buffer is the caller's, so the only allocation left is the shared
+    /// allocation the value needs, and the units are copied into it once.
+    fn from_vec(mut units: Vec<u16>) -> Self {
         if let Some(end) = units.iter().position(|&unit| unit == 0) {
             units.truncate(end);
         }
@@ -81,10 +96,11 @@ impl TjsString {
         if self.is_empty() {
             return other.clone();
         }
-        let mut units = Vec::with_capacity(self.len() + other.len());
-        units.extend_from_slice(&self.units);
-        units.extend_from_slice(&other.units);
-        Self::from_units(units)
+        // neither text holds a zero, so the joined text does not either, and
+        // the length is known: the joined text is written once
+        Self {
+            units: Arc::from_iter(self.units.iter().chain(other.units.iter()).copied()),
+        }
     }
 
     /// The hash an object's member table buckets this text by.
@@ -135,7 +151,7 @@ impl TjsString {
             hexadecimal = false;
             units.push(unit);
         }
-        Self::from_units(units)
+        Self::from_vec(units)
     }
 
     /// The text an escaped value stands for.
@@ -192,7 +208,31 @@ impl Default for TjsString {
 
 impl From<&str> for TjsString {
     fn from(text: &str) -> Self {
-        Self::from_units(text.encode_utf16().collect())
+        // the first byte that is either not plain ASCII or the zero that
+        // ends the text; everything before it is one code unit per byte, so
+        // one scan decides between the two routes
+        let end = text
+            .as_bytes()
+            .iter()
+            .position(|&byte| byte == 0 || !byte.is_ascii())
+            .unwrap_or(text.len());
+        if end == text.len() || text.as_bytes()[end] == 0 {
+            return Self {
+                units: Arc::from_iter(text.as_bytes()[..end].iter().copied().map(u16::from)),
+            };
+        }
+        // a character of four bytes is two code units and every other
+        // character is no wider than the bytes it takes, so the byte length
+        // bounds the code-unit count
+        let text = match text[end..].find('\0') {
+            Some(zero) => &text[..end + zero],
+            None => text,
+        };
+        let mut units: Vec<u16> = Vec::with_capacity(text.len());
+        units.extend(text.encode_utf16());
+        Self {
+            units: Arc::from_iter(units.iter().copied()),
+        }
     }
 }
 
@@ -204,13 +244,13 @@ impl From<String> for TjsString {
 
 impl From<&[u16]> for TjsString {
     fn from(units: &[u16]) -> Self {
-        Self::from_units(units.to_vec())
+        Self::from_units(units)
     }
 }
 
 impl From<Vec<u16>> for TjsString {
     fn from(units: Vec<u16>) -> Self {
-        Self::from_units(units)
+        Self::from_vec(units)
     }
 }
 

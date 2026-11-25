@@ -24,13 +24,21 @@
 //! fifteen significant digits, and the named forms `NaN`, `+Infinity`,
 //! `-Infinity`, `+0.0` and `-0.0`.
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 /// The number of significant digits a real's text holds.
 const REAL_DIGITS: usize = 15;
 
 /// The decimal exponent from which a real is written in the exponent form.
 const FIXED_FORM_LOWEST_EXPONENT: i32 = -4;
+
+/// The most characters a real's text holds.
+///
+/// The longest form is a sign, one integer digit, the point, fourteen
+/// fractional digits, the exponent marker, its sign and three exponent
+/// digits — `-1.79769313486232e+308` — so the answer is allocated once, at
+/// its greatest size, and never grows.
+const REAL_TEXT_CAPACITY: usize = 22;
 
 /// The largest number of mantissa digits the real conversion collects.
 const MOST_MANTISSA_DIGITS: i32 = 48;
@@ -196,6 +204,15 @@ impl<'a> Cursor<'a> {
         self.units.get(self.position).copied()
     }
 
+    /// The number of code units the cursor has left.
+    ///
+    /// The extracted text is a subsequence of them, so this bounds its
+    /// length; a number that ends the text (the usual case) gives it
+    /// exactly.
+    fn remaining(&self) -> usize {
+        self.units.len() - self.position
+    }
+
     /// The sign the cursor is at, if it is at one.
     fn sign(&self) -> Option<u16> {
         match self.at() {
@@ -316,7 +333,7 @@ fn extract(
     digit: impl Fn(u16) -> Option<u8>,
     exponent_marks: [u8; 2],
 ) -> (Vec<u16>, bool) {
-    let mut text: Vec<u16> = Vec::new();
+    let mut text: Vec<u16> = Vec::with_capacity(cursor.remaining());
     let mut point_found = false;
     let mut exponent_found = false;
     while let Some(character) = cursor.at() {
@@ -619,6 +636,10 @@ fn non_decimal_real(text: &[u16], digits: Digits) -> Result<f64, NumberError> {
 /// The text holds fifteen significant digits: the exponent form when the
 /// decimal exponent is below `-4` or at least the number of digits, and the
 /// plain form otherwise, with the insignificant zero digits dropped.
+///
+/// The digits are collected as the formatter emits them (see
+/// [`Significand`]) and written into the answer in one pass, so no text
+/// exists between the formatter and the answer.
 fn real_text(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_owned();
@@ -639,43 +660,49 @@ fn real_text(value: f64) -> String {
         }
         .to_owned();
     }
-    let (digits, exponent) = rounded_digits(value.abs());
-    let mut text = String::with_capacity(REAL_DIGITS + 8);
+    let rounded = rounded_digits(value.abs());
+    let digits = &rounded.digits[..rounded.count];
+    // the insignificant zero digits are not written
+    let mut significant = digits.len();
+    while significant > 1 && digits[significant - 1] == b'0' {
+        significant -= 1;
+    }
+    let digits = &digits[..significant];
+    let exponent = rounded.exponent;
+    let mut text = String::with_capacity(REAL_TEXT_CAPACITY);
     if value < 0.0 {
         text.push('-');
     }
     if exponent < FIXED_FORM_LOWEST_EXPONENT || exponent >= REAL_DIGITS as i32 {
         // one digit, the rest of the digits after the point, and the
         // exponent with a sign and at least two digits
-        text.push_str(&digits[..1]);
-        let fraction = digits[1..].trim_end_matches('0');
-        if !fraction.is_empty() {
+        push_digits(&mut text, &digits[..1]);
+        if digits.len() > 1 {
             text.push('.');
-            text.push_str(fraction);
+            push_digits(&mut text, &digits[1..]);
         }
         text.push('e');
         text.push(if exponent < 0 { '-' } else { '+' });
-        let magnitude = exponent.unsigned_abs();
-        if magnitude < 10 {
-            text.push('0');
-        }
-        text.push_str(&magnitude.to_string());
+        push_magnitude(&mut text, exponent.unsigned_abs(), 2);
     } else if exponent >= 0 {
         // the point falls inside the significand or just after it
         let point = exponent as usize + 1;
-        let (whole, fraction) = digits.split_at(point);
-        text.push_str(whole);
-        let fraction = fraction.trim_end_matches('0');
-        if !fraction.is_empty() {
+        if digits.len() <= point {
+            push_digits(&mut text, digits);
+            for _ in digits.len()..point {
+                text.push('0');
+            }
+        } else {
+            push_digits(&mut text, &digits[..point]);
             text.push('.');
-            text.push_str(fraction);
+            push_digits(&mut text, &digits[point..]);
         }
     } else {
         text.push_str("0.");
         for _ in 0..(-exponent - 1) {
             text.push('0');
         }
-        text.push_str(digits.trim_end_matches('0'));
+        push_digits(&mut text, digits);
     }
     text
 }
@@ -686,16 +713,78 @@ fn real_text(value: f64) -> String {
 /// The value is rounded to [`REAL_DIGITS`] significant digits, and the
 /// digits are the rounded significand from its first digit, which a value
 /// that is not zero never leaves at zero.
-fn rounded_digits(value: f64) -> (String, i32) {
-    let text = format!("{:.*e}", REAL_DIGITS - 1, value);
-    let (mantissa, exponent) = text
-        .split_once('e')
-        .expect("the exponent form of a real carries its exponent");
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let exponent = exponent
-        .parse()
-        .expect("the exponent form of a real carries a decimal exponent");
-    (digits, exponent)
+fn rounded_digits(value: f64) -> Significand {
+    let mut digits = Significand::default();
+    write!(&mut digits, "{:.*e}", REAL_DIGITS - 1, value).expect("the digit sink never fails");
+    if digits.negative {
+        digits.exponent = -digits.exponent;
+    }
+    digits
+}
+
+/// The significand of a real, as the formatter rounds it.
+///
+/// The formatter emits the rounded value as its digits, a point, the
+/// exponent marker and the exponent; this sink keeps the digits and the
+/// exponent as it reads them, so the value's digits exist as numbers and
+/// never as text.
+#[derive(Default)]
+struct Significand {
+    /// The significand digits, most significant first.
+    digits: [u8; REAL_DIGITS],
+    /// The number of digits kept.
+    count: usize,
+    /// The decimal exponent of the first digit.
+    exponent: i32,
+    /// Whether the exponent carries a minus sign.
+    negative: bool,
+    /// Whether the exponent marker has been read.
+    in_exponent: bool,
+}
+
+impl fmt::Write for Significand {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for byte in text.bytes() {
+            if byte == b'e' {
+                self.in_exponent = true;
+            } else if self.in_exponent {
+                if byte == b'-' {
+                    self.negative = true;
+                } else if byte.is_ascii_digit() {
+                    self.exponent = self.exponent * 10 + i32::from(byte - b'0');
+                }
+            } else if byte.is_ascii_digit() && self.count < REAL_DIGITS {
+                self.digits[self.count] = byte;
+                self.count += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Write digit bytes as characters.
+fn push_digits(text: &mut String, digits: &[u8]) {
+    for &digit in digits {
+        text.push(char::from(digit));
+    }
+}
+
+/// Write the decimal digits of a magnitude, at least `width` digits wide.
+fn push_magnitude(text: &mut String, mut magnitude: u32, width: usize) {
+    let mut digits = [0u8; 3];
+    let mut count = 0;
+    while magnitude != 0 && count < digits.len() {
+        digits[count] = b'0' + (magnitude % 10) as u8;
+        magnitude /= 10;
+        count += 1;
+    }
+    for _ in count..width {
+        text.push('0');
+    }
+    while count > 0 {
+        count -= 1;
+        text.push(char::from(digits[count]));
+    }
 }
 
 /// The code unit at the index, or the zero code unit that ends the text.
