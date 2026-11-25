@@ -38,6 +38,7 @@ pub mod codegen;
 pub mod commands;
 pub mod lexer;
 pub mod parser;
+pub mod runtime;
 mod stats;
 
 pub use codegen::Generator;
