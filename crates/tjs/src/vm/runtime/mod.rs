@@ -47,6 +47,7 @@
 pub mod hash;
 pub mod member;
 pub mod number;
+pub mod object;
 pub mod octet;
 pub mod string;
 pub mod variant;

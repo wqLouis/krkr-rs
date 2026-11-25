@@ -1,0 +1,11 @@
+# the engine's answers, recorded by `crates/tjs/examples/object_oracle.rs`; regenerate with the command in the example's docs
+dot_read	Integer	4
+bracket_read	Integer	4
+dot_read_from_bracket_write	Integer	5
+bracket_read_from_dot_write	Integer	5
+created_read	Integer	7
+present_typeof	String	Integer
+void_typeof	String	void
+absent_typeof	String	undefined
+deleted_typeof	String	undefined
+created_typeof	String	Integer
