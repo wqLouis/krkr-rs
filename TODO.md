@@ -1705,6 +1705,44 @@ replaces is deleted from the vendored tree in that same change:
 | R6 the builtin natives | `runtime/natives/`: `Math`, `Date`, `RandomGenerator`, `RegExp`, `String`, `Exception`, `Config` | `tjsMath`, `tjsDate`, `tjsRandomGenerator`, `tjsRegExp`, `tjsString`, `tjsConfig`, `tjsError` |
 | R7 the seam goes | `crates/vm` drives the Rust engine directly | `cpp/tjs2_abi.{h,cpp}`, the `extern` block in `crates/tjs/src/lib.rs`, `build.rs`'s zig/bison/python/oniguruma chain, `streams.cpp` |
 
+**Every line of C and C++ in the tree, and what deletes it.** The tracked
+native code is `crates/tjs/cpp/` and nothing else: 39 400 lines. The
+`scripts/fixtures/**/*.cpp` files are inputs to the gate's own self-tests —
+they are never compiled and they stay.
+
+| artifact | lines | gone with |
+|---|---|---|
+| `cpp/tjs2/` — the vendored VM | 32 632 | R2–R6, file by file, each deleted in the change that takes its part |
+| `cpp/tjs2_abi.cpp` + `tjs2_abi.h` | 4 837 | R7: `crates/vm` drives the Rust engine directly and the C surface stops existing |
+| `cpp/tjs2_codegen.h` | 331 | R7: the script block image stops crossing a C ABI |
+| `cpp/streams.cpp` | 1 617 | R4: the TJS stream IO (`Array.save`/`load`/`saveStruct`) in Rust, over the fs surface |
+| `cpp/hash_order_test.cpp` | 120 | R3: it diagnoses a defect in the C++ member table, and the table it guards is deleted |
+| `cpp/value_bench.cpp` | 379 | the last primitive it shims: a bench shim whose other side is Rust has nothing left to compare |
+| `cpp/tjs2/tjsNumberParse.cpp` | 511 | **landed** |
+| `cpp/tjs2/tjsConfig.cpp`'s `TJS_strtod` | 183 | **landed** |
+
+and the build chain that exists only to compile them: **zig** (the C++
+compiler, and the package manager that fetches fmt, spdlog, boost and
+oniguruma), **bison** (the date grammar), **python3** (the date word map),
+**libc++** and **libonig**. Two of those needs have to be replaced rather than
+deleted, and each needs its own oracle first:
+
+* **the regular expression engine** (`tjsRegExp.cpp` over Oniguruma). The
+  syntax is Oniguruma's and it is reached from `String.replace`, the
+  `RegExp` object and every pattern a game's scripts carry. Its replacement is
+  proven the way the number rule was: record the engine's own match results
+  over the patterns the games actually ship, compare, and only then cut over.
+  This is the one part where a Rust dependency may be the right answer rather
+  than a port, and the measurement decides.
+* **the date grammar and its word map** (`bison/tjsdate.y` and
+  `script/create_world_map.py`). Bison and python3 exist for this alone; a Rust
+  date parser and a generated Rust table retire both.
+
+When the last file goes, `crates/tjs/build.rs` and `links = "tjs2"` go with
+it, and the toolchain list in `AGENTS.md` §1.2 shrinks to Rust plus the media
+backends' system libraries — FFmpeg and ALSA are external C libraries the media
+backend links by choice (`docs/arch/l1.md` §4), not code in this tree.
+
 **The member map is not the keyed table.** `tTJSCustomObject` does not store
 its members in `tTJSHashTable`: it keeps a power-of-two symbol array with its
 own `RebuildHash` (`tjsObject.cpp:325-340`, `:649-756`) and enumerates it in

@@ -82,7 +82,6 @@ namespace TJS {
 #define TJS_octetcpy memcpy
 #define TJS_octetcmp memcmp
 
-    double TJS_strtod(const tjs_char *pString, tjs_char **endPtr);
 
     TJS_EXP_FUNC_DEF(tjs_int64, TJS_atoll, (const tjs_char *s));
 

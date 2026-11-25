@@ -18,14 +18,12 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
 
 #include "tjsConfig.h"
 #include "tjsHashSearch.h"
-#include "tjsNumberParse.h"
 #include "tjsString.h"
 #include "tjsVariant.h"
 
@@ -109,22 +107,6 @@ namespace {
         return TJS::ttstr(units);
     }
 
-    /// The texts the number parser entry reads: a plain integer, an integer
-    /// wider than the value, a real, an exponent form, a hexadecimal form, a
-    /// real with ten significant digits, and a text that is not a number.
-    std::vector<TJS::ttstr> NumberTextCorpus() {
-        std::vector<TJS::ttstr> texts;
-        texts.reserve(7);
-        texts.push_back(TJS::ttstr(TJS_W("12345")));
-        texts.push_back(TJS::ttstr(TJS_W("12345678901234567890")));
-        texts.push_back(TJS::ttstr(TJS_W("12.5")));
-        texts.push_back(TJS::ttstr(TJS_W("6.02e23")));
-        texts.push_back(TJS::ttstr(TJS_W("0x1f")));
-        texts.push_back(TJS::ttstr(TJS_W("3.1415926535")));
-        texts.push_back(TJS::ttstr(TJS_W("not a number")));
-        return texts;
-    }
-
     /// One value the number formatter entry writes.
     struct FormatValue {
         /// Whether the value is the integer in `integer`.
@@ -158,13 +140,6 @@ namespace {
         value = {false, 0, std::numeric_limits<tjs_real>::infinity()};
         values.push_back(value);
         return values;
-    }
-
-    /// The bits of a real, as the checksum folds them.
-    std::uint64_t RealBits(tjs_real value) {
-        std::uint64_t bits = 0;
-        std::memcpy(&bits, &value, sizeof bits);
-        return bits;
     }
 
     /// The next corpus index from a loop counter, opaque to the optimiser.
@@ -286,36 +261,6 @@ long long tjs2_bench_string_escape(long long iterations,
             checksum = checksum * 31u +
                 static_cast<std::uint64_t>(escaped.GetLen() * 31 +
                                            escaped[escaped.GetLen() - 1]);
-        }
-        ns = ElapsedNs(start);
-    }
-    *out_checksum = checksum;
-    return ns;
-}
-
-// Times the text-to-number rule over the number corpus: a value per
-// iteration, and the integer or real bits folded into the checksum.
-// Measurement only.
-long long tjs2_bench_number_parse(long long iterations,
-                                  unsigned long long *out_checksum) {
-    const std::vector<TJS::ttstr> texts = NumberTextCorpus();
-    const std::size_t count = texts.size();
-    std::uint64_t checksum = 0;
-    long long ns = 0;
-    if(iterations > 0 && count != 0) {
-        const Clock::time_point start = Clock::now();
-        for(long long iteration = 0; iteration < iterations; iteration++) {
-            const std::size_t index = NextIndex(iteration, count);
-            const tjs_char *cursor = texts[index].c_str();
-            TJS::tTJSVariant value;
-            std::uint64_t folded = 0;
-            if(TJS::TJSParseNumber(value, &cursor)) {
-                if(value.Type() == TJS::tvtInteger)
-                    folded = static_cast<std::uint64_t>(value.AsInteger());
-                else
-                    folded = RealBits(value.AsReal());
-            }
-            checksum = checksum * 31u + folded;
         }
         ns = ElapsedNs(start);
     }

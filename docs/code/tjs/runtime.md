@@ -8,12 +8,16 @@ front end beside it — the lexer, the parser and the code generator — turns
 script text into intermediate code; this module is the machine that runs it.
 
 The runtime is built **bottom up, one part per change**, and each part is
-deleted from the vendored tree in the change that takes it over. What is
-here today is the **value layer**; the object model, the variant, the
-interpreter and the builtin natives follow, in the order `TODO.md` §12.1
-records. Nothing of the vendored tree has been deleted yet: the two meet at
-the one compile seam (`docs/code/tjs/seam.md`), and the parts land here
-proven before the code they replace is removed.
+deleted from the vendored tree in the change that takes it over. What is here
+today is the **value layer**; the object model, the variant, the interpreter
+and the builtin natives follow, in the order `TODO.md` §12.1 records.
+
+The text-to-number rule has already been taken over: `tjsNumberParse.cpp` and
+the `TJS_strtod` it exported are deleted, and the five place the C++ side
+converted text reads this module through one C entry. Everything else of the
+vendored runtime still runs, met at the one compile seam
+(`docs/code/tjs/seam.md`); a part lands here proven first, and only then is the
+code it replaces removed.
 
 ---
 
@@ -151,6 +155,15 @@ limitation is stated rather than hidden: the probes' **literals** are compiled
 by the Rust front end, so a probe whose answer is the literal's own value is a
 round trip through this tree rather than an independent reading. Every other
 answer is the engine's.
+
+**A cutover** is proven the same way, one step further: while both sides
+existed, the vendored rule and this module's rule were compared over 1 047
+written texts and 300 000 generated ones on kind, value and extent, with **zero
+divergences**, and that comparison was recorded as
+`crates/tjs/tests/fixtures/number_parse.txt` before the vendored rule was
+deleted. `cargo test -p tjs --test number_parse` replays the record with no C++
+and no engine, so the deletion of the code the record was taken from costs the
+proof nothing.
 
 **Speed** is proven against the primitives the module replaces, with the A/B
 harness in `runtime/bench.rs`: the same operations, the same inputs, both sides

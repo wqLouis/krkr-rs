@@ -1205,10 +1205,23 @@ big-integer path when it is a sixteen- or seventeen-digit value or a subnormal.
 * `TJS2_OPT=-O3` is the second opinion, holding both sides at one level rather
   than at each side's own shipped level.
 * **These are primitives, not a frame.** The value layer is the first part of
-  the runtime column and nothing has been cut over to it yet, so this is not a
-  claim that a game runs faster. It is the claim the column's bar makes: each
-  primitive that will be used is faster than the one it replaces, on the same
-  work, measured rather than assumed.
+  the runtime column, so this is not a claim that a game runs faster. It is the
+  claim the column's bar makes: each primitive that will be used is faster than
+  the one it replaces, on the same work, measured rather than assumed.
+
+**What has been cut over since.** The text-to-number rule stopped being a
+comparison: `crates/tjs/cpp/tjs2/tjsNumberParse.cpp` (511 lines) and the
+`TJS_strtod` it exported from `tjsConfig.cpp` (183 lines) are **deleted**, the
+five callers go through one C entry into `runtime::number`, and the C++ side
+keeps no prefix, digit, overflow or whitespace rule at all. The proof is a
+recorded one: while both sides existed, the two were compared over 1 047
+written texts (every prefix, sign and space rule, both range ends, subnormals,
+the exponent mark with no digit) and 300 000 generated ones, on kind, value and
+extent — **zero divergences** — and the record is a committed fixture the
+permanent check replays with no C++ and no engine in the loop. The row above is
+consequently gone from the harness: with the rule on both sides being the same
+code, there is nothing left to compare, and the figure stands as the
+measurement taken while the vendored rule still existed.
 
 ---
 

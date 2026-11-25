@@ -263,6 +263,21 @@ int tjs2_compile_script(tjs2_engine *e, const char *script, size_t script_len,
                         int outputdebug, int isexpression, const char *name,
                         int lineofs, char **out_error);
 
+/* The kind of a number the text-to-number rule answers. */
+#define TJS2_NUMBER_INTEGER 0
+#define TJS2_NUMBER_REAL 1
+
+/*
+ * Read the number at the start of `text`, a NUL-terminated UTF-16 string, with
+ * the engine's text-to-number rule. Answers 1 and fills `kind`
+ * (TJS2_NUMBER_INTEGER or TJS2_NUMBER_REAL), the value in `integer` or in
+ * `real`, and `consumed` with the number of code units the number occupies;
+ * the number's sign and the spaces after that sign are part of them. Answers 0,
+ * and writes nothing, when the text does not begin with a number.
+ */
+int tjs2_number_parse(const uint16_t *text, int *kind, long long *integer,
+                      double *real, size_t *consumed);
+
 /*
  * Load and execute TJS2 precompiled bytecode from an in-memory buffer
  * (reference `tTJS::LoadByteCode(tTJSBinaryStream*, ...)`, whose only caller
@@ -885,9 +900,6 @@ long long tjs2_bench_string_hash(long long iterations,
 /* Times the escape rule over a text with control units and quotes. */
 long long tjs2_bench_string_escape(long long iterations,
                                    unsigned long long *out_checksum);
-/* Times the text-to-number rule over the number corpus. */
-long long tjs2_bench_number_parse(long long iterations,
-                                  unsigned long long *out_checksum);
 /* Times the number-to-text rule over the format corpus. */
 long long tjs2_bench_number_format(long long iterations,
                                    unsigned long long *out_checksum);

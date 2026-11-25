@@ -751,8 +751,6 @@ unsafe extern "C" {
     fn tjs2_bench_string_hash(iterations: i64, out_checksum: *mut u64) -> i64;
     /// Times the escape rule over a text with control units and quotes.
     fn tjs2_bench_string_escape(iterations: i64, out_checksum: *mut u64) -> i64;
-    /// Times the text-to-number rule over the number corpus.
-    fn tjs2_bench_number_parse(iterations: i64, out_checksum: *mut u64) -> i64;
     /// Times the number-to-text rule over the format corpus.
     fn tjs2_bench_number_format(iterations: i64, out_checksum: *mut u64) -> i64;
     /// Times `count` insertions into an empty member table.

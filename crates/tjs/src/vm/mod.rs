@@ -56,6 +56,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::vm::codegen::ffi::{
     Image, c_string, panic_message, tjs2_codegen_block, tjs2_pp_value, tjs2_pp_values,
 };
+use crate::vm::runtime::number;
 
 /// The compile succeeded.
 pub const TJS2_SCRIPT_OK: c_int = 0;
@@ -278,6 +279,67 @@ pub unsafe extern "C" fn tjs2_script_compile(
         // panic's text is not lost
         Err(panic) => failed(&panic),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The text-to-number entry: the one number rule, in the C shape
+// ---------------------------------------------------------------------------
+
+/// The kind a number the entry read: an integer (the C `TJS2_NUMBER_INTEGER`).
+const NUMBER_INTEGER: c_int = 0;
+/// The kind a number the entry read: a real (the C `TJS2_NUMBER_REAL`).
+const NUMBER_REAL: c_int = 1;
+
+/// Reads the number at the start of a NUL-terminated UTF-16 text.
+///
+/// `kind` answers 0 for an integer and 1 for a real, and the value is written
+/// to `integer` or to `real`. `consumed` answers the number of code units the
+/// number occupies; its sign and the spaces after that sign are part of them.
+///
+/// Answers 1 when the text begins with a number, and 0, with the outputs
+/// untouched, when it does not.
+///
+/// # Safety
+///
+/// `text` must be NUL-terminated and readable up to the terminator, and every
+/// output pointer must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tjs2_number_parse(
+    text: *const u16,
+    kind: *mut c_int,
+    integer: *mut i64,
+    real: *mut f64,
+    consumed: *mut usize,
+) -> c_int {
+    if text.is_null() {
+        return 0;
+    }
+    // the text ends at its terminator, which is never part of a number
+    let mut length = 0usize;
+    // SAFETY: the caller promises the text is readable up to its terminator.
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the caller promises the text is readable up to its terminator.
+    let units = unsafe { std::slice::from_raw_parts(text, length) };
+    let Ok(parsed) = number::parse(units) else {
+        return 0;
+    };
+    // SAFETY: the caller promises every output pointer is writable.
+    unsafe {
+        match parsed.number {
+            number::Number::Integer(value) => {
+                *kind = NUMBER_INTEGER;
+                *integer = value;
+            }
+            number::Number::Real(value) => {
+                *kind = NUMBER_REAL;
+                *real = value;
+            }
+        }
+        *consumed = parsed.consumed;
+    }
+    1
 }
 
 /// Frees the handle and every buffer of the image it owns.

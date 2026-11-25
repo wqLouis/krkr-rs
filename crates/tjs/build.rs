@@ -75,7 +75,6 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsVariantString.cpp",
     "tjsScriptBlock.cpp",
     "tjsMath.cpp",
-    "tjsNumberParse.cpp",
     "tjs.cpp",
     "tjsMessage.cpp",
     "tjsDisassemble.cpp",

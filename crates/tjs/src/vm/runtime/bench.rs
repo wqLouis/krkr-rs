@@ -64,7 +64,7 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use super::hash::HashTable;
-use super::number::{self, Number, NumberError};
+use super::number::Number;
 use super::string::TjsString;
 
 /// The operations one measured pass of the string rows runs.
@@ -78,9 +78,6 @@ const HASH_ITERATIONS: i64 = 5_000_000;
 
 /// The operations one measured pass of the escape row runs.
 const ESCAPE_ITERATIONS: i64 = 200_000;
-
-/// The operations one measured pass of the text-to-number row runs.
-const PARSE_ITERATIONS: i64 = 2_000_000;
 
 /// The operations one measured pass of the number-to-text row runs.
 const FORMAT_ITERATIONS: i64 = 1_000_000;
@@ -115,19 +112,6 @@ const MEMBER_NAMES: [&str; 8] = [
 /// hexadecimal digit, and a unit above the control range.
 const ESCAPED_UNITS: [u16; 14] = [
     0x61, 0x09, 0x62, 0x0a, 0x63, 0x5c, 0x22, 0x27, 0x01, 0x61, 0x02, 0x66, 0x7f, 0x7a,
-];
-
-/// The texts the text-to-number row reads: a plain integer, an integer wider
-/// than the value, a real, an exponent form, a hexadecimal form, a real with
-/// ten significant digits, and a text that is not a number.
-const NUMBER_TEXTS: [&str; 7] = [
-    "12345",
-    "12345678901234567890",
-    "12.5",
-    "6.02e23",
-    "0x1f",
-    "3.1415926535",
-    "not a number",
 ];
 
 /// One value the number-to-text row writes.
@@ -287,14 +271,6 @@ fn vendored_escape() -> Pass {
     ))
 }
 
-/// Times the vendored text-to-number rule.
-fn vendored_parse() -> Pass {
-    pass(crate::run_bench_entry(
-        crate::tjs2_bench_number_parse,
-        PARSE_ITERATIONS,
-    ))
-}
-
 /// Times the vendored number-to-text rule.
 fn vendored_format() -> Pass {
     pass(crate::run_bench_entry(
@@ -423,31 +399,6 @@ fn print_value_layer_table() {
             checksum = checksum
                 .wrapping_mul(31)
                 .wrapping_add(text.len() as u64 * 31 + u64::from(text.as_utf16()[text.len() - 1]));
-        }
-        Pass {
-            ns: elapsed(start),
-            checksum,
-        }
-    });
-
-    let number_texts: Vec<Vec<u16>> = NUMBER_TEXTS
-        .iter()
-        .map(|text| text.encode_utf16().collect())
-        .collect();
-    print_row("text to number", PARSE_ITERATIONS, vendored_parse, || {
-        let mut checksum: u64 = 0;
-        let start = Instant::now();
-        for iteration in 0..PARSE_ITERATIONS as usize {
-            let index = black_box(iteration % number_texts.len());
-            let folded = match number::parse(&number_texts[index]) {
-                Ok(parsed) => match parsed.number {
-                    Number::Integer(value) => value as u64,
-                    Number::Real(value) => value.to_bits(),
-                },
-                Err(NumberError::NotANumber) => 0,
-                Err(NumberError::RealOutOfRange) => 0,
-            };
-            checksum = checksum.wrapping_mul(31).wrapping_add(folded);
         }
         Pass {
             ns: elapsed(start),
