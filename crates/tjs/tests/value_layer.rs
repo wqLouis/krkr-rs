@@ -9,11 +9,14 @@
 //! A record that holds only the header is a failure, not a pass: the table must
 //! be recorded before the check means anything.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::path::PathBuf;
 
 use tjs::vm::runtime::number::{Number, NumberError};
+use tjs::vm::runtime::octet::Octet;
 use tjs::vm::runtime::string::TjsString;
+use tjs::vm::runtime::variant::{Closure, Variant, VariantError};
 
 /// The probes the record must hold, in the recorder's order.
 const PROBES: &[&str] = &[
@@ -56,6 +59,36 @@ const PROBES: &[&str] = &[
     "compare_lower_against_upper",
     "compare_case",
     "compare_prefix",
+    "sum_integers",
+    "divide_integers",
+    "integer_divide",
+    "remainder",
+    "negative_remainder",
+    "multiply_texts",
+    "subtract_from_text",
+    "add_text_and_number",
+    "add_number_and_text",
+    "add_void_and_number",
+    "add_number_and_void",
+    "add_two_voids",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "shift_left",
+    "shift_right",
+    "bit_not",
+    "negate_integer",
+    "order_text_and_number",
+    "equal_integer_and_real",
+    "equal_number_and_text",
+    "unequal_number_and_text",
+    "equal_void_and_empty_text",
+    "equal_null_and_void",
+    "kind_of_integer",
+    "kind_of_real",
+    "kind_of_text",
+    "kind_of_octet",
+    "kind_of_null",
 ];
 
 /// One recorded answer.
@@ -82,7 +115,7 @@ fn the_value_layer_reproduces_the_recorded_answers() {
         seen.as_slice(),
         PROBES,
         "the record's probes are not the table this check knows; record it again with \
-         `cargo run -p tjs --example value_oracle > crates/tjs/tests/fixtures/value_layer.txt`"
+         `cargo run -p tjs --example value_oracle`"
     );
 }
 
@@ -148,6 +181,47 @@ fn answer(probe: &str) -> (&'static str, String) {
         "compare_case" => truth(TjsString::from("a") == TjsString::from("A")),
         // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:856-883
         "compare_prefix" => truth(TjsString::from("abc") < TjsString::from("abd")),
+        // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:1123-1202
+        "sum_integers" => variant(Variant::Integer(1).add(&Variant::Integer(2))),
+        "divide_integers" => variant(Variant::Integer(7).divide(&Variant::Integer(2))),
+        "integer_divide" => variant(Variant::Integer(7).idivide(&Variant::Integer(2))),
+        "remainder" => variant(Variant::Integer(7).remainder(&Variant::Integer(3))),
+        "negative_remainder" => variant(Variant::Integer(-7).remainder(&Variant::Integer(3))),
+        "multiply_texts" => variant(Variant::from("5").multiply(&Variant::from("2"))),
+        "subtract_from_text" => variant(Variant::from("5").subtract(&Variant::Integer(2))),
+        "add_text_and_number" => variant(Variant::from("a").add(&Variant::Integer(1))),
+        "add_number_and_text" => variant(Variant::Integer(1).add(&Variant::from("a"))),
+        "add_void_and_number" => variant(Variant::Void.add(&Variant::Integer(1))),
+        "add_number_and_void" => variant(Variant::Integer(1).add(&Variant::Void)),
+        "add_two_voids" => variant(Variant::Void.add(&Variant::Void)),
+        // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:928-1006
+        "bit_and" => variant(Variant::Integer(6).bit_and(&Variant::Integer(3))),
+        "bit_or" => variant(Variant::Integer(6).bit_or(&Variant::Integer(3))),
+        "bit_xor" => variant(Variant::Integer(6).bit_xor(&Variant::Integer(3))),
+        "shift_left" => variant(Variant::Integer(1).shift_left(&Variant::Integer(4))),
+        "shift_right" => variant(Variant::Integer(-8).shift_right(&Variant::Integer(1))),
+        "bit_not" => variant(Variant::Integer(5).complement()),
+        // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:1091-1104
+        "negate_integer" => variant(Variant::Integer(5).negate()),
+        // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:856-910
+        "order_text_and_number" => {
+            truth(Variant::from("10").compare(&Variant::Integer(9)) == Ok(Some(Ordering::Less)))
+        }
+        // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:665-804
+        "equal_integer_and_real" => truth(Variant::Integer(1).equals(&Variant::Real(1.0))),
+        "equal_number_and_text" => truth(Variant::Integer(1).equals(&Variant::from("1"))),
+        "unequal_number_and_text" => truth(Variant::Integer(1).equals(&Variant::from("2"))),
+        "equal_void_and_empty_text" => truth(Variant::Void.equals(&Variant::from(""))),
+        "equal_null_and_void" => truth(Variant::Object(Closure::null()).equals(&Variant::Void)),
+        // reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2602-2638
+        "kind_of_integer" => kind(Variant::Integer(1)),
+        "kind_of_real" => kind(Variant::Real(1.5)),
+        "kind_of_text" => kind(Variant::from("a")),
+        "kind_of_octet" => kind(Variant::from(Octet::from_slice(&[1]))),
+        "kind_of_null" => {
+            let null = Variant::Object(Closure::null());
+            (null.type_name(), String::from("Object"))
+        }
         other => panic!("the check has no answer for the recorded probe: {other}"),
     }
 }
@@ -168,6 +242,21 @@ fn text(value: TjsString) -> (&'static str, String) {
 /// A truth value as a script's comparison answers it.
 fn truth(value: bool) -> (&'static str, String) {
     number(Number::Integer(i64::from(value)))
+}
+
+/// A variant's answer: the kind `typeof` reports and the value's text.
+fn variant(value: Result<Variant, VariantError>) -> (&'static str, String) {
+    let value = value.expect("the value layer does not raise here");
+    let kind = value.type_name();
+    match value.to_string() {
+        Ok(text) => (kind, text.to_string()),
+        Err(error) => panic!("the value has no text: {error}"),
+    }
+}
+
+/// The answer of `typeof value`: a text holding the kind's name.
+fn kind(value: Variant) -> (&'static str, String) {
+    ("String", value.type_name().to_owned())
 }
 
 /// The answer of `"text" * 1`.
@@ -217,7 +306,7 @@ fn recorded_answers() -> Vec<Record> {
     assert!(
         !records.is_empty(),
         "the value layer fixture records nothing; record it with \
-         `cargo run -p tjs --example value_oracle > crates/tjs/tests/fixtures/value_layer.txt`"
+         `cargo run -p tjs --example value_oracle`"
     );
     records
 }

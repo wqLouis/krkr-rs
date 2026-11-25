@@ -8,18 +8,43 @@
 //! the engine and without a game.
 //!
 //! The record is written whole or not at all: every probe is evaluated before
-//! anything is printed, and a probe the engine rejects stops the recorder with
-//! a message naming the probe.
+//! the file is touched, a probe the engine rejects stops the recorder with a
+//! message naming the probe, and the record is written beside the fixture and
+//! renamed over it, so a failed recording leaves the old record in place.
+//!
+//! A probe whose answer has no text records the raise the language makes
+//! instead — see [`RAISED`]: a raise at run time is the rule's answer, not a
+//! gap. A probe the front end refuses to *compile* is another thing
+//! altogether (`!compile`): it never reaches a rule, so it is not evidence,
+//! and the recorder stops and writes nothing rather than record it.
 //!
 //! ```sh
-//! cargo run -p tjs --example value_oracle > crates/tjs/tests/fixtures/value_layer.txt
+//! cargo run -p tjs --example value_oracle
 //! ```
+//!
+//! The record goes to the committed fixture; an argument names another path.
 
+use std::ffi::CStr;
+use std::path::{Path, PathBuf};
+use std::ptr;
+
+use tjs::vm::{
+    TJS2_SCRIPT_OK, tjs2_script_compile, tjs2_script_error_message, tjs2_script_free,
+    tjs2_script_status,
+};
 use tjs::{Tjs2Engine, TjsValue};
 
 /// The fixture's first line, so that regenerating the record keeps the file
 /// self-describing.
 const HEADER: &str = "# the engine's answers, recorded by `crates/tjs/examples/value_oracle.rs`; regenerate with the command in the example's docs";
+
+/// The text a probe records when the language raises instead of answering a
+/// text.
+///
+/// The raise is the rule's answer — an octet has no text, and the coercion
+/// says so by raising — so the record pins the raise itself. The message is
+/// not recorded: the message table words it, not the value.
+const RAISED: &str = "!raise";
 
 /// The probe table: the name the check uses, and the script expression.
 const PROBES: &[(&str, &str)] = &[
@@ -69,7 +94,86 @@ const PROBES: &[(&str, &str)] = &[
     ("compare_lower_against_upper", r#""a" < "B""#),
     ("compare_case", r#""a" == "A""#),
     ("compare_prefix", r#""abc" < "abd""#),
+    // the variant's arithmetic
+    //
+    // One operand of each of these is read at run time, from a dictionary's
+    // absent member: the generator folds an operation whose operands are both
+    // constants, and a folded operation never reaches the rule the probe is
+    // named for. The read answers the empty variant, so the operation it feeds
+    // is the same one the probe names, with the same operands.
+    ("sum_integers", r#"((new Dictionary())["x"] + 1) + 2"#),
+    ("divide_integers", r#"((new Dictionary())["x"] + 7) / 2"#),
+    ("integer_divide", r#"((new Dictionary())["x"] + 7) \ 2"#),
+    ("remainder", r#"((new Dictionary())["x"] + 7) % 3"#),
+    ("negative_remainder", r#"((new Dictionary())["x"] - 7) % 3"#),
+    ("multiply_texts", r#"((new Dictionary())["x"] + "5") * "2""#),
+    (
+        "subtract_from_text",
+        r#"((new Dictionary())["x"] + "5") - 2"#,
+    ),
+    (
+        "add_text_and_number",
+        r#"((new Dictionary())["x"] + "a") + 1"#,
+    ),
+    (
+        "add_number_and_text",
+        r#"((new Dictionary())["x"] + 1) + "a""#,
+    ),
+    ("add_void_and_number", r#"((new Dictionary())["x"] + 1)"#),
+    ("add_number_and_void", r#"(1 + (new Dictionary())["x"])"#),
+    (
+        "add_two_voids",
+        r#"((new Dictionary())["x"] + (new Dictionary())["y"])"#,
+    ),
+    // the variant's bitwise family
+    ("bit_and", r#"((new Dictionary())["x"] + 6) & 3"#),
+    ("bit_or", r#"((new Dictionary())["x"] + 6) | 3"#),
+    ("bit_xor", r#"((new Dictionary())["x"] + 6) ^ 3"#),
+    ("shift_left", r#"((new Dictionary())["x"] + 1) << 4"#),
+    ("shift_right", r#"((new Dictionary())["x"] - 8) >> 1"#),
+    ("bit_not", r#"~((new Dictionary())["x"] + 5)"#),
+    ("negate_integer", r#"-((new Dictionary())["x"] + 5)"#),
+    // the variant's comparisons
+    (
+        "order_text_and_number",
+        r#"((new Dictionary())["x"] + "10") < 9"#,
+    ),
+    (
+        "equal_integer_and_real",
+        r#"((new Dictionary())["x"] + 1) == 1.0"#,
+    ),
+    (
+        "equal_number_and_text",
+        r#"((new Dictionary())["x"] + 1) == "1""#,
+    ),
+    (
+        "unequal_number_and_text",
+        r#"((new Dictionary())["x"] + 1) == "2""#,
+    ),
+    (
+        "equal_void_and_empty_text",
+        "((new Dictionary())[\"x\"]) == \"\"",
+    ),
+    (
+        "equal_null_and_void",
+        r#"null == ((new Dictionary())["x"])"#,
+    ),
+    // the kind the typeof operator reports
+    ("kind_of_integer", "typeof (1)"),
+    ("kind_of_real", "typeof (1.5)"),
+    ("kind_of_text", r#"typeof ("a")"#),
+    ("kind_of_octet", "typeof (<%01%>)"),
 ];
+
+/// Probes whose answer's text is not the value's own coercion: the name, the
+/// value's expression, and the expression the answer's text is read from.
+///
+/// `typeof` is asked of the value's expression here too, so a probe of this
+/// table reads exactly like one of the table above; only the text differs.
+/// Two values are here: an object's own text is the two addresses it carries,
+/// which a record cannot pin, and an octet has no text at all — the language
+/// raises where the coercion would be asked for one.
+const TEXT_PROBES: &[(&str, &str, &str)] = &[("kind_of_null", "null", "typeof (null)")];
 
 fn main() {
     let engine = match Tjs2Engine::new() {
@@ -80,23 +184,107 @@ fn main() {
     table.push_str(HEADER);
     table.push('\n');
     for &(probe, expression) in PROBES {
-        let kind = answer(&engine, &format!("typeof ({expression})"), probe);
-        let text = answer(&engine, &format!("\"\" + ({expression})"), probe);
-        table.push_str(&format!("{probe}\t{kind}\t{}\n", escaped(&text)));
+        let kind_expression = format!("typeof ({expression})");
+        let text_expression = format!("\"\" + ({expression})");
+        let kind = column(&engine, &kind_expression, probe, "kind");
+        let text = column(&engine, &text_expression, probe, "text");
+        table.push_str(&format!("{probe}\t{kind}\t{text}\n"));
     }
-    print!("{table}");
+    for &(probe, expression, text_expression) in TEXT_PROBES {
+        let kind_expression = format!("typeof ({expression})");
+        let kind = column(&engine, &kind_expression, probe, "kind");
+        let text = column(&engine, text_expression, probe, "text");
+        table.push_str(&format!("{probe}\t{kind}\t{text}\n"));
+    }
+    record(&fixture_path(), &table, PROBES.len() + TEXT_PROBES.len());
 }
 
-/// The text of one evaluation, which must be a text.
-fn answer(engine: &Tjs2Engine, expression: &str, probe: &str) -> String {
+/// The fixture's path: the first argument, or the committed fixture.
+fn fixture_path() -> PathBuf {
+    match std::env::args_os().nth(1) {
+        Some(path) => PathBuf::from(path),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("value_layer.txt"),
+    }
+}
+
+/// Writes the record where the check reads it, all at once.
+///
+/// The record is written to a file beside the fixture and renamed over it, so
+/// a recording that fails cannot leave an empty or a partial record where a
+/// good one was.
+fn record(path: &Path, table: &str, probes: usize) {
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+    if let Err(error) = std::fs::write(&temporary, table) {
+        fail(format_args!(
+            "the record could not be written to {}: {error}",
+            temporary.display()
+        ));
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        fail(format_args!(
+            "the record could not be moved to {}: {error}",
+            path.display()
+        ));
+    }
+    eprintln!(
+        "value_oracle: recorded {probes} probes in {}",
+        path.display()
+    );
+}
+
+/// One column of one probe: the answer's text, or the raise it makes.
+///
+/// The expression is compiled first, so a refused compile is told apart from a
+/// raise: the engine reports both the same way, but they are not the same
+/// thing. A refused compile stops the recorder — a probe that never reaches a
+/// rule is not evidence — while a raise at run time is the rule's answer.
+fn column(engine: &Tjs2Engine, expression: &str, probe: &str, name: &str) -> String {
+    if let Err(message) = compiles(expression) {
+        fail(format_args!(
+            "probe {probe}: the {name} expression does not compile (!compile): {message}"
+        ));
+    }
     match engine.eval(expression, "value_oracle") {
-        Ok(TjsValue::String(text)) => text,
+        Ok(TjsValue::String(text)) => escaped(&text),
         Ok(other) => fail(format_args!(
             "probe {probe}: the answer is not a text: {other:?}"
         )),
-        Err(error) => fail(format_args!(
-            "probe {probe}: the engine rejected it: {error}"
-        )),
+        Err(_raised) => String::from(RAISED),
+    }
+}
+
+/// Whether the front end compiles the expression, and why it does not.
+fn compiles(expression: &str) -> Result<(), String> {
+    let units: Vec<u16> = expression.encode_utf16().collect();
+    let length = u32::try_from(units.len()).expect("a probe expression fits a 32-bit length");
+    // SAFETY: the units are readable for `length` code units, the null values
+    // pointer means "no conditional-compilation values", and the handle is
+    // freed before this returns.
+    unsafe {
+        let script = tjs2_script_compile(units.as_ptr(), length, 1, 1, ptr::null());
+        if script.is_null() {
+            return Err(String::from("the front end answered no handle"));
+        }
+        let status = tjs2_script_status(script);
+        if status == TJS2_SCRIPT_OK {
+            tjs2_script_free(script);
+            return Ok(());
+        }
+        let message = tjs2_script_error_message(script);
+        let message = if message.is_null() {
+            String::from("the front end gave no message")
+        } else {
+            // SAFETY: the handle owns a NUL-terminated message, live until the
+            // handle is freed below.
+            CStr::from_ptr(message).to_string_lossy().into_owned()
+        };
+        tjs2_script_free(script);
+        Err(message)
     }
 }
 
