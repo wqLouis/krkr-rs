@@ -1728,15 +1728,24 @@ oniguruma), **bison** (the date grammar), **python3** (the date word map),
 deleted, and each needs its own oracle first:
 
 * **the regular expression engine** (`tjsRegExp.cpp` over Oniguruma). The
-  syntax is Oniguruma's and it is reached from `String.replace`, the
-  `RegExp` object and every pattern a game's scripts carry. Its replacement is
-  proven the way the number rule was: record the engine's own match results
-  over the patterns the games actually ship, compare, and only then cut over.
-  This is the one part where a Rust dependency may be the right answer rather
-  than a port, and the measurement decides.
+  surface is six calls — `onig_new`, `onig_search`, `onig_region_new`/`free`/
+  `clear`, `onig_error_code_to_str`, `onig_free`, `onig_end` — and it is
+  reached from `String.replace`, the `RegExp` object and every pattern a game's
+  scripts carry. Pure-Rust candidates exist and are evaluated in this order:
+  `rusty_expressions` (states match-equivalence to Oniguruma 6.9.10, and
+  per-regex UTF-16 encodings, which is what a `tjs_char` is), `ferroni`
+  (Oniguruma in pure Rust, driven by TextMate grammars, 2.x), `fancy-regex`
+  (Oniguruma-compatible mode, but no callouts, absent operator or
+  subexpression calls). The binding crates — `onig`, `onig_sys`,
+  `oniguruma` — are not candidates: they keep the C library. The proof is the
+  number rule's: inventory the patterns the games ship (needs the game
+  directory), record the engine's own match results over them, compare, and
+  only then delete `tjsRegExp.cpp` and `libonig`. An adapter seam
+  (`compile`/`search`/`error`) keeps the choice replaceable.
 * **the date grammar and its word map** (`bison/tjsdate.y` and
-  `script/create_world_map.py`). Bison and python3 exist for this alone; a Rust
-  date parser and a generated Rust table retire both.
+  `script/create_world_map.py`). The whole unit is 800 lines plus a 99-line
+  generator; a ported parser retires bison, a Rust build step retires python3,
+  and calendar arithmetic comes from `jiff` (1.0, pure Rust) or std.
 
 When the last file goes, `crates/tjs/build.rs` and `links = "tjs2"` go with
 it, and the toolchain list in `AGENTS.md` §1.2 shrinks to Rust plus the media
