@@ -1,0 +1,3 @@
+# the engine's answers, recorded by the ignored test `vm::runtime::member::tests::record_member_order`; regenerate with the command in its `#[ignore]` reason
+insert	left,member_32,key25,k27,v4,e2,width,at10,key15,key10,key47,gamma
+remove	left,member_32,key25,k27,v4,e2,at10,key15,key10,at0,key47,gamma

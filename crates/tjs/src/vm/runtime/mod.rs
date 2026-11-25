@@ -45,6 +45,7 @@
 #![deny(unsafe_code)]
 
 pub mod hash;
+pub mod member;
 pub mod number;
 pub mod string;
 
