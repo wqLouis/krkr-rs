@@ -32,6 +32,13 @@ const REAL_DIGITS: usize = 15;
 /// The decimal exponent from which a real is written in the exponent form.
 const FIXED_FORM_LOWEST_EXPONENT: i32 = -4;
 
+/// The significant digits the shortest round-trip sink keeps.
+///
+/// The fast path is taken only when the text holds at most this many of them,
+/// so the kept digits are all it can write; a digit past them is counted and
+/// forces the exact path rather than being dropped.
+const SHORTEST_DIGITS: usize = 15;
+
 /// The most characters a real's text holds.
 ///
 /// The longest form is a sign, one integer digit, the point, fourteen
@@ -637,9 +644,13 @@ fn non_decimal_real(text: &[u16], digits: Digits) -> Result<f64, NumberError> {
 /// decimal exponent is below `-4` or at least the number of digits, and the
 /// plain form otherwise, with the insignificant zero digits dropped.
 ///
-/// The digits are collected as the formatter emits them (see
-/// [`Significand`]) and written into the answer in one pass, so no text
-/// exists between the formatter and the answer.
+/// The digits come from the shortest round-trip text when it holds at most
+/// fifteen of them, and from the exact formatter otherwise. The shortest text
+/// is the answer because rounding a value to fifteen significant digits keeps
+/// its shortest text when that text fits in fifteen digits: the value's
+/// round-trip interval is narrower than half a fifteen-digit step, so the
+/// rounded text is the shortest text with zeros after it — and the zeros are
+/// exactly what the rule drops.
 fn real_text(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_owned();
@@ -660,17 +671,35 @@ fn real_text(value: f64) -> String {
         }
         .to_owned();
     }
-    let rounded = rounded_digits(value.abs());
-    let digits = &rounded.digits[..rounded.count];
-    // the insignificant zero digits are not written
+    let negative = value < 0.0;
+    let magnitude = value.abs();
+    // a subnormal's steps are wider than a fifteen-digit step, so its
+    // shortest text and its fifteen-digit rounding can differ; only a
+    // normal value's shortest text is the answer
+    if magnitude.is_normal() {
+        let shortest = shortest_text(magnitude);
+        if let Some((digits, exponent)) = shortest.answer() {
+            return shaped(negative, digits, exponent);
+        }
+    }
+    // the exact path: the value rounded to fifteen significant digits, with
+    // the insignificant zero digits dropped
+    let exact = rounded_digits(magnitude);
+    let digits = &exact.digits[..exact.count];
     let mut significant = digits.len();
     while significant > 1 && digits[significant - 1] == b'0' {
         significant -= 1;
     }
-    let digits = &digits[..significant];
-    let exponent = rounded.exponent;
+    shaped(negative, &digits[..significant], exact.exponent)
+}
+
+/// The text of a real with the given sign, significant digits and decimal
+/// exponent.
+///
+/// The digits are the significant ones, so no zero is dropped here.
+fn shaped(negative: bool, digits: &[u8], exponent: i32) -> String {
     let mut text = String::with_capacity(REAL_TEXT_CAPACITY);
-    if value < 0.0 {
+    if negative {
         text.push('-');
     }
     if exponent < FIXED_FORM_LOWEST_EXPONENT || exponent >= REAL_DIGITS as i32 {
@@ -707,6 +736,111 @@ fn real_text(value: f64) -> String {
     text
 }
 
+/// The shortest round-trip text of a positive real, read into [`Shortest`].
+fn shortest_text(value: f64) -> Shortest {
+    let mut shortest = Shortest::default();
+    write!(&mut shortest, "{value}").expect("the shortest-form sink never fails");
+    shortest
+}
+
+/// The sink a real's shortest round-trip text is written into.
+///
+/// The text is positional — the shortest formatter never uses the exponent
+/// form — so a tiny value begins with a long run of zeros and a huge one
+/// ends with one. Both runs are counted rather than stored: the sink keeps
+/// the first [`SHORTEST_DIGITS`] significant digits and the counts that place
+/// them, so its size does not depend on the value's exponent.
+#[derive(Default)]
+struct Shortest {
+    /// The significant digits kept, most significant first, as ASCII digit
+    /// bytes so the answer holds the same bytes as the exact path's.
+    digits: [u8; SHORTEST_DIGITS],
+    /// The number of digits kept.
+    count: usize,
+    /// The number of digits in the integer part.
+    integer_digits: u32,
+    /// The index, in the integer part, of the first significant digit.
+    integer_first: Option<u32>,
+    /// The number of fraction digits before the first significant digit.
+    fraction_leading: u32,
+    /// The number of digits seen since the first significant digit.
+    position: u32,
+    /// The position of the last non-zero digit since the first significant
+    /// one, which is the number of significant digits the text holds.
+    last_nonzero: u32,
+    /// Whether the first significant digit has been seen.
+    started: bool,
+    /// Whether the point has been seen.
+    point_seen: bool,
+    /// Whether the text holds a digit the sink could not keep, or a character
+    /// that is not part of a number's text.
+    rejected: bool,
+}
+
+impl Shortest {
+    /// Takes one digit of the text.
+    fn push_digit(&mut self, digit: u8) {
+        if self.point_seen {
+            if !self.started {
+                if digit == 0 {
+                    self.fraction_leading += 1;
+                    return;
+                }
+                self.started = true;
+            }
+        } else {
+            let index = self.integer_digits;
+            self.integer_digits += 1;
+            if !self.started {
+                if digit == 0 {
+                    return;
+                }
+                self.started = true;
+                self.integer_first = Some(index);
+            }
+        }
+        self.position += 1;
+        if digit != 0 {
+            self.last_nonzero = self.position;
+        }
+        if self.count < SHORTEST_DIGITS {
+            // the digits are written as text, so the answer holds digit bytes
+            self.digits[self.count] = b'0' + digit;
+            self.count += 1;
+        } else if digit != 0 {
+            self.rejected = true;
+        }
+    }
+
+    /// The significant digits and the decimal exponent of their first digit,
+    /// or `None` when the text holds more than fifteen of them.
+    fn answer(&self) -> Option<(&[u8], i32)> {
+        if self.rejected || !self.started || self.last_nonzero as usize > SHORTEST_DIGITS {
+            return None;
+        }
+        let exponent = match self.integer_first {
+            Some(index) => self.integer_digits as i32 - 1 - index as i32,
+            None => -(self.fraction_leading as i32) - 1,
+        };
+        Some((&self.digits[..self.last_nonzero as usize], exponent))
+    }
+}
+
+impl fmt::Write for Shortest {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        for byte in text.bytes() {
+            if byte == b'.' {
+                self.point_seen = true;
+            } else if byte.is_ascii_digit() {
+                self.push_digit(byte - b'0');
+            } else if byte != b'-' {
+                self.rejected = true;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The rounded significand digits of a positive real, and the decimal
 /// exponent of its first digit.
 ///
@@ -730,7 +864,7 @@ fn rounded_digits(value: f64) -> Significand {
 /// never as text.
 #[derive(Default)]
 struct Significand {
-    /// The significand digits, most significant first.
+    /// The significand digits, most significant first, as ASCII digit bytes.
     digits: [u8; REAL_DIGITS],
     /// The number of digits kept.
     count: usize,
@@ -886,7 +1020,7 @@ impl Digits {
 
 #[cfg(test)]
 mod tests {
-    use super::{Number, NumberError, parse};
+    use super::{FIXED_FORM_LOWEST_EXPONENT, Number, NumberError, REAL_DIGITS, parse, real_text};
 
     /// The code units of a text.
     fn units(text: &str) -> Vec<u16> {
@@ -1123,5 +1257,178 @@ mod tests {
         assert_eq!(Number::Integer(12).to_real(), 12.0);
         assert_eq!(Number::Integer(-12).to_real(), -12.0);
         assert_eq!(Number::Real(0.5).to_real(), 0.5);
+    }
+
+    /// The rule written the plain way: the exact formatter's text, its digits
+    /// collected, the insignificant zero digits dropped, the text shaped.
+    ///
+    /// It is the oracle of the test below — the shortest-text path must
+    /// answer what this answers, byte for byte.
+    ///
+    /// reference/cpp/core/tjs2/tjsVariant.cpp:213-249
+    fn oracle(value: f64) -> String {
+        if value.is_nan() {
+            return "NaN".to_owned();
+        }
+        if value.is_infinite() {
+            return if value < 0.0 {
+                "-Infinity"
+            } else {
+                "+Infinity"
+            }
+            .to_owned();
+        }
+        if value == 0.0 {
+            return if value.is_sign_negative() {
+                "-0.0"
+            } else {
+                "+0.0"
+            }
+            .to_owned();
+        }
+        let exact = format!("{:.*e}", REAL_DIGITS - 1, value.abs());
+        let (mantissa, exponent) = exact
+            .split_once('e')
+            .expect("the exponent form of a real carries its exponent");
+        let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+        let exponent: i32 = exponent
+            .parse()
+            .expect("the exponent form of a real carries a decimal exponent");
+        let mut text = String::new();
+        if value < 0.0 {
+            text.push('-');
+        }
+        if exponent < FIXED_FORM_LOWEST_EXPONENT || exponent >= REAL_DIGITS as i32 {
+            text.push_str(&digits[..1]);
+            let fraction = digits[1..].trim_end_matches('0');
+            if !fraction.is_empty() {
+                text.push('.');
+                text.push_str(fraction);
+            }
+            text.push('e');
+            text.push(if exponent < 0 { '-' } else { '+' });
+            let magnitude = exponent.unsigned_abs();
+            if magnitude < 10 {
+                text.push('0');
+            }
+            text.push_str(&magnitude.to_string());
+        } else if exponent >= 0 {
+            let point = exponent as usize + 1;
+            let (whole, fraction) = digits.split_at(point);
+            text.push_str(whole);
+            let fraction = fraction.trim_end_matches('0');
+            if !fraction.is_empty() {
+                text.push('.');
+                text.push_str(fraction);
+            }
+        } else {
+            text.push_str("0.");
+            for _ in 0..(-exponent - 1) {
+                text.push('0');
+            }
+            text.push_str(digits.trim_end_matches('0'));
+        }
+        text
+    }
+
+    /// Asserts that the written text is the oracle's text.
+    fn agrees(value: f64) {
+        assert_eq!(
+            real_text(value),
+            oracle(value),
+            "the answers differ for the bit pattern {:#018x}",
+            value.to_bits()
+        );
+    }
+
+    /// The number of significant digits the shortest round-trip text holds.
+    fn shortest_digits(value: f64) -> usize {
+        let text = format!("{value}");
+        let digits: Vec<u8> = text.bytes().filter(u8::is_ascii_digit).collect();
+        let first = digits.iter().position(|&digit| digit != b'0');
+        let last = digits.iter().rposition(|&digit| digit != b'0');
+        match (first, last) {
+            (Some(first), Some(last)) => last - first + 1,
+            _ => 0,
+        }
+    }
+
+    /// The shortest-text path answers exactly what the plain rule answers.
+    ///
+    /// The corpus: two million random bit patterns (a linear congruential
+    /// generator, no dependency; the non-finite patterns are skipped here and
+    /// compared with the named forms below), every power of ten from 1e-308
+    /// to 1e308, a thousand integers spaced over `0..1e15`, the values on both
+    /// sides of the two form thresholds, the subnormal range with both of its
+    /// ends, values whose shortest text holds exactly fifteen, sixteen and
+    /// seventeen significant digits, and the nine recorded answers.
+    ///
+    /// reference/cpp/core/tjs2/tjsVariant.cpp:213-249
+    #[test]
+    fn the_shortest_text_is_the_exact_text() {
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..2_000_000 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let value = f64::from_bits(state);
+            if !value.is_finite() {
+                continue;
+            }
+            agrees(value);
+        }
+        for exponent in -308..=308 {
+            agrees(10f64.powi(exponent));
+        }
+        for step in 0..1000 {
+            agrees(f64::from(step) * 1e12);
+            agrees(f64::from(step));
+        }
+        let thresholds: [f64; 3] = [1e-4, 1e15, 9.99999999999999e14];
+        for value in thresholds {
+            for bits in [value.to_bits() - 1, value.to_bits(), value.to_bits() + 1] {
+                agrees(f64::from_bits(bits));
+            }
+        }
+        for bits in [
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            0x000f_ffff_ffff_ffff,
+            0x0010_0000_0000_0000,
+        ] {
+            agrees(f64::from_bits(bits));
+            agrees(f64::from_bits(bits | (1 << 63)));
+        }
+        // the shortest text of these holds exactly fifteen, sixteen and
+        // seventeen significant digits, and the test checks that it does
+        for value in [0.123456789012345, 1.0 / 3.0, 0.1 + 0.2, 1.0000000000000002] {
+            agrees(value);
+        }
+        assert_eq!(shortest_digits(0.123456789012345), 15);
+        assert_eq!(shortest_digits(1.0 / 3.0), 16);
+        assert_eq!(shortest_digits(0.1 + 0.2), 17);
+        assert_eq!(shortest_digits(1.0000000000000002), 17);
+        // the recorded answers: the named forms, both zeros and the reals
+        for value in [
+            0.0,
+            1.5,
+            1.0 / 3.0,
+            1e20,
+            1e-20,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            agrees(value);
+        }
     }
 }
