@@ -1727,36 +1727,42 @@ oniguruma), **bison** (the date grammar), **python3** (the date word map),
 **libc++** and **libonig**. Two of those needs have to be replaced rather than
 deleted, and each needs its own oracle first:
 
-* **the regular expression engine** (`tjsRegExp.cpp` over Oniguruma). The
-  surface is six calls — `onig_new`, `onig_search`, `onig_region_new`/`free`/
-  `clear`, `onig_error_code_to_str`, `onig_free`, `onig_end` — and it is
-  reached from `String.replace`, the `RegExp` object and every pattern a game's
-  scripts carry. The candidates are chosen by **usage and maintenance, not by
-  the claim on the tin**: `regex` (1.45e9 downloads, rust-lang, linear-time
-  matching on every input) for everything it can express, `fancy-regex`
-  (3.25e8 downloads, since 2017, layered on `regex-automata`) for the
-  backreference and lookaround patterns `regex` cannot take. The Oniguruma
-  clones are **rejected on that bar**, however close their stated
-  compatibility: `ferroni` has 60 000 downloads and `rusty_expressions` 1 300,
-  both first published this year, against a game's save path. The binding
-  crates — `onig`, `onig_sys`, `oniguruma` — are not candidates either: they
-  keep the C library. What the two chosen engines do not implement is stated
-  rather than discovered: callouts, the absent operator, subexpression calls
-  and `\G`. The proof is the number rule's: inventory the patterns the games
-  ship (needs the game directory), record the engine's own match results over
-  them, compare, and only then delete `tjsRegExp.cpp` and `libonig`. An adapter
-  seam (`compile`/`search`/`error`) keeps the choice replaceable, and if the
-  inventory turns up a pattern that needs an Oniguruma-only construct, that is
-  a recorded gap with its pattern, not a silent difference.
+* **the regular expression engine** (`tjsRegExp.cpp`, 763 lines of C++, over
+  Oniguruma). The scope is set: the **C library stays** and the *C++* goes.
+  The engine is created with `ONIG_ENCODING_UTF16_LE` and `ONIG_SYNTAX_PERL`
+  (`tjsRegExp.cpp:307`, `:650`) — not UTF-8 and not the default syntax — so a
+  Rust engine would have to reproduce a dialect, an encoding and an index
+  mapping over strings that are UTF-16 by definition. Keeping Oniguruma through
+  a Rust binding (`onig` 6.5 / `onig_sys` 69.9, or the raw `onig_sys` for the
+  six calls that are used: `onig_new`, `onig_search`, `onig_region_new`/
+  `free`/`clear`, `onig_error_code_to_str`, `onig_free`, `onig_end`) makes the
+  behaviour **identical by construction** and removes the last C++ user of the
+  regex surface while leaving the C dependency in place, like FFmpeg, libopus
+  and ALSA. The pure-Rust engines stay recorded as the fallback if a C
+  dependency ever has to go: `regex` (1.45e9 downloads, rust-lang, linear time)
+  and `fancy-regex` (3.3e8, backreferences and lookaround), while the two
+  Oniguruma clones are rejected on the usage bar — `ferroni` 60 000 downloads
+  and `rusty_expressions` 1 300, both first published this year. Either way the
+  proof is the number rule's: inventory the patterns the games ship (needs the
+  game directory), record the engine's own match results, compare, then delete
+  `tjsRegExp.cpp`.
 * **the date grammar and its word map** (`bison/tjsdate.y` and
   `script/create_world_map.py`). The whole unit is 800 lines plus a 99-line
   generator; a ported parser retires bison, a Rust build step retires python3,
   and calendar arithmetic comes from `jiff` (1.0, pure Rust) or std.
 
-When the last file goes, `crates/tjs/build.rs` and `links = "tjs2"` go with
-it, and the toolchain list in `AGENTS.md` §1.2 shrinks to Rust plus the media
-backends' system libraries — FFmpeg and ALSA are external C libraries the media
-backend links by choice (`docs/arch/l1.md` §4), not code in this tree.
+**The scope, decided.** The target is **zero C and C++ sources in this
+repository**: `crates/tjs/cpp/` deleted, `build.rs` and `links = "tjs2"` with
+it, and **zig gone** — the C++ compiler, and the package manager that fetches
+fmt, spdlog, boost and oniguruma, exists only to build those files. Bison and
+python3 go the same way, with the date grammar they serve. **C libraries stay**:
+FFmpeg, libopus, ALSA and Oniguruma are dependencies of the binary, accepted as
+such (`docs/arch/l1.md` §4 for the media backend), and the point of the order is
+that the C++ and its zig chain leave the build before anything else does.
+
+When the last file goes, the toolchain list in `AGENTS.md` §1.2 shrinks to Rust
+plus a C compiler for those libraries — no C++ compiler, no zig, no bison, no
+python3.
 
 **The member map is not the keyed table.** `tTJSCustomObject` does not store
 its members in `tTJSHashTable`: it keeps a power-of-two symbol array with its
