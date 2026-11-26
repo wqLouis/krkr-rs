@@ -300,8 +300,17 @@ computes the same three offsets (`crates/tjs/src/vm/codegen/objects.rs:709`,
 
 ### 2.4 The surprises
 
-Six rules that reading the opcode names will not give you. Each one is a
+Seven rules that reading the opcode names will not give you, each one
+recorded from the engine rather than read off the code where the two disagree. Each one is a
 behaviour a port gets wrong silently.
+
+0. **`typeof` of a subscripted string answers the character.** `typeof s[1]`
+   is `"b"`, not `"String"`, for a literal receiver as well as a variable,
+   while `typeof s.length` through the same diversion answers `"Integer"`
+   (`tjsInterCodeExec.cpp:1871-1889`). The direct form runs the string
+   property read into the destination register and then applies the type; for
+   an index the type does not survive. A port that computes the type from the
+   value is more correct than the engine and therefore wrong.
 
 1. **`CLT` compares *less-than*, but the variant method it calls is named
    `GreaterThan`.** `VM_CLT` evaluates `a.GreaterThan(b)`
