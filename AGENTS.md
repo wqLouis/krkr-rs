@@ -308,12 +308,14 @@ renderer and the scenario engine are reimplemented in Rust.
 ### 1.2 Get it running
 
 The toolchain is Rust stable (edition 2024), a C++17 compiler, Zig 0.17
-(`crates/tjs/build.rs` fetches the C++ dependencies with it), bison, Python 3
-and the system development packages for FFmpeg, ALSA and libc++. The release
-workflow's Linux job installs exactly that list: `bison build-essential clang
-cmake libclang-dev`, `libavcodec-dev libavformat-dev libavutil-dev
-libswresample-dev libswscale-dev`, `libasound2-dev libc++-dev libc++abi-dev
-pkg-config python3`.
+(`crates/tjs/build.rs` fetches the C++ dependencies with it) and the system
+development packages for FFmpeg, ALSA and libc++. No grammar generator runs at
+build time: the script and date grammars are this repository's own code, so
+`bison` and the word-map generator are gone. The release workflow's Linux job
+installs exactly that list: `build-essential clang cmake libclang-dev`,
+`libavcodec-dev libavformat-dev libavutil-dev libswresample-dev libswscale-dev`,
+`libasound2-dev libc++-dev libc++abi-dev pkg-config`. The gate itself is a
+Python program run through `uv`, which brings its own interpreter.
 
 Build and run:
 

@@ -1689,7 +1689,7 @@ page.
 
 The front end is Rust (`crates/tjs/src/vm/{lexer,parser,codegen}`) and the
 vendored analyser, grammar and generator are gone. Everything behind the one
-compile seam is still the vendored tree — 31 280 lines across 68 files, plus
+compile seam is still the vendored tree — 30 979 lines across 66 files, plus
 the C ABI shim (`cpp/tjs2_abi.cpp`, 3 917 lines) and
 `cpp/streams.cpp`. The runtime is built bottom up in
 `crates/tjs/src/vm/runtime/`, one part per change, and the part a change
