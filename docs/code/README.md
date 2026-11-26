@@ -117,7 +117,8 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 | [`tjs/generator.md`](tjs/generator.md) | `tjs::vm` | the code generator: the expression tree to bytecode, and the rules it implements |
 | [`tjs/seam.md`](tjs/seam.md), [`tjs/seam-fields.md`](tjs/seam-fields.md) | `tjs::vm` | the seam: the compile entry, the C ABI, and the field-by-field table of the script block image |
 | [`tjs/corpus.md`](tjs/corpus.md) | `tjs::vm` | the corpus digest: the fixture of every script's compiled block, and the check that compares the front end with it |
-| [`tjs/runtime.md`](tjs/runtime.md) | `tjs::vm::runtime` | the runtime in Rust: the value layer, the two proofs, and what each later part deletes |
+| [`tjs/runtime.md`](tjs/runtime.md) | `tjs::vm::runtime` | the runtime in Rust: the value layer, its parts, and what each later part deletes |
+| [`tjs/interpreter.md`](tjs/interpreter.md) | `tjs::vm::runtime::exec` | the interpreter: the 128 instructions, the frame, `this`/`objthis`, calls, exceptions, the inline cache, the packet plan and the A/B bar |
 
 ---
 
