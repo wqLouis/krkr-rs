@@ -192,10 +192,16 @@ are the reference's own (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.h:42`).
 | `MOD` | `%=` | `DIV` | `/=` |
 | `IDIV` | `\=` | `MUL` | `*=` |
 
-Note that `OPPD`/`OPPI`/`OPP` **do not read the member and write it back**. They
-hand the operation to the object, so a container or a property that defines a
-compound assignment sees one operation rather than a read and a write
-(`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1592-1690`).
+Note that `OPPD`/`OPPI`/`OPP` **do not read the member and write it back**, while
+the executor written against the current dispatch surface must: that surface's
+operator entry carries no member name, so a *named* compound assignment is the
+base object's read, apply and write. The reference's entry does carry the name
+(`Operation(flag, membername, hint, param, objthis)`), and the one place this
+matters is the closure form `*o += 1`, which reaches an object's own override
+with a null name (`tjsInterCodeExec.cpp:1592-1690`). Nothing in the engine
+overrides the named form, so the two agree in practice; the port keeps the
+narrower entry and records the difference here rather than growing a parameter
+no closure can serve.
 
 #### The single-operand operators — 82 … 98
 
@@ -359,7 +365,7 @@ behaviour a port gets wrong silently.
 | 3 | build the **objthis-context** into `ra[-2]`: a proxy over `objthis`, falling back to the global object (`:659-672`) |
 | 4 | set `ra[-1] = (objthis, objthis)` (`:707`) |
 | 5 | clear `ra[0]` (`:708`) |
-| 6 | copy the declared arguments into `ra[-3]`, `ra[-4]`, …, clearing the ones not supplied (`:711-731`) |
+| 6 | copy the declared arguments into `ra[-3]`, `ra[-4]`, …, clearing the ones not supplied (`:711-731`) — the registers below `ra` belong to the **caller**, which writes them into its own stack, so a frame with no caller never writes them |
 | 7 | when the signature has a named collapse argument, build the array from the surplus arguments (`:734-750`) |
 | 8 | run `ExecuteCode` (`:752`) |
 | 9 | clear `ra[-2]` and hand the block back (`:766-771`) |
@@ -675,7 +681,7 @@ everything, and the frame gates every opcode.
 |---|---|---|---|---|
 | **P0** | **the dispatch surface** — `func_call`, `create_new`, `operation`, by-number access, and the real `Closure` surface | `runtime/object.rs`, `runtime/variant.rs` (G1–G3, G5) | ~600 lines | a script-shaped value can be invoked, compound-assigned and subscripted through the trait; the object-model oracle (`crates/tjs/examples/object_oracle.rs`) still reproduces its record, and new probes cover the three added entries |
 | **P0b** | **the throw value on the native boundary** (G6) | `crates/tjs/cpp/tjs2_abi.cpp`, `crates/tjs/cpp/tjs2_abi.h`, `crates/tjs/src/lib.rs` | ~250 lines | a script `throw` that crosses a native call leaves a `catch` with the object it threw; the probe drives a native that calls back into a script that throws, and asserts the object's members on the far side |
-| **P1** | **the frame** — the register window, the argument copy, the collapse array, the discard register, the `this` triple, the block allocator | `runtime/exec/frame.rs` | ~450 lines | a hand-built code stream answers what the frame put there: `[CONST %1 #3][SRV %1][RET]` answers 3; a call with more, fewer and exactly the declared arguments leaves the registers the reference leaves; a collapse parameter answers an array of the surplus |
+| **P1** | **the frame** — the register window, the argument copy, the collapse array, the discard register, the `this` triple, the block allocator, and the objthis-context proxy (a thirteen-entry dispatch of its own) | `runtime/exec/frame.rs` | ~930 lines | a hand-built code stream answers what the frame put there: `[CONST %1 #3][SRV %1][RET]` answers 3; a call with more, fewer and exactly the declared arguments leaves the registers the reference leaves; a collapse parameter answers an array of the surplus |
 | **P2** | **the decoder and the flag** — the layout table, the dispatch, the 18 control/comparison opcodes, the 17 single-operand ones, and the 56 arithmetic and property forms | `runtime/exec/decode.rs`, `runtime/exec/op.rs` | ~1 100 lines | every arithmetic and comparison opcode answers what the reference answers, including the `GreaterThan`/`LittlerThan` inversion and the `<=`-as-`CGT`+`SETNF` pair; the flag survives an intervening `TT`; the two unreachable opcodes are decoded and executed |
 | **P3** | **member access** — the 15 access opcodes, the string and octet diversions, the property flags | `runtime/exec/member.rs` | ~700 lines | the six source shapes of §3.4 answer what the reference answers on a plain object, a dictionary, a string, an octet and a property; `delete` answers a boolean and a missing member is not an error; `typeof` distinguishes `"void"` from `"undefined"` |
 | **P4** | **calls and returns** — the four call opcodes, the three argument-list shapes, `SRV`/`RET`, the context as a dispatch object | `runtime/exec/call.rs` | ~500 lines | recursion terminates with the right answer; `...` passes the caller's arguments through with no copy and no `arguments` object; the collapse parameter and `fatExpand` splice the right elements; a call with no result slot discards nothing |
