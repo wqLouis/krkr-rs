@@ -49,6 +49,7 @@ pub mod dictionary;
 pub mod exec;
 pub mod hash;
 pub mod member;
+pub mod natives;
 pub mod number;
 pub mod object;
 pub mod octet;

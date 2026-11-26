@@ -1,0 +1,9 @@
+//! The built-in classes' rules.
+//!
+//! Each module here is a table of what the class publishes and the function
+//! behind each entry, not a class object: the object itself — its statics, its
+//! construction, its class name — belongs to the layer that registers classes.
+//! What is here is the part a script's answer depends on, and every answer is
+//! recorded from the engine before it is written.
+
+pub mod math;
