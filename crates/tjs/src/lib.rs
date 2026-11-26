@@ -1,6 +1,6 @@
 //! FFI bindings to the TJS2 scripting VM.
 //!
-//! The VM is compiled by `build.rs` with the C++ compiler it bundles, and
+//! The VM is compiled by `build.rs` with the compiler it bundles, and
 //! statically linked; the script and date grammars are this crate's own code, so
 //! no grammar generator runs at build time. This crate exposes a small, hand-written safe wrapper
 //! over the C ABI the VM's glue exports.

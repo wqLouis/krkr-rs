@@ -613,7 +613,7 @@ pub fn register(address: i32) -> Result<i32, Fault> {
 /// The code position a code address names, relative to the start of the code
 /// stream.
 pub fn code_position(address: i32) -> Result<i32, Fault> {
-    if address % 4 != 0 {
+    if address.checked_rem(4) != Some(0) {
         return Err(Fault::MisalignedCode(address));
     }
     Ok(vm_code_from_addr(address))

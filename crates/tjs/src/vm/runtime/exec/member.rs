@@ -200,7 +200,8 @@ fn delete(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), F
     };
     let answer = match object.delete_member(&text, MemberFlags::NONE, receiver.as_deref()) {
         Ok(()) => Variant::Integer(1),
-        Err(_) => Variant::Integer(0),
+        // a refusal is the answer, not a failure the instruction reports
+        Err(_refused) => Variant::Integer(0),
     };
     if destination != 0 {
         frame.set(destination, answer)?;
