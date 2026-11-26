@@ -46,6 +46,7 @@
 
 pub mod array;
 pub mod dictionary;
+pub mod exec;
 pub mod hash;
 pub mod member;
 pub mod number;
