@@ -1700,10 +1700,10 @@ replaces is deleted from the vendored tree in that same change:
 | R1 the value layer — **landed** | `runtime/{string,number,hash}.rs` | `tjsVariantString`, `tjsNumberParse`, the table in `tjsHashSearch.h` |
 | R2 the variant — **landed** | `runtime/{variant,octet}.rs`: the tagged value, the closure handle, the coercions | `tjsVariant.{h,cpp}` |
 | R3 the object model — **landed** | `runtime/{member,object}.rs`: the member map, the custom object, the dispatch | `tjsObject.{h,cpp}`, `tjsNative.{h,cpp}` |
-| R4 the containers — **the array landed** | `runtime/{array,dictionary}.rs` | `tjsArray`, `tjsDictionary`, `tjsOctPack` |
-| R5 the interpreter | `runtime/exec.rs`: the contexts, the code stream, the globals | `tjsInterCodeExec.cpp`, `tjsInterCodeContext.*`, `tjs.cpp` |
-| R6 the builtin natives | `runtime/natives/`: `Math`, `Date`, `RandomGenerator`, `RegExp`, `String`, `Exception`, `Config` | `tjsMath`, `tjsDate`, `tjsRandomGenerator`, `tjsRegExp`, `tjsString`, `tjsConfig`, `tjsError` |
-| R7 the seam goes | `crates/vm` drives the Rust engine directly | `cpp/tjs2_abi.{h,cpp}`, the `extern` block in `crates/tjs/src/lib.rs`, `build.rs`'s zig/bison/python/oniguruma chain, `streams.cpp` |
+| R4 the containers — **the array and the dictionary landed** | `runtime/{array,dictionary}.rs` (1 296 + 757), 118 and 26 recorded answers | `tjsArray`, `tjsDictionary`; **left:** `tjsOctPack` (1 068), the pack's byte reader and writer |
+| R5 the interpreter — **121 of 128 instructions execute** | `runtime/exec/` (5 887): the frame, the layout table, the arithmetic, the member instructions, calls, the context objects | `tjsInterCodeExec.cpp`, `tjsInterCodeContext.*`, `tjs.cpp`. **Left:** the exception machinery (`ENTRY`/`EXTRY`/`THROW`), the property-object access (`SETP`/`GETP`), the compile entry (`EVAL`/`EEXP`), the class-name write, and the thirteen string methods a call reaches — the packet plan is `docs/code/tjs/interpreter.md` §6 |
+| R6 the builtin natives — **`Math` and `Date` landed, and the date rule is cut over** | `runtime/natives/` (1 683): 141 and 157 recorded answers | `tjsMath`, `tjsDate` and its parser are gone, with bison and python3. **Left:** `String`, `Config`, `RandomGenerator`, `RegExp`, the exception class, `ObjectExtendable`, and the pack with R4 |
+| R7 the seam goes — **not started** | `crates/vm` drives the Rust engine directly | `cpp/tjs2_abi.{h,cpp}` (4 853), `tjs2_codegen.h` (331), `streams.cpp` (1 617), the block loader and serializer (4 021), the `extern` block in `crates/tjs/src/lib.rs`, and then **zig** with the last of the vendored bodies (12 850 shadow lines), which die in this one move |
 
 **A landed part does not always delete its body in the same change.** R2 and
 R3 are in Rust and proven, but the vendored variant and object are still
