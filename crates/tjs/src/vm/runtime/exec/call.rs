@@ -429,6 +429,10 @@ mod tests {
             false
         }
 
+        fn add_class_name(&self, _name: &TjsString) -> Result<(), ObjectError> {
+            Ok(())
+        }
+
         fn func_call(
             &self,
             name: &TjsString,

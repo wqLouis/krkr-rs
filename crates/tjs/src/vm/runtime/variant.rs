@@ -583,6 +583,10 @@ mod tests {
         fn invalidate(&self) -> bool {
             false
         }
+
+        fn add_class_name(&self, _name: &TjsString) -> Result<(), ObjectError> {
+            Ok(())
+        }
     }
 
     /// The object value over a dispatch.

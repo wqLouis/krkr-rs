@@ -352,6 +352,11 @@ impl Dispatch for ObjThisContext {
         self.primary.class_names()
     }
 
+    /// A name added to the view is added to the object it stands in front of.
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.primary.add_class_name(name)
+    }
+
     /// The view is usable while the primary is.
     fn is_valid(&self) -> bool {
         self.primary.is_valid()
@@ -984,6 +989,20 @@ mod tests {
         assert!(matches!(found, Variant::Integer(9)));
         let missing = context.prop_get(&TjsString::from("nope"), MemberFlags::NONE, None);
         assert!(matches!(missing, Err(ObjectError::MemberNotFound)));
+    }
+
+    /// A name added to the view is added to the object the view stands in front
+    /// of (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:237-238`,
+    /// `OBJ1`).
+    #[test]
+    fn the_context_forwards_a_class_name_to_its_receiver() {
+        let primary = Rc::new(CustomObject::new(Vec::new()));
+        let handle: Rc<dyn Dispatch> = primary.clone();
+        let context = ObjThisContext::new(handle, None);
+        context
+            .add_class_name(&TjsString::from("Added"))
+            .expect("the name is added");
+        assert_eq!(primary.class_names(), vec![TjsString::from("Added")]);
     }
 
     /// The context does not look twice in one object.

@@ -808,6 +808,10 @@ impl Dispatch for ArrayObject {
         self.members.class_names()
     }
 
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.members.add_class_name(name)
+    }
+
     fn is_valid(&self) -> bool {
         self.members.is_valid()
     }

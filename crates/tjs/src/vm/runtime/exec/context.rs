@@ -36,6 +36,7 @@
 //! instruction therefore stops with a refusal that names the missing entry
 //! rather than dropping the name.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::vm::codegen::context::ContextType;
@@ -116,10 +117,32 @@ pub fn execute(
             };
             publish(context, frame)
         }
-        vm::ADDCI => Err(Fault::Refused {
-            opcode: String::from("ADDCI"),
-            part: "the class-name write on the object surface",
-        }),
+        vm::ADDCI => {
+            let target = operand(code, ip, 1)?;
+            let value = frame.reg(operand(code, ip, 2)?)?.clone();
+            let named = frame.reg(target)?.clone();
+            let object = match &named {
+                Variant::Object(closure) => closure.object.clone(),
+                _ => None,
+            };
+            let object = match object {
+                Some(object) => object,
+                None => {
+                    return Err(Fault::Raised(super::Raise::Convert {
+                        value: Box::new(named),
+                        to: "Object",
+                    }));
+                }
+            };
+            // a value with no text names the empty class, which is what the
+            // engine's null string becomes
+            // a value with no text names the empty class, which is what the
+            // engine's null string becomes
+            let name = value
+                .to_string()
+                .unwrap_or_else(|_no_text| TjsString::new());
+            object.add_class_name(&name).map_err(Fault::from)
+        }
         _ => Err(Fault::Broken("a context instruction that is not one")),
     }
 }
@@ -183,6 +206,12 @@ pub struct ContextObject {
     /// The members the context publishes: the functions it declares and, for a
     /// class, the members its body installs.
     members: CustomObject,
+    /// The class names added to the context after it was built.
+    ///
+    /// The chain a class answers to is this, then the context's own name, then
+    /// its parent's; a name added here is a name an instance of the class
+    /// answers to.
+    added: RefCell<Vec<TjsString>>,
 }
 
 impl ContextObject {
@@ -194,6 +223,7 @@ impl ContextObject {
             name: name.into(),
             parent: None,
             members: CustomObject::new(Vec::new()),
+            added: RefCell::new(Vec::new()),
         }
     }
 
@@ -248,6 +278,7 @@ impl ContextObject {
         if self.kind == ContextType::Class && !self.name.is_empty() {
             names.push(self.name.clone());
         }
+        names.extend(self.added.borrow().iter().cloned());
         if let Some(parent) = self.continuation() {
             names.extend(parent.chain());
         }
@@ -313,6 +344,13 @@ impl Dispatch for ContextObject {
 
     fn class_names(&self) -> Vec<TjsString> {
         self.chain()
+    }
+
+    /// A name added to the context joins its chain, which is the list both
+    /// readers of class names walk.
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.added.borrow_mut().push(name.clone());
+        Ok(())
     }
 
     fn is_valid(&self) -> bool {
@@ -625,13 +663,13 @@ mod tests {
         ));
     }
 
-    /// `ADDCI` adds a class name to an object that is already built, and the
-    /// surface publishes class names with no write beside them, so the
-    /// instruction stops and names what it is missing
-    /// (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2233-2247`).
+    /// `ADDCI` appends the name the instruction names to the object in its
+    /// register (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2236-2246`,
+    /// `ClassInstanceInfo(TJS_CII_ADD, ...)`).
     #[test]
-    fn addci_names_the_missing_entry() {
-        let instance: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+    fn addci_appends_the_class_name() {
+        let instance = Rc::new(CustomObject::new(Vec::new()));
+        let handle: Rc<dyn Dispatch> = instance.clone();
         let code = code_of(
             vec![
                 vm::CONST,
@@ -643,24 +681,43 @@ mod tests {
                 vm::ADDCI,
                 register(1),
                 register(2),
+                vm::SRV,
+                register(1),
                 vm::RET,
             ],
             vec![
                 Variant::Object(Closure {
-                    object: Some(instance),
+                    object: Some(handle),
                     objthis: None,
                 }),
                 Variant::String(text("C")),
             ],
         );
         let mut machine = super::super::Machine::new();
-        match machine.run(&code, None, &[]) {
-            Err(Fault::Refused { opcode, part }) => {
-                assert_eq!(opcode, "ADDCI");
-                assert_eq!(part, "the class-name write on the object surface");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
+        let _ = machine.run(&code, None, &[]).expect("the stream runs");
+        assert_eq!(instance.class_names(), vec![text("C")]);
+        assert_eq!(instance.is_instance_of(&text("C"), None), Ok(true));
+        assert_eq!(instance.is_instance_of(&text("Other"), None), Ok(false));
+    }
+
+    /// A name added to a class joins the chain both of its readers walk, so an
+    /// instance of it answers the question the name asks
+    /// (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2236-2246`).
+    #[test]
+    fn a_name_added_to_a_class_joins_its_chain() {
+        let base = context(ContextType::Class, "Base");
+        let child = Rc::new(
+            ContextObject::new(Code::default(), ContextType::Class, "Child").with_parent(base),
+        );
+        child
+            .add_class_name(&text("Alias"))
+            .expect("the name is added");
+        let names: Vec<String> = child.class_names().iter().map(|n| n.to_string()).collect();
+        assert_eq!(
+            names,
+            vec!["Child".to_string(), "Alias".to_string(), "Base".to_string()]
+        );
+        assert_eq!(child.is_instance_of(&text("Alias"), None), Ok(true));
     }
 
     /// The four opcodes are the ones handled, and no others.

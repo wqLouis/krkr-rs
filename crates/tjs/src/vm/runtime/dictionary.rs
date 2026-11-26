@@ -198,6 +198,10 @@ impl Dispatch for Dictionary {
         self.object.class_names()
     }
 
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.object.add_class_name(name)
+    }
+
     fn is_valid(&self) -> bool {
         self.object.is_valid()
     }

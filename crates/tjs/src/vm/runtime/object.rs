@@ -290,6 +290,14 @@ pub trait Dispatch {
     /// The class names the object carries.
     fn class_names(&self) -> Vec<TjsString>;
 
+    /// Adds a class name to the object.
+    ///
+    /// The names an object carries are how a class question is answered, so an
+    /// object that cannot hold one cannot answer it. Every object can: the name
+    /// is appended to the list the object already keeps, and both the list and
+    /// the class question read that one list.
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError>;
+
     /// Whether the object is still usable.
     fn is_valid(&self) -> bool;
 
@@ -390,7 +398,7 @@ pub struct CustomObject {
     /// The members, in the object's enumeration order.
     members: RefCell<MemberMap<Member>>,
     /// The class names the object answers to, `"Object"` aside.
-    class_names: Vec<TjsString>,
+    class_names: RefCell<Vec<TjsString>>,
     /// Whether the object has been invalidated.
     invalid: Cell<bool>,
 }
@@ -400,7 +408,7 @@ impl CustomObject {
     pub fn new(class_names: impl IntoIterator<Item = TjsString>) -> Self {
         Self {
             members: RefCell::new(MemberMap::new()),
-            class_names: class_names.into_iter().collect(),
+            class_names: RefCell::new(class_names.into_iter().collect()),
             invalid: Cell::new(false),
         }
     }
@@ -580,11 +588,17 @@ impl Dispatch for CustomObject {
         if *class == object_class {
             return Ok(true);
         }
-        Ok(self.class_names.contains(class))
+        Ok(self.class_names.borrow().contains(class))
     }
 
     fn class_names(&self) -> Vec<TjsString> {
-        self.class_names.clone()
+        self.class_names.borrow().clone()
+    }
+
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.check_valid()?;
+        self.class_names.borrow_mut().push(name.clone());
+        Ok(())
     }
 
     fn is_valid(&self) -> bool {
@@ -705,6 +719,34 @@ mod tests {
             .expect("the object enumerates");
         names.sort();
         names
+    }
+
+    /// A class name appended after the object was built is read by both readers
+    /// of the store: the list itself and the class question
+    /// (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2236-2246`).
+    #[test]
+    fn an_appended_class_name_is_read_by_both_readers() {
+        let object = CustomObject::new([TjsString::from("Base")]);
+        object
+            .add_class_name(&TjsString::from("Added"))
+            .expect("the name is added");
+        assert_eq!(
+            object.class_names(),
+            vec![TjsString::from("Base"), TjsString::from("Added")],
+            "the list keeps the order the names arrived in"
+        );
+        assert_eq!(
+            object.is_instance_of(&TjsString::from("Added"), None),
+            Ok(true)
+        );
+        assert_eq!(
+            object.is_instance_of(&TjsString::from("Base"), None),
+            Ok(true)
+        );
+        assert_eq!(
+            object.is_instance_of(&TjsString::from("Missing"), None),
+            Ok(false)
+        );
     }
 
     // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1276-1311
