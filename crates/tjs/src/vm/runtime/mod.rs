@@ -44,6 +44,7 @@
 //! under it stay free of `unsafe`.
 #![deny(unsafe_code)]
 
+pub mod array;
 pub mod hash;
 pub mod member;
 pub mod number;

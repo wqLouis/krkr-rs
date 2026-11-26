@@ -1,0 +1,119 @@
+# the engine's answers, recorded by `crates/tjs/examples/array_oracle.rs`; regenerate with the command in the example's docs
+length_initial	Integer	5
+count_initial	Integer	5
+hole	void	
+hole_typeof	String	void
+element	String	c
+past_end	void	
+past_end_typeof	String	undefined
+length_after_read	Integer	5
+negative_read	Integer	5
+negative_beyond	void	
+negative_beyond_typeof	String	undefined
+write_past	Integer	9
+write_gap	void	
+length_after_write	Integer	8
+shrink	Integer	3
+length_after_shrink	Integer	3
+shrink_typeof	String	undefined
+grow	Integer	5
+grown_hole	void	
+write_negative	String	z
+write_negative_read	String	z
+write_negative_beyond	!raise	
+add	Integer	5
+add_read	String	a
+insert_head	void	
+insert_head_read	String	i
+insert_middle	void	
+insert_middle_read	String	m
+insert_middle_shift	void	
+insert_negative	void	
+insert_negative_read	String	e
+insert_too_negative	!raise	
+insert_past	!raise	
+erase	void	
+erase_read	Integer	1
+erase_negative	void	
+erase_past	!raise	
+erase_too_negative	!raise	
+push	Integer	10
+find_first	Integer	7
+find_start	Integer	8
+find_miss	Integer	-1
+find_kind	Integer	-1
+find_same	Integer	0
+find_negative_start	Integer	9
+find_before	Integer	7
+remove_first	Integer	1
+remove_rest	Integer	1
+remove_miss	Integer	0
+join	String	1-m--c--z-e-8
+join_purge	String	1-m-c-z-e-8
+reverse	void	
+reverse_read	Integer	8
+clear	void	
+clear_length	Integer	0
+clear_read	void	
+sort_push	Integer	3
+sort_default	void	
+sort_default_join	String	1,2,3
+sort_desc	void	
+sort_desc_join	String	3,2,1
+sort_text_clear	void	
+sort_text_push	Integer	3
+sort_numeric	void	
+sort_numeric_join	String	1,9,10
+sort_numeric_desc	void	
+sort_numeric_desc_join	String	10,9,1
+sort_string	void	
+sort_string_join	String	1,10,9
+sort_string_desc	void	
+sort_string_desc_join	String	9,10,1
+sort_unknown_letter	void	
+sort_unknown_join	String	1,10,9
+sort_stable	void	
+sort_stable_join	String	1,10,9
+queue_clear	void	
+queue_push	Integer	3
+pop	Integer	3
+shift	Integer	1
+unshift	Integer	2
+queue_join	String	0,2
+queue_clear2	void	
+pop_empty	void	
+shift_empty	void	
+delete_push	Integer	3
+delete_index	Integer	1
+delete_read	Integer	2
+delete_past	Integer	0
+delete_negative	Integer	1
+delete_negative_beyond	Integer	0
+delete_string_index	Integer	1
+named_write	String	n
+named_read	String	n
+named_absent_typeof	String	undefined
+named_absent_read	!raise	
+named_delete	Integer	1
+named_deleted_typeof	String	undefined
+named_delete_again	Integer	0
+named_void_write	void	
+named_void_read	void	
+named_length	Integer	0
+padded_write	String	p
+padded_read	String	p
+signed_read	String	p
+dotted_read	String	p
+named_string_typeof	String	undefined
+named_string_read	!raise	
+minus_zero	void	
+whitespace_index	void	
+signed_space_read	String	p
+assign	void	
+assign_length	Integer	2
+assign_first	Integer	4
+assign_second	Integer	5
+named_survives_assign	String	void
+instanceof_array	Integer	0
+instanceof_object	!raise	
+instanceof_dictionary	Integer	0
