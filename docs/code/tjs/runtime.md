@@ -32,6 +32,7 @@ code it replaces removed.
 | the variant | `runtime/variant.rs` | the tagged value, the closure handle and the coercions |
 | the octet | `runtime/octet.rs` | the byte-sequence value |
 | the object | `runtime/object.rs` | the custom object, its member records and the dispatch a member access goes through |
+| the array | `runtime/array.rs` | the containers: an index space of its own and the named members forwarded to the object model |
 | the measurement | `runtime/bench.rs` | the A/B harness against the vendored primitives; `#[cfg(test)]`, `#[ignore]`d |
 
 The module denies `unsafe`: a value owns its storage and is borrowed or
@@ -228,8 +229,11 @@ CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \
 
 ## 4. What the layer does not do yet
 
-The containers (the array, the dictionary, the octet object and its streams),
-the interpreter, and the builtin natives. The order, and what each part
+The dictionary, the interpreter, and the builtin natives. The octet object and
+the stream class that a first plan put under the containers do not exist in the
+engine — asked directly, it answers `Member "Octet" does not exist` for both
+`typeof Octet` and `new Octet()`, and the same for `Stream` — so there is no such
+surface to port, and the octet value is all there is. The order, and what each part
 deletes, is `TODO.md` §12.1.
 
 The vendored bodies of the variant and the object **are still in the tree** and
