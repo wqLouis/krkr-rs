@@ -52,7 +52,9 @@ pub mod decode;
 pub mod frame;
 pub mod member;
 pub mod op;
+pub mod throw;
 
+pub use context::ContextObject;
 pub use decode::{Operator, PropertyForm};
 pub use frame::{BlockStack, Code, Frame, ObjThisContext};
 
@@ -134,7 +136,7 @@ impl PartialEq for Raise {
 /// Every branch is a distinct outcome, because a caller has to tell them apart:
 /// a part is missing, the code raised, the code stream is defective, or a
 /// register is outside the window.
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Fault {
     /// The instruction belongs to a part of the interpreter this build does not
@@ -173,6 +175,61 @@ pub enum Fault {
     /// The object surface refused a call the instruction needed.
     #[error("the object refused the call")]
     Object(ObjectError),
+    /// A script threw this value.
+    ///
+    /// It is its own kind and not a reason, because a catch can reach into the
+    /// value and a handler has to be able to tell a script's failure from the
+    /// engine's.
+    #[error("the script threw a value")]
+    Thrown {
+        /// The value the script threw.
+        value: Box<Variant>,
+    },
+    /// The failure is silent: it passes every protected region by.
+    ///
+    /// A cancellation is not a value a handler may inspect, so it is not turned
+    /// into one.
+    #[error("the code cancelled silently")]
+    Silent,
+}
+
+/// Two faults are the same failure when they are the same kind and carry equal
+/// data.
+///
+/// The comparison is written out because a thrown value is a variant, and a
+/// variant has no equality of its own: the strict comparison is the one that
+/// compares every kind and every handle.
+impl PartialEq for Fault {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::Refused {
+                    opcode: left,
+                    part: left_part,
+                },
+                Self::Refused {
+                    opcode: right,
+                    part: right_part,
+                },
+            ) => left == right && left_part == right_part,
+            (Self::Raised(left), Self::Raised(right)) => left == right,
+            (Self::Thrown { value: left }, Self::Thrown { value: right }) => {
+                op::discern_equals(left, right)
+            }
+            (Self::InvalidOpcode(left), Self::InvalidOpcode(right)) => left == right,
+            (Self::Truncated, Self::Truncated) => true,
+            (Self::Broken(left), Self::Broken(right)) => left == right,
+            (Self::MisalignedRegister(left), Self::MisalignedRegister(right)) => left == right,
+            (Self::MisalignedCode(left), Self::MisalignedCode(right)) => left == right,
+            (
+                Self::RegisterOutOfWindow { address: left },
+                Self::RegisterOutOfWindow { address: right },
+            ) => left == right,
+            (Self::Object(left), Self::Object(right)) => left == right,
+            (Self::Silent, Self::Silent) => true,
+            _ => false,
+        }
+    }
 }
 
 impl From<ObjectError> for Fault {
@@ -233,9 +290,9 @@ impl Machine {
     ) -> Result<Variant, Fault> {
         let block = self.blocks.allocate(code.block_len()?);
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
-        let answer = self.execute(code, &mut frame, argv, None);
+        let answer = self.execute(code, &mut frame, argv, None, 0);
         self.blocks.release(frame.into_block());
-        answer
+        answer.map_err(throw::Unwind::fault)
     }
 
     /// Runs one call of a context object's own code.
@@ -252,20 +309,25 @@ impl Machine {
         let code = context.code();
         let block = self.blocks.allocate(code.block_len()?);
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
-        let answer = self.execute(code, &mut frame, argv, Some(context));
+        let answer = self.execute(code, &mut frame, argv, Some(context), 0);
         self.blocks.release(frame.into_block());
-        answer
+        answer.map_err(throw::Unwind::fault)
     }
 
-    /// Executes the code stream from its first instruction to its return.
-    fn execute(
+    /// Executes the code stream from `start` to its return.
+    ///
+    /// A protected region re-enters here, which is what makes a `try` a host call
+    /// and not a handler stack: the failure of the body surfaces in the entry's
+    /// own frame, and the entry decides whether the catch runs.
+    pub(super) fn execute(
         &self,
         code: &Code,
         frame: &mut Frame,
         argv: &[Variant],
-        context: Option<&Rc<context::ContextObject>>,
-    ) -> Result<Variant, Fault> {
-        let mut ip: usize = 0;
+        context: Option<&Rc<ContextObject>>,
+        start: usize,
+    ) -> Result<Variant, throw::Unwind> {
+        let mut ip: usize = start;
         let mut flag = false;
         let mut result = Variant::Void;
         loop {
@@ -467,6 +529,12 @@ impl Machine {
                 // parts another part owns
                 _ if member::handles(opcode) => member::execute(code, frame, ip, opcode)?,
                 _ if call::handles(opcode) => call::execute(code, frame, argv, ip, opcode)?,
+                // an exit from a protected region ends the context with the result
+                // the stream has stored so far
+                vm::EXTRY => return Ok(result),
+                _ if throw::handles(opcode) => {
+                    return throw::execute(self, code, frame, argv, context, ip, opcode);
+                }
                 _ if context::handles(opcode) => {
                     context::execute(code, frame, context, self.global.as_ref(), ip, opcode)?;
                 }
@@ -475,7 +543,7 @@ impl Machine {
                     (None, Some((operator, form))) => {
                         self.operate(frame, code, ip, operator, form)?;
                     }
-                    (None, None) => return Err(refused(opcode)),
+                    (None, None) => return Err(refused(opcode).into()),
                 },
             }
             ip = next;

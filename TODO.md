@@ -1695,15 +1695,25 @@ the C ABI shim (`cpp/tjs2_abi.cpp`, 3 917 lines) and
 `crates/tjs/src/vm/runtime/`, one part per change, and the part a change
 replaces is deleted from the vendored tree in that same change:
 
-| part | the Rust module | what it deletes |
+The columns are the ones `docs/arch/l4.md` §8 defines, and this table says
+where each stands. A column is landed when its Rust side is in the tree and
+proven against the C++ it replaces; it is **retired** when its vendored body is
+deleted, which for the runtime columns happens together, because the C interface
+marshals their types by value and pointer (see the note below).
+
+| column | in Rust now | what the column still owes |
 |---|---|---|
-| R1 the value layer — **landed** | `runtime/{string,number,hash}.rs` | `tjsVariantString`, `tjsNumberParse`, the table in `tjsHashSearch.h` |
-| R2 the variant — **landed** | `runtime/{variant,octet}.rs`: the tagged value, the closure handle, the coercions | `tjsVariant.{h,cpp}` |
-| R3 the object model — **landed** | `runtime/{member,object}.rs`: the member map, the custom object, the dispatch | `tjsObject.{h,cpp}`, `tjsNative.{h,cpp}` |
-| R4 the containers — **the array and the dictionary landed** | `runtime/{array,dictionary}.rs` (1 296 + 757), 118 and 26 recorded answers | `tjsArray`, `tjsDictionary`; **left:** `tjsOctPack` (1 068), the pack's byte reader and writer |
-| R5 the interpreter — **121 of 128 instructions execute** | `runtime/exec/` (5 887): the frame, the layout table, the arithmetic, the member instructions, calls, the context objects | `tjsInterCodeExec.cpp`, `tjsInterCodeContext.*`, `tjs.cpp`. **Left:** the exception machinery (`ENTRY`/`EXTRY`/`THROW`), the property-object access (`SETP`/`GETP`), the compile entry (`EVAL`/`EEXP`), the class-name write, and the thirteen string methods a call reaches — the packet plan is `docs/code/tjs/interpreter.md` §6 |
-| R6 the builtin natives — **`Math` and `Date` landed, and the date rule is cut over** | `runtime/natives/` (1 683): 141 and 157 recorded answers | `tjsMath`, `tjsDate` and its parser are gone, with bison and python3. **Left:** `String`, `Config`, `RandomGenerator`, `RegExp`, the exception class, `ObjectExtendable`, and the pack with R4 |
-| R7 the seam goes — **not started** | `crates/vm` drives the Rust engine directly | `cpp/tjs2_abi.{h,cpp}` (4 853), `tjs2_codegen.h` (331), `streams.cpp` (1 617), the block loader and serializer (4 021), the `extern` block in `crates/tjs/src/lib.rs`, and then **zig** with the last of the vendored bodies (12 850 shadow lines), which die in this one move |
+| C1 the lexer — **landed, body deleted** | `vm/lexer/` | — |
+| C2 the parser — **landed, body deleted** | `vm/parser/` | — |
+| C3 the code generator — **landed, body deleted** | `vm/codegen/` | — |
+| C4 the executor — **125 of 128 instructions** | `runtime/exec/` (6 000): the frame and its window, the layout table, the arithmetic, the member surface with its two diversions, calls, the context objects, the exception machinery | `EVAL`/`EEXP` (the compile entry) and `SETP`/`GETP` (the property-object access), and the thirteen string methods a call reaches. **Retiring this column retires the inter-code bridge**, which is what deletes `tjs2_abi`, `tjs2_codegen.h`, the bytecode loader and the rest of the bridge's C++ |
+| C5 the object model and the variant system — **landed in Rust** | `runtime/{string,number,hash,member,variant,octet,object,array,dictionary}.rs` (~7 300), with 8 recorded oracles behind them | the pack (`tjsOctPack`, 1 068), the `String` class (825), the extendable objects (285), and the shared helpers `tjsUtils` (999) |
+| C6 the native dispatch — **started** | `runtime/natives/{math,date,date_parse}.rs` (1 683), 298 recorded answers | `Config`, `RandomGenerator`, `RegExp`, the exception class; `Math` and `Date` landed, and `Date`'s C++ rule is already cut over, which is what let bison and python3 leave the build |
+
+A column lands in **changes**, and the change list for the executor is
+`docs/code/tjs/interpreter.md` §6 (frame, decoder, member surface, calls,
+contexts, exceptions, and the two that remain). Those changes are the unit a
+review sees; the column is the unit the design names.
 
 **A landed part does not always delete its body in the same change.** R2 and
 R3 are in Rust and proven, but the vendored variant and object are still
