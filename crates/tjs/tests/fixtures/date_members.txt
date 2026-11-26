@@ -1,0 +1,158 @@
+# the engine's answers, recorded by `crates/tjs/examples/date_oracle.rs`; regenerate with the command in the example's docs
+class_typeof	String	Object
+now_typeof	String	Object
+absent_now	String	undefined
+absent_utc	String	undefined
+absent_to_string	String	undefined
+absent_value_of	String	undefined
+absent_get_full_year	String	undefined
+absent_get_utc_hours	String	undefined
+absent_get_milliseconds	String	undefined
+member_get_time	String	Object
+member_parse	String	Object
+member_set_year	String	Object
+class_parse_raises	!raise	
+class_set_year_raises	!raise	
+class_timezone_offset	Integer	-540
+instance_timezone_offset	Integer	-540
+built_fields	String	2004,4,3,1,11,22,33,1083550953000
+built_one_arg	String	2020,0,1,3,0,0,0,1577804400000
+built_two_args	String	2020,5,1,1,0,0,0,1590937200000
+built_three_args	String	2020,5,15,1,0,0,0,1592146800000
+built_four_args	String	2020,5,15,1,12,0,0,1592190000000
+built_five_args	String	2020,5,15,1,12,30,0,1592191800000
+built_six_args	String	2020,5,15,1,12,30,45,1592191845000
+built_month_12	String	2021,0,1,5,0,0,0,1609426800000
+built_month_negative	String	2019,11,1,0,0,0,0,1575126000000
+built_month_24	String	2022,0,1,6,0,0,0,1640962800000
+built_day_32	String	2020,1,1,6,0,0,0,1580482800000
+built_day_0	String	2019,11,31,2,0,0,0,1577718000000
+built_day_negative	String	2019,11,30,1,0,0,0,1577631600000
+built_hour_25	String	2020,0,2,4,1,0,0,1577894400000
+built_hour_negative	String	2019,11,31,2,23,0,0,1577800800000
+built_minute_90	String	2020,0,1,3,1,31,30,1577809890000
+built_second_negative	String	2019,11,31,2,23,59,59,1577804399000
+built_leap_day	String	2020,1,29,6,12,0,0,1582945200000
+built_common_day	String	2019,2,1,5,12,0,0,1551409200000
+built_year_0	String	0,0,1,6,0,0,0,-62167251600000
+built_year_50	String	50,0,1,6,0,0,0,-60589328400000
+built_year_1900	String	1900,0,1,1,0,0,0,-2209021200000
+built_year_100000	String	100000,0,1,6,0,0,0,3093527948400000
+built_year_wrapped	String	2000,0,1,6,0,0,0,946652400000
+built_real_fields	String	2020,5,15,1,12,30,45,1592191845000
+built_void_day	String	2020,0,1,3,0,0,0,1577804400000
+built_epoch_before	String	1970,0,1,4,8,59,58,-2000
+built_epoch_exact	!raise	
+built_epoch_after	String	1970,0,1,4,9,0,0,0
+set_time_result	void	
+set_time_positive	String	1970,0,1,4,9,0,1,1000
+set_time_negative	String	1970,0,1,4,8,59,59,-1000
+set_time_exact	String	2023,10,15,3,7,13,20,1700000000000
+set_time_real	String	1970,0,1,4,9,0,1,1000
+set_time_zero	String	1970,0,1,4,9,0,0,0
+set_time_huge	String	-292275055,4,17,1,1,47,5,-9223372036854775000
+set_year	String	1999,4,3,1,11,22,33,925698153000
+set_year_two_digits	String	99,4,3,0,11,22,33,-59032445847000
+set_year_zero	String	0,4,3,3,11,22,33,-62156583447000
+set_year_negative	String	-1,4,3,1,11,22,33,-62188205847000
+set_year_real	String	1999,4,3,1,11,22,33,925698153000
+set_year_result	void	
+set_month	String	2004,0,3,6,11,22,33,1073096553000
+set_month_12	String	2005,0,3,1,11,22,33,1104718953000
+set_month_negative	String	2003,11,3,3,11,22,33,1070418153000
+set_date	String	2004,4,15,6,11,22,33,1084587753000
+set_date_zero	String	2004,3,30,5,11,22,33,1083291753000
+set_date_32	String	2004,5,1,2,11,22,33,1086056553000
+set_hours	String	2004,4,3,1,0,22,33,1083511353000
+set_hours_25	String	2004,4,4,2,1,22,33,1083601353000
+set_minutes	String	2004,4,3,1,11,0,33,1083549633000
+set_minutes_90	String	2004,4,3,1,12,30,33,1083555033000
+set_seconds	String	2004,4,3,1,11,22,0,1083550920000
+set_seconds_90	String	2004,4,3,1,11,23,30,1083551010000
+set_seconds_negative	String	2004,4,3,1,11,21,59,1083550919000
+set_year_missing	!raise	
+set_month_missing	!raise	
+set_date_missing	!raise	
+set_hours_missing	!raise	
+set_minutes_missing	!raise	
+set_seconds_missing	!raise	
+set_time_missing	!raise	
+parse_alt1	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt1_no_comma	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt1_no_wday	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt2	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt3	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt4	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt5	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt6	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt7	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt8	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt9	String	2004,4,3,1,11,22,33,1083550953000
+parse_alt10	String	2004,4,3,1,11,22,33,1083550953000
+parse_ymd_slash	String	2004,2,3,3,11,22,33,1078280553000
+parse_ymd_dash	String	2004,2,3,3,11,22,33,1078280553000
+parse_ymd_mixed	String	2004,2,3,3,11,22,33,1078280553000
+parse_ymd_month_13	String	2005,0,3,1,20,22,33,1104751353000
+parse_ymd_day_0	String	2004,1,29,0,20,22,33,1078053753000
+parse_ymd_day_32	String	2004,3,1,4,20,22,33,1080818553000
+parse_hm_only	String	2004,4,3,1,11,22,0,1083550920000
+parse_fraction	String	2004,4,3,1,11,22,33,1083550953000
+parse_am_before	String	2004,4,3,1,11,22,33,1083550953000
+parse_pm_before	String	2004,4,3,1,23,22,33,1083594153000
+parse_pm_after	String	2004,4,3,1,23,22,33,1083594153000
+parse_am_after	String	2004,4,3,1,11,22,33,1083550953000
+parse_pm_noon	String	2004,4,4,2,0,0,0,1083596400000
+parse_am_midnight	String	2004,4,3,1,12,0,0,1083553200000
+parse_pm_no_space	String	2004,4,3,1,23,22,33,1083594153000
+parse_tz_jst	String	2004,4,3,1,11,22,33,1083550953000
+parse_tz_lower	String	2004,4,3,1,11,22,33,1083550953000
+parse_tz_ut	String	2004,4,3,1,20,22,33,1083583353000
+parse_tz_est	String	2004,4,4,2,1,22,33,1083601353000
+parse_tz_gmt_negative	String	2004,4,4,2,1,22,33,1083601353000
+parse_tz_offset_only	String	2004,4,3,1,11,22,33,1083550953000
+parse_tz_offset_negative	String	2004,4,4,2,1,22,33,1083601353000
+parse_tz_z	String	2004,4,3,1,20,22,33,1083583353000
+parse_tz_desc	String	2004,4,3,1,11,22,33,1083550953000
+parse_tz_desc_only	String	2004,4,3,1,11,22,33,1083550953000
+parse_tz_glued	String	2004,4,3,1,11,22,33,1083550953000
+parse_no_tz	String	2004,4,3,1,11,22,33,1083550953000
+parse_no_spaces	String	2004,4,3,1,11,22,33,1083550953000
+parse_whitespace	String	2004,4,3,1,20,22,33,1083583353000
+parse_two_digit_04	String	2004,4,3,1,20,22,33,1083583353000
+parse_two_digit_50	String	2050,4,3,2,20,22,33,2535189753000
+parse_two_digit_51	String	1951,4,3,4,20,22,33,-589034247000
+parse_two_digit_99	String	1999,4,3,1,20,22,33,925730553000
+parse_two_digit_00	String	2000,4,3,3,20,22,33,957352953000
+parse_ymd_two_digit	String	2004,2,3,3,20,22,33,1078312953000
+parse_month_full	String	2004,8,3,5,20,22,33,1094210553000
+parse_month_dotted	String	2004,8,3,5,20,22,33,1094210553000
+parse_month_ju	String	2004,5,3,4,20,22,33,1086261753000
+parse_month_jul	String	2004,6,3,6,20,22,33,1088853753000
+parse_month_upper	String	2004,4,3,1,20,22,33,1083583353000
+parse_wday_dotted	String	2004,4,3,1,20,22,33,1083583353000
+parse_wday_wrong	String	2004,4,3,1,20,22,33,1083583353000
+parse_year_wrap	String	2000,4,3,3,20,22,33,957352953000
+parse_new_string	String	2004,4,3,1,11,22,33,1083550953000
+parse_epoch_before	String	1970,0,1,4,8,59,58,-2000
+parse_epoch_exact	!raise	
+parse_epoch_after	String	1970,0,1,4,9,0,0,0
+refuse_spaces	!raise	
+refuse_time_only	!raise	
+refuse_date_only	!raise	
+refuse_no_year	!raise	
+refuse_no_day	!raise	
+refuse_two_ymd	!raise	
+refuse_bad_tz	!raise	
+refuse_trailing	!raise	
+refuse_fraction_without_seconds	!raise	
+refuse_dot_no_digits	!raise	
+refuse_unclosed_paren	!raise	
+refuse_double_pm	!raise	
+refuse_janx	!raise	
+refuse_sundayx	!raise	
+refuse_wide	!raise	
+refuse_negative_year	!raise	
+refuse_second_missing	!raise	
+refuse_minute_missing	!raise	
+refuse_may_may	!raise	
+refuse_no_time	!raise	
