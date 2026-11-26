@@ -138,7 +138,12 @@ impl Code {
 
     /// A value of the constant area, or the failure that says the instruction
     /// named a slot that is not there.
-    pub fn constant(&self, slot: i32) -> Result<&Variant, Fault> {
+    ///
+    /// The operand is an offset in the constant area, in the same units a
+    /// register address uses, so the slot is that offset over the size of a
+    /// variant.
+    pub fn constant(&self, offset: i32) -> Result<&Variant, Fault> {
+        let slot = super::decode::register(offset)?;
         let slot =
             usize::try_from(slot).map_err(|_| Fault::Broken("a constant slot is negative"))?;
         self.data.get(slot).ok_or(Fault::Broken(

@@ -544,7 +544,7 @@ mod tests {
     fn the_member_forms_name_the_member() {
         let direct = Callee::new(Variant::Integer(1));
         let code = one_call(
-            &[vm::CALLD, register(2), register(1), 1, 0],
+            &[vm::CALLD, register(2), register(1), register(1), 0],
             vec![value(&direct, None), Variant::String(TjsString::from("m"))],
         );
         let _ = run(&code, None, &[]).expect("the call runs");
@@ -555,10 +555,10 @@ mod tests {
             vec![
                 vm::CONST,
                 register(1),
-                0,
+                register(0),
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::CALLI,
                 register(2),
                 register(1),
@@ -603,7 +603,7 @@ mod tests {
             vec![
                 vm::CONST,
                 register(1),
-                0,
+                register(0),
                 vm::CALL,
                 0,
                 register(1),
@@ -629,13 +629,13 @@ mod tests {
             vec![
                 vm::CONST,
                 register(1),
-                0,
+                register(0),
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::CONST,
                 register(4),
-                2,
+                register(2),
                 vm::CALL,
                 register(2),
                 register(1),
@@ -695,13 +695,13 @@ mod tests {
             code: vec![
                 vm::CONST,
                 register(1),
-                0,
+                register(0),
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::CONST,
                 register(4),
-                2,
+                register(2),
                 vm::CALL,
                 register(2),
                 register(1),
@@ -756,10 +756,10 @@ mod tests {
             code: vec![
                 vm::CONST,
                 register(1),
-                0,
+                register(0),
                 vm::CONST,
                 register(4),
-                1,
+                register(1),
                 vm::CALL,
                 register(2),
                 register(1),
@@ -793,7 +793,7 @@ mod tests {
     fn a_value_that_is_not_callable_raises() {
         let callee = Callee::silent();
         let code = one_call(
-            &[vm::CALLD, register(2), register(1), 1, 0],
+            &[vm::CALLD, register(2), register(1), register(1), 0],
             vec![value(&callee, None), Variant::String(TjsString::from("m"))],
         );
         let answer = run(&code, None, &[]);

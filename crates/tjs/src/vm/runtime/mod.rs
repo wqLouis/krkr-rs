@@ -53,6 +53,7 @@ pub mod natives;
 pub mod number;
 pub mod object;
 pub mod octet;
+pub mod octet_pack;
 pub mod string;
 pub mod variant;
 

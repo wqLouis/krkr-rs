@@ -30,6 +30,7 @@ use std::rc::Rc;
 use super::number::Number;
 use super::object::Dispatch as ObjectHandle;
 use super::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
+use super::octet_pack::{self, PackError};
 use super::string::TjsString;
 use super::variant::{Closure, Variant, VariantError};
 
@@ -294,6 +295,10 @@ pub enum ArrayError {
     /// A value cannot be converted where the operation needs it.
     #[error("the value cannot be converted")]
     Convert(#[from] VariantError),
+
+    /// The pack format refused the call.
+    #[error("the pack format refused the call")]
+    Pack(#[from] PackError),
 }
 
 /// An array object: a dense sequence of values and the class's member surface.
@@ -530,6 +535,20 @@ impl ArrayObject {
         self.check()?;
         self.elements.borrow_mut().reverse();
         Ok(())
+    }
+
+    /// Packs the elements with `format`'s template.
+    ///
+    /// Answers the bytes, or the null object when the template wrote no byte
+    /// at all; the format itself is the only description of what the bytes
+    /// hold.
+    pub fn pack(&self, format: &TjsString) -> Result<Variant, ArrayError> {
+        self.check()?;
+        let values = self.snapshot();
+        match octet_pack::pack(format, &values)? {
+            Some(octet) => Ok(Variant::Octet(octet)),
+            None => Ok(Variant::Object(Closure::null())),
+        }
     }
 
     /// Reads the element at `index`.
@@ -833,9 +852,10 @@ impl Dispatch for ArrayObject {
 fn object_error(error: ArrayError) -> ObjectError {
     match error {
         ArrayError::InvalidObject => ObjectError::InvalidObject,
-        ArrayError::IndexOutOfRange | ArrayError::LengthOutOfRange | ArrayError::Convert(_) => {
-            ObjectError::CallNotServed
-        }
+        ArrayError::IndexOutOfRange
+        | ArrayError::LengthOutOfRange
+        | ArrayError::Convert(_)
+        | ArrayError::Pack(_) => ObjectError::CallNotServed,
     }
 }
 
@@ -1298,5 +1318,22 @@ mod tests {
             ),
             Err(ObjectError::CallNotServed)
         ));
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsOctPack.cpp:1002-1022
+    #[test]
+    fn pack_answers_the_null_object_when_no_byte_is_written() {
+        let array = ArrayObject::new();
+        assert!(matches!(
+            array.pack(&text("i")),
+            Ok(Variant::Object(closure)) if closure.is_null()
+        ));
+        array
+            .push(&[Variant::from(1i64)])
+            .expect("the value is appended");
+        match array.pack(&text("i")) {
+            Ok(Variant::Octet(octet)) => assert_eq!(octet.as_slice(), &[1, 0, 0, 0]),
+            other => panic!("the pack answered {other:?}"),
+        }
     }
 }

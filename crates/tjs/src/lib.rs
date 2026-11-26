@@ -2709,7 +2709,7 @@ name), and none was available"
         // as its most recent object result, so the retention resolves against
         // that slot and no engine call may run in between.
         // SAFETY: self.inner is a live engine and `out` came from the call on
-        // it; a retained id keeps its own reference to the object.
+        // it; a retained id keeps the object alive on its own.
         let retained = unsafe { tjs2_retain_value(self.inner, &out) };
         if retained.is_null() {
             return Err("the new object could not be retained".into());

@@ -61,7 +61,7 @@ pub struct FrameTrace {
     /// The name of the frame's context, when it has one.
     pub name: String,
     /// The code position the failure was at inside it.
-    pub position: i32,
+    pub position: usize,
 }
 
 impl FrameTrace {
@@ -291,8 +291,7 @@ fn line_of(context: Option<&Rc<ContextObject>>, ip: usize) -> FrameTrace {
         Some(context) => context.name().to_string(),
         None => String::new(),
     };
-    let position = i32::try_from(ip).unwrap_or(i32::MAX);
-    FrameTrace { name, position }
+    FrameTrace { name, position: ip }
 }
 
 /// The `slot`-th operand of the instruction at `ip`.
@@ -340,7 +339,7 @@ mod tests {
                 register(1),
                 vm::CONST,
                 register(2),
-                0,
+                register(0),
                 vm::THROW,
                 register(2),
                 vm::SRV,
@@ -349,7 +348,7 @@ mod tests {
                 vm::NOP,
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::SRV,
                 register(3),
                 vm::RET,
@@ -382,10 +381,10 @@ mod tests {
                 register(1),
                 vm::CONST,
                 register(2),
-                0,
+                register(0),
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::IDIV,
                 register(2),
                 register(3),
@@ -394,7 +393,7 @@ mod tests {
                 vm::RET,
                 vm::CONST,
                 register(4),
-                2,
+                register(2),
                 vm::GPI,
                 register(5),
                 register(1),
@@ -431,19 +430,19 @@ mod tests {
                 register(1),
                 vm::CONST,
                 register(2),
-                0,
+                register(0),
                 vm::SRV,
                 register(2),
                 vm::EXTRY,
                 vm::CONST,
                 register(2),
-                1,
+                register(1),
                 vm::SRV,
                 register(2),
                 vm::RET,
                 vm::CONST,
                 register(2),
-                2,
+                register(2),
                 vm::SRV,
                 register(2),
                 vm::RET,

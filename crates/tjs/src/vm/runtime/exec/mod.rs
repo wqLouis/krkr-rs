@@ -46,6 +46,7 @@ use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::Variant;
 
+pub mod build;
 pub mod call;
 pub mod context;
 pub mod decode;
@@ -938,7 +939,7 @@ mod tests {
                 register(0),
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::CLT,
                 register(2),
                 register(3),
@@ -980,7 +981,7 @@ mod tests {
                 register(0),
                 vm::CONST,
                 register(2),
-                1,
+                register(1),
                 vm::CEQ,
                 register(1),
                 register(2),
@@ -999,7 +1000,7 @@ mod tests {
                 register(0),
                 vm::CONST,
                 register(2),
-                1,
+                register(1),
                 vm::CDEQ,
                 register(1),
                 register(2),
@@ -1029,7 +1030,7 @@ mod tests {
                 register(0),
                 vm::CONST,
                 register(2),
-                1,
+                register(1),
                 vm::ADD,
                 register(1),
                 register(2),
@@ -1056,7 +1057,7 @@ mod tests {
                     register(0),
                     vm::CONST,
                     register(2),
-                    1,
+                    register(1),
                     opcode,
                     register(1),
                     register(2),
@@ -1214,18 +1215,18 @@ mod tests {
             code: vec![
                 vm::CONST,
                 register(2),
-                0,
+                register(0),
                 vm::CONST,
                 register(3),
-                1,
+                register(1),
                 vm::SPDEH,
                 register(2),
-                2,
+                register(2),
                 register(3),
                 vm::GPDS,
                 register(4),
                 register(2),
-                2,
+                register(2),
                 vm::SRV,
                 register(4),
                 vm::RET,
