@@ -1733,8 +1733,10 @@ they are never compiled and they stay.
 
 and the build chain that exists only to compile them: **zig** (the C++
 compiler, and the package manager that fetches fmt, spdlog, boost and
-oniguruma), **bison** (the date grammar), **python3** (the date word map),
-**libc++** and **libonig**. Two of those needs have to be replaced rather than
+oniguruma), **libc++** and **libonig**. **bison** and **python3** are gone:
+their only inputs were the date grammar and its word map, and the date rule is
+this repository's own code now, proved by re-recording the calendar's answers
+through the cut-over engine and getting the committed bytes back. Two of those needs have to be replaced rather than
 deleted, and each needs its own oracle first:
 
 * **the regular expression engine** (`tjsRegExp.cpp`, 763 lines of C++, over

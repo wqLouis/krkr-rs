@@ -9,7 +9,7 @@ script text into intermediate code; this module is the machine that runs it.
 
 The runtime is built **bottom up, one part per change**, and each part is
 deleted from the vendored tree in the change that takes it over. What is here
-today is the **value layer**; the object model, the variant, the interpreter
+today is the **value layer**; the variant, the object model, the interpreter
 and the builtin natives follow, in the order `TODO.md` §12.1 records.
 
 The text-to-number rule has already been taken over: `tjsNumberParse.cpp` and
@@ -33,6 +33,8 @@ code it replaces removed.
 | the octet | `runtime/octet.rs` | the byte-sequence value |
 | the object | `runtime/object.rs` | the custom object, its member records and the dispatch a member access goes through |
 | the containers | `runtime/{array,dictionary}.rs` | the array's index space of its own, the dictionary's must-exist policy, and the struct text a dictionary writes |
+| the interpreter | `runtime/exec/` | the frame and its register window, the instruction layout table, the arithmetic and member instructions, and the operators |
+| the built-in classes | `runtime/natives/` | `Math`'s functions and constants, and `Date`'s calendar and text grammar |
 | the measurement | `runtime/bench.rs` | the A/B harness against the vendored primitives; `#[cfg(test)]`, `#[ignore]`d |
 
 The module denies `unsafe`: a value owns its storage and is borrowed or
