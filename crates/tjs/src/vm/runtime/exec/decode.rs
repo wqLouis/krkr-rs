@@ -637,7 +637,6 @@ pub fn owner(opcode: i32) -> Option<&'static str> {
         // the fifteen member instructions are executed by this interpreter's
         // member module; the two property-object instructions read and write
         // the member as a property, which no part implements yet
-        vm::SETP | vm::GETP => Some("the property-object access part"),
         vm::ENTRY | vm::EXTRY | vm::THROW => Some("the exception part"),
         vm::EVAL | vm::EEXP => Some("the compile entry"),
         _ => None,
@@ -822,7 +821,6 @@ mod tests {
         assert_eq!(owner(vm::GPD), None, "the member instructions execute");
         assert_eq!(owner(vm::SPDEH), None);
         assert_eq!(owner(vm::TYPEOFD), None);
-        assert_eq!(owner(vm::SETP), Some("the property-object access part"));
         assert_eq!(owner(vm::THROW), Some("the exception part"));
         assert_eq!(owner(vm::ADDCI), None, "the class-name write executes");
         assert_eq!(owner(vm::EVAL), Some("the compile entry"));

@@ -1183,24 +1183,19 @@ mod tests {
         assert!(matches!(refused, Err(Fault::Raised(Raise::Convert { .. }))));
     }
 
-    /// A member access is the member access part's, and the refusal names the
-    /// instruction and the part
-    /// (`docs/code/tjs/interpreter.md` §6, the packet plan).
+    /// The property access reaches an object that is not there through the
+    /// surface's own failure rather than a refusal, because the instruction
+    /// executes: a register holding no object has no default member
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1468-1491`).
     #[test]
-    fn the_property_object_access_is_refused_by_name() {
-        // `*o` forces the property surface, which no part implements yet
-        let code = code_of(
-            &[vm::SETP, register(1), register(0), vm::RET],
-            &[Variant::String(TjsString::from("m"))],
-        );
+    fn the_property_object_access_executes_and_refuses_a_non_object() {
+        let code = code_of(&[vm::SETP, register(1), register(0), vm::RET], &[]);
         let mut machine = Machine::new();
         let answer = machine.run(&code, None, &[]);
+        // the register holds no object, so the surface refuses the conversion
         match answer {
-            Err(Fault::Refused { opcode, part }) => {
-                assert_eq!(opcode, "SETP");
-                assert_eq!(part, "the property-object access part");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
+            Err(Fault::Raised(Raise::Convert { to, .. })) => assert_eq!(to, "Object"),
+            other => panic!("expected a refused conversion, got {other:?}"),
         }
     }
 

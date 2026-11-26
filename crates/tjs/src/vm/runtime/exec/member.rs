@@ -75,6 +75,8 @@ pub fn handles(opcode: i32) -> bool {
             | vm::DELI
             | vm::TYPEOFD
             | vm::TYPEOFI
+            | vm::SETP
+            | vm::GETP
     )
 }
 
@@ -118,6 +120,8 @@ pub fn execute(code: &Code, frame: &mut Frame, ip: usize, opcode: i32) -> Result
         ),
         vm::DELD => delete(code, frame, ip, Form::Direct),
         vm::DELI => delete(code, frame, ip, Form::Indirect),
+        vm::GETP => property_get(code, frame, ip),
+        vm::SETP => property_set(code, frame, ip),
         vm::TYPEOFD => typeof_member(code, frame, ip, Form::Direct),
         vm::TYPEOFI => typeof_member(code, frame, ip, Form::Indirect),
         _ => Err(Fault::Broken("a member instruction that is not one")),
@@ -173,6 +177,30 @@ fn write(
         Variant::String(_) | Variant::Octet(_) => Err(write_refused(&name)),
         _ => object_set(&target, form, &name, &value, flags),
     }
+}
+
+/// A read through a property object: `%d = *%s`.
+///
+/// The member name is the null one the engine passes, which this surface
+/// spells as the empty text: an object that does not answer it refuses, and a
+/// script sees a raise either way.
+fn property_get(code: &Code, frame: &mut Frame, ip: usize) -> Result<(), Fault> {
+    let destination = operand(code, ip, 1)?;
+    let holder = operand(code, ip, 2)?;
+    let target = frame.reg(holder)?.clone();
+    let name = Variant::String(TjsString::new());
+    let answer = object_get(&target, Form::Direct, &name, MemberFlags::NONE)?;
+    frame.set(destination, answer)
+}
+
+/// A write through a property object: `*%o = %v`.
+fn property_set(code: &Code, frame: &mut Frame, ip: usize) -> Result<(), Fault> {
+    let holder = operand(code, ip, 1)?;
+    let written = operand(code, ip, 2)?;
+    let target = frame.reg(holder)?.clone();
+    let value = frame.reg(written)?.clone();
+    let name = Variant::String(TjsString::new());
+    object_set(&target, Form::Direct, &name, &value, MemberFlags::NONE)
 }
 
 /// A delete: `%d = delete %o[@k]` and its indirect form.
@@ -697,9 +725,39 @@ mod tests {
                 crate::vm::runtime::exec::decode::mnemonic(opcode)
             );
         }
-        assert!(!handles(vm::SETP), "the property-object access is not here");
+        assert!(handles(vm::SETP), "the property-object access is here");
+        assert!(handles(vm::GETP));
         assert!(!handles(vm::CALL));
         assert!(!handles(vm::NOP));
+    }
+
+    /// A property object answers its default member, which the engine names with
+    /// a null member name and this surface spells as the empty text
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1468-1491`).
+    #[test]
+    fn a_property_object_is_read_and_written_by_its_default_member() {
+        let object: std::rc::Rc<dyn Dispatch> =
+            std::rc::Rc::new(CustomObject::new(vec![TjsString::from("Object")]));
+        let target = Variant::Object(Closure {
+            object: Some(object),
+            objthis: None,
+        });
+        let name = text("");
+        // nothing answers the default member yet, so the read refuses
+        assert!(matches!(
+            object_get(&target, Form::Direct, &name, MemberFlags::NONE),
+            Err(Fault::Raised(Raise::MemberNotFound { .. }))
+        ));
+        object_set(
+            &target,
+            Form::Direct,
+            &name,
+            &integer(7),
+            MemberFlags::ENSURE,
+        )
+        .expect("a default-member write");
+        let answer = object_get(&target, Form::Direct, &name, MemberFlags::NONE).expect("a read");
+        assert!(same(&answer, &integer(7)));
     }
 
     /// A value that is not an object has no member surface of its own
