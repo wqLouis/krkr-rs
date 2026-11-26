@@ -1689,8 +1689,8 @@ page.
 
 The front end is Rust (`crates/tjs/src/vm/{lexer,parser,codegen}`) and the
 vendored analyser, grammar and generator are gone. Everything behind the one
-compile seam is still the vendored tree — roughly 32 000 lines across 73
-files, plus the C ABI shim (`cpp/tjs2_abi.cpp`, 3 917 lines) and
+compile seam is still the vendored tree — 31 280 lines across 68 files, plus
+the C ABI shim (`cpp/tjs2_abi.cpp`, 3 917 lines) and
 `cpp/streams.cpp`. The runtime is built bottom up in
 `crates/tjs/src/vm/runtime/`, one part per change, and the part a change
 replaces is deleted from the vendored tree in that same change:
@@ -1698,12 +1698,22 @@ replaces is deleted from the vendored tree in that same change:
 | part | the Rust module | what it deletes |
 |---|---|---|
 | R1 the value layer — **landed** | `runtime/{string,number,hash}.rs` | `tjsVariantString`, `tjsNumberParse`, the table in `tjsHashSearch.h` |
-| R2 the variant | `runtime/variant.rs`: the tagged value, the closure, the coercions | `tjsVariant.{h,cpp}` |
-| R3 the object model | `runtime/object.rs`: the custom object, its member map, the dispatch | `tjsObject.{h,cpp}`, `tjsNative.{h,cpp}` |
+| R2 the variant — **landed** | `runtime/{variant,octet}.rs`: the tagged value, the closure handle, the coercions | `tjsVariant.{h,cpp}` |
+| R3 the object model — **landed** | `runtime/{member,object}.rs`: the member map, the custom object, the dispatch | `tjsObject.{h,cpp}`, `tjsNative.{h,cpp}` |
 | R4 the containers | `runtime/{array,dictionary,octet}.rs` | `tjsArray`, `tjsDictionary`, `tjsOctPack` |
 | R5 the interpreter | `runtime/exec.rs`: the contexts, the code stream, the globals | `tjsInterCodeExec.cpp`, `tjsInterCodeContext.*`, `tjs.cpp` |
 | R6 the builtin natives | `runtime/natives/`: `Math`, `Date`, `RandomGenerator`, `RegExp`, `String`, `Exception`, `Config` | `tjsMath`, `tjsDate`, `tjsRandomGenerator`, `tjsRegExp`, `tjsString`, `tjsConfig`, `tjsError` |
 | R7 the seam goes | `crates/vm` drives the Rust engine directly | `cpp/tjs2_abi.{h,cpp}`, the `extern` block in `crates/tjs/src/lib.rs`, `build.rs`'s zig/bison/python/oniguruma chain, `streams.cpp` |
+
+**A landed part does not always delete its body in the same change.** R2 and
+R3 are in Rust and proven, but the vendored variant and object are still
+compiled into the binary, because their types cross the C interface by value
+and pointer: the vendored executor reads a variant struct and calls through a
+pointer, so it cannot yet be handed a Rust object. Those bodies are deleted with
+R7, in the change that stops the interface existing. A **rule** is the
+exception: the text-to-number rule is a pure function over a text and a length,
+so the vendored parser calls it across the interface, and its 694 lines went at
+the change that proved it.
 
 **Every line of C and C++ in the tree, and what deletes it.** The tracked
 native code is `crates/tjs/cpp/` and nothing else: 39 400 lines. The
@@ -1716,7 +1726,7 @@ they are never compiled and they stay.
 | `cpp/tjs2_abi.cpp` + `tjs2_abi.h` | 4 837 | R7: `crates/vm` drives the Rust engine directly and the C surface stops existing |
 | `cpp/tjs2_codegen.h` | 331 | R7: the script block image stops crossing a C ABI |
 | `cpp/streams.cpp` | 1 617 | R4: the TJS stream IO (`Array.save`/`load`/`saveStruct`) in Rust, over the fs surface |
-| `cpp/hash_order_test.cpp` | 120 | R3: it diagnoses a defect in the C++ member table, and the table it guards is deleted |
+| `cpp/hash_order_test.cpp` | 120 | R7: it diagnoses a defect in the C++ member table, and the table it guards only dies with the seam |
 | `cpp/value_bench.cpp` | 379 | the last primitive it shims: a bench shim whose other side is Rust has nothing left to compare |
 | `cpp/tjs2/tjsNumberParse.cpp` | 511 | **landed** |
 | `cpp/tjs2/tjsConfig.cpp`'s `TJS_strtod` | 183 | **landed** |

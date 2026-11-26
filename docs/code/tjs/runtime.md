@@ -27,7 +27,11 @@ code it replaces removed.
 |---|---|---|
 | the string | `runtime/string.rs` | `TjsString`: an immutable sequence of UTF-16 code units, cheap to clone |
 | the number | `runtime/number.rs` | `Number` (an integer or a real), the text-to-number rules, and the number-to-text form |
-| the member table | `runtime/hash.rs` | the keyed table an object's members, a dictionary and the script cache are stored in |
+| the member table | `runtime/hash.rs` | the keyed table a dictionary, a message map and the script cache are stored in |
+| the member map | `runtime/member.rs` | an object's own symbol table: a power-of-two array whose enumeration order is script-visible |
+| the variant | `runtime/variant.rs` | the tagged value, the closure handle and the coercions |
+| the octet | `runtime/octet.rs` | the byte-sequence value |
+| the object | `runtime/object.rs` | the custom object, its member records and the dispatch a member access goes through |
 | the measurement | `runtime/bench.rs` | the A/B harness against the vendored primitives; `#[cfg(test)]`, `#[ignore]`d |
 
 The module denies `unsafe`: a value owns its storage and is borrowed or
@@ -126,6 +130,50 @@ obj)` walks and the order `Dictionary.saveStruct` writes.
 
 ---
 
+### 2.5 The variant
+
+The tagged value is a string, an integer, a real, a closure handle, an octet,
+void, or a reference to a dispatch object. Its coercions are the engine's own,
+proven against 69 recorded answers: `"a" + 1` is the string `"a1"`; `"abc" * 1`
+is the **integer** zero, not a real, which is the answer a reader is most
+likely to get wrong; `7 / 2` is the real 3.5 while `7 \ 2` is the integer 3;
+`null == void` is false while `void == ""` is true.
+
+Two shapes matter beyond the arithmetic. An object coerced to a string yields
+its pointer form and nothing else, because the engine has no other answer
+without a class's own `toString`. And an object coerced to a number, an
+integer or a real raises rather than guessing: three recorded probes agree, so
+the conversion error is a typed error here too. The same is true of the
+default-value protocol the vendored header declares — nothing in the engine
+calls it, so nothing here implements it.
+
+The octet is the byte-sequence member of the variant. The octet *object* — its
+index space and its streams — belongs to the containers, and is not here yet.
+
+### 2.6 The object
+
+`runtime/object.rs` is the custom object: a member map, a record that is either
+a value or a **property** with a getter and a setter, and the dispatch surface a
+script's member access goes through — read, write, delete, enumerate,
+`is_instance_of`, `class_names`, validity. The surface is `&self` and the map
+sits behind a cell, because a member read may change the table: a chain member
+more than two deep moves to the head of its chain, which is the behaviour the
+member map already reproduces.
+
+The recorded answers pin three member states apart, and it took the engine to
+settle them: a member that is present and void reads `void`, a member that is
+absent reads `undefined`, a member holding a value reports its kind. A write
+creates the member; a delete makes it absent again; reading a missing member
+with the ensure flag creates it as void. The flags carry the rest: must-exist
+answers an error instead of creating, ignore-property skips the getter and the
+setter, hidden and static are reported by the enumeration, and enum-no-value
+retrieves nothing and calls no getter.
+
+What is deliberately absent: the call mechanics. A call is the interpreter's,
+not an object method, and a trait method nothing implements is dead API. A
+property whose call is not served falls back to the member's value, which is
+the engine's rule for a getter that exists but does not answer.
+
 ## 3. The two proofs
 
 A part is done on two measurements, and neither is its own test suite.
@@ -180,8 +228,15 @@ CARGO_PROFILE_RELEASE_OPT_LEVEL=2 \
 
 ## 4. What the layer does not do yet
 
-The variant — the tagged value, the closure and the coercions — is the next
-part, and it is where a text that is not a number becomes the integer zero.
-The object model, the containers, the interpreter and the builtin natives
-follow, and the vendored tree is deleted part by part as each lands. The order,
-and what each part deletes, is `TODO.md` §12.1.
+The containers (the array, the dictionary, the octet object and its streams),
+the interpreter, and the builtin natives. The order, and what each part
+deletes, is `TODO.md` §12.1.
+
+The vendored bodies of the variant and the object **are still in the tree** and
+die with the seam, not with the Rust half: their types cross the C interface by
+value — a variant as a C struct, an object as a pointer — so the vendored side
+cannot call the Rust one until that interface itself is replaced. The one rule
+cut over the other way is the text-to-number rule, because it is a pure
+function; its 694 lines are already gone. The remaining count and the file list
+live in `TODO.md` §12.1 rather than here, so that a deletion has one place to
+be recorded.
