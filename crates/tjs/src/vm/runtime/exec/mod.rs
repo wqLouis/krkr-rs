@@ -57,9 +57,7 @@ pub use frame::{BlockStack, Code, Frame, ObjThisContext};
 /// The failure a raising rule reports.
 ///
 /// The value that failed travels with it, so the message a script reads can be
-/// the engine's own text rather than a summary
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:146-163`, the conversion
-/// error; `:1008-1016`, the divisor of zero).
+/// the engine's own text rather than a summary.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum Raise {
@@ -76,20 +74,16 @@ pub enum Raise {
     IntegerOutOfRange,
     /// A member the instruction named is not there.
     ///
-    /// The name travels because the engine's own message carries it
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1421-1426`).
+    /// The name travels because the engine's own message carries it.
     MemberNotFound {
         /// The name the instruction named.
         name: TjsString,
     },
     /// A member the instruction named cannot be written: a text's or a byte
     /// string's surface is read-only, and a write to it is an access denial
-    /// rather than a missing member
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:110-122`,
-    /// `:169-186`).
+    /// rather than a missing member.
     AccessDenied,
-    /// A subscript is outside the value it indexes
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:77`, `:152`).
+    /// A subscript is outside the value it indexes.
     RangeError,
 }
 
@@ -525,8 +519,7 @@ impl Machine {
     ///
     /// A member named by a constant or by a register is read, operated on and
     /// written back, which is what the engine's base object does for a compound
-    /// assignment (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:224-253`,
-    /// `tTJSDispatch::Operation`). The closure form — the object itself as the
+    /// assignment. The closure form — the object itself as the
     /// property — is the one the object's own `operation` entry is asked, because
     /// it is the one form the surface can express without a name.
     ///
@@ -742,17 +735,13 @@ fn jump(code: &[i32], ip: usize, distance: i32) -> Result<usize, Fault> {
 
 /// The comparison the less-than instruction asks for.
 ///
-/// The instruction is named `CLT` and it calls the variant's `GreaterThan`,
-/// which answers whether the *other* operand is greater — that is, whether this
-/// one is less. The name of the variant's method is inverted and the name of the
-/// instruction is not
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:856-876`, `GreaterThan`).
+/// The comparison answers whether the *other* operand is greater, which is the
+/// same question as whether this one is less.
 pub fn less(left: &Variant, right: &Variant) -> Result<bool, Fault> {
     ordering(left, right, Ordering::Less)
 }
 
-/// The comparison the greater-than instruction asks for
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:896-909`, `LittlerThan`).
+/// The comparison the greater-than instruction asks for.
 pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
     ordering(left, right, Ordering::Greater)
 }
@@ -825,7 +814,10 @@ mod tests {
 
     /// The flag survives the instructions between the compare and the jump, and
     /// a taken jump lands where the distance names
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:898-970`).
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:898-970`). The
+    /// comparison answers whether the *other* operand is greater, which is the
+    /// same question as whether this one is less, so `CLT` is `<` even though
+    /// the comparison's own name reads the other way.
     #[test]
     fn the_flag_carries_across_an_instruction_and_the_jump_lands() {
         // if (2 < 9) %1 = #2 else %1 = #9, then answer %1. The jump sits at

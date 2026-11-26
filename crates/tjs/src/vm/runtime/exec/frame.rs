@@ -83,9 +83,7 @@ pub struct Code {
 ///
 /// The collapse base is `-1`, which is the value that names no collapse
 /// argument: zero names a real base, the first declared argument, and a default
-/// of zero would make every frame build an array nobody asked for
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:199`,
-/// `FuncDeclCollapseBase = -1`).
+/// of zero would make every frame build an array nobody asked for.
 impl Default for Code {
     fn default() -> Self {
         Self {
@@ -325,8 +323,7 @@ impl Dispatch for ObjThisContext {
     /// A member walk is not served.
     ///
     /// The view exists to look a name up, not to enumerate two objects as one,
-    /// so a walk of it is the engine's own "not implemented"
-    /// (`crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:328-331`).
+    /// so a walk of it is not served.
     fn enum_members(
         &self,
         _flags: MemberFlags,
@@ -488,10 +485,9 @@ impl Frame {
     /// The window for one call of `code`, with its receiver, its receiver's
     /// fallback, and the arguments the caller passed.
     ///
-    /// The order is the engine's: place the base, build the objthis-context,
-    /// set the receiver, clear the discard register, copy the declared
-    /// arguments, and build the collapse array from the surplus ones
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:635-780`).
+    /// The order is: place the base, build the objthis-context, set the
+    /// receiver, clear the discard register, copy the declared arguments, and
+    /// build the collapse array from the surplus ones.
     pub fn new(
         block: Vec<Variant>,
         code: &Code,
@@ -594,8 +590,7 @@ impl Frame {
     /// The value a register address names.
     ///
     /// A register below the base reads as the absent value: no caller filled it,
-    /// and reading it is not an error
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:653-707`).
+    /// and reading it is not an error.
     pub fn reg(&self, address: i32) -> Result<&Variant, Fault> {
         match self.locate(address)? {
             Some(index) => self
@@ -677,8 +672,7 @@ impl Frame {
     /// Clears `count` registers from `address` upwards.
     ///
     /// The consecutive clear, which the generator does not emit and a bytecode
-    /// block can carry
-    /// (`crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:1388-1396`, `ContinuousClear`).
+    /// block can carry.
     pub fn clear_run(&mut self, address: i32, count: i32) -> Result<(), Fault> {
         let count =
             usize::try_from(count).map_err(|_| Fault::Broken("a clear count is negative"))?;
@@ -708,7 +702,7 @@ pub const REG_CONTEXT: i32 = -2 * crate::vm::codegen::opcode::VARIANT_SIZE;
 /// The register address the `index`-th declared argument is stored at.
 ///
 /// The first argument is at `ra[-3]`, so the argument's own register is
-/// `-3 - index` (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:3719`).
+/// `-3 - index`.
 pub fn address_of_argument(index: usize) -> Result<i32, Fault> {
     let index = i32::try_from(index)
         .map_err(|_| Fault::Broken("a declared argument count is too large"))?;

@@ -104,8 +104,7 @@ pub fn negate(value: &Variant) -> Result<Variant, Fault> {
 /// it already is one.
 ///
 /// The empty variant reads as the integer zero and a text that is not a number
-/// reads as zero; a value with no numeric conversion at all is refused
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:1073-1088`, `tonumber`).
+/// reads as zero; a value with no numeric conversion at all is refused.
 pub fn to_number(value: &Variant) -> Result<Variant, Fault> {
     match value {
         Variant::Integer(_) | Variant::Real(_) => Ok(value.clone()),
@@ -121,8 +120,7 @@ pub fn to_number(value: &Variant) -> Result<Variant, Fault> {
 ///
 /// The empty variant and a null object are false; an object is true when it has
 /// one; a text is true when it reads as a number that is not zero; an octet is
-/// true when it holds a byte; a number is true when it is not zero
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.h:911-931`, `operator bool`).
+/// true when it holds a byte; a number is true when it is not zero.
 pub fn truth(value: &Variant) -> Result<bool, Fault> {
     match value {
         Variant::Void => Ok(false),
@@ -139,8 +137,7 @@ pub fn truth(value: &Variant) -> Result<bool, Fault> {
 
 /// The truth of a value as the `!` operator answers it.
 ///
-/// The answer is an integer, not a separate boolean kind
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:1057-1062`, `logicalnot`).
+/// The answer is an integer, not a separate boolean kind.
 pub fn logical_not(value: &Variant) -> Result<Variant, Fault> {
     Ok(Variant::Integer(i64::from(!truth(value)?)))
 }
@@ -152,8 +149,7 @@ pub fn logical_not(value: &Variant) -> Result<Variant, Fault> {
 /// different receivers are *not* equal, and a real compares by value with
 /// not-a-number equal to nothing. Two values of different kinds are never
 /// equal — which is the whole difference from the plain comparison, where the
-/// empty variant equals the integer zero and a text compares as text
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:806-840`, `DiscernCompare`).
+/// empty variant equals the integer zero and a text compares as text.
 pub fn discern_equals(left: &Variant, right: &Variant) -> bool {
     match (left, right) {
         (Variant::Void, Variant::Void) => true,
@@ -186,8 +182,7 @@ fn same_handle(left: &Option<Rc<dyn Dispatch>>, right: &Option<Rc<dyn Dispatch>>
 ///
 /// The variant's own right shift is arithmetic, so this one is not its call. The
 /// count is the low six bits, which is what the hardware does with a shift count
-/// and what the variant's own shifts do
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:958-963`, `rbitshiftequal`).
+/// and what the variant's own shifts do.
 pub fn logical_shift_right(left: &Variant, right: &Variant) -> Result<Variant, Fault> {
     let value = left
         .to_integer()
@@ -197,23 +192,20 @@ pub fn logical_shift_right(left: &Variant, right: &Variant) -> Result<Variant, F
         .map_err(|error| refused_conversion(error, right))?;
     // the mask bounds the count to 0..=63, so the conversion cannot fail
     let count = (count & 63) as u32;
-    // the reference shifts the value as an unsigned integer and stores the bits
-    // back into a signed one
+    // the value shifts as an unsigned integer and the bits are stored back into
+    // a signed one
     Ok(Variant::Integer(((value as u64) >> count) as i64))
 }
 
 /// The comparison the less-than instruction asks for.
 ///
-/// The instruction is named `CLT` and the variant's method is named
-/// `GreaterThan`, which answers whether the *other* operand is greater — that is,
-/// whether this one is less. The instruction's name is inverted and its
-/// behaviour is not (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:856-876`).
+/// The comparison answers whether the *other* operand is greater, which is the
+/// same question as whether this one is less.
 pub fn less(left: &Variant, right: &Variant) -> Result<bool, Fault> {
     ordering(left, right, Ordering::Less)
 }
 
-/// The comparison the greater-than instruction asks for
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:896-909`, `LittlerThan`).
+/// The comparison the greater-than instruction asks for.
 pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
     ordering(left, right, Ordering::Greater)
 }
@@ -221,8 +213,7 @@ pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
 /// Whether the comparison of the two values is `wanted`.
 ///
 /// An unordered pair — one operand is a not-a-number — is false for both
-/// operators, and a value with no ordering at all is refused
-/// (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:661-676`).
+/// operators, and a value with no ordering at all is refused.
 fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, Fault> {
     match left.compare(right) {
         Ok(Some(order)) => Ok(order == wanted),
@@ -234,8 +225,7 @@ fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, F
 /// The code of a text's first unit, as the `#` operator answers it.
 ///
 /// A value that has no text is refused; an empty text answers zero, which is the
-/// terminator an empty text holds
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2663-2673`).
+/// terminator an empty text holds.
 pub fn character_code(value: &Variant) -> Result<Variant, Fault> {
     let text = value
         .to_string()
@@ -247,14 +237,12 @@ pub fn character_code(value: &Variant) -> Result<Variant, Fault> {
 /// The one-unit text of a code, as the `$` operator answers it.
 ///
 /// The code is truncated to a unit, and a code of zero is the empty text because
-/// a text ends at its first zero unit
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2676-2681`).
+/// a text ends at its first zero unit.
 pub fn character_from(value: &Variant) -> Result<Variant, Fault> {
     let code = value
         .to_integer()
         .map_err(|error| refused_conversion(error, value))?;
-    // the reference stores the integer into a unit, which keeps the low sixteen
-    // bits
+    // the code is stored into a unit, which keeps the low sixteen bits
     let units = [code as u16];
     Ok(Variant::String(TjsString::from(&units[..])))
 }

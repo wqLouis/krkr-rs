@@ -52,9 +52,8 @@ use super::op;
 use super::{Fault, Raise};
 
 /// The text a value with no text answers when a member instruction names it
-/// with one: the engine's `GetString` yields nothing there, and the lookup
-/// answers "no such member" for the empty name
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:47-50`).
+/// with one: nothing, so the lookup then answers "no such member" for the empty
+/// name.
 const NO_NAME: &str = "";
 
 /// Whether an opcode is one of the member instructions.
@@ -135,8 +134,7 @@ enum Form {
     Indirect,
 }
 
-/// A read: `%d = %o[@k]` or `%d = %o[%n]`
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1400-1428`, `:1502-1532`).
+/// A read: `%d = %o[@k]` or `%d = %o[%n]`.
 fn read(
     code: &Code,
     frame: &mut Frame,
@@ -157,8 +155,7 @@ fn read(
 }
 
 /// A write: `%o[@k] = %v` or `%o[%n] = %v`, and the four spellings that decide
-/// whether the member is created, hidden or written through its property
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1430-1476`, `:1534-1590`).
+/// whether the member is created, hidden or written through its property.
 fn write(
     code: &Code,
     frame: &mut Frame,
@@ -180,9 +177,8 @@ fn write(
 
 /// A delete: `%d = delete %o[@k]` and its indirect form.
 ///
-/// A failure answers a false rather than raising
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1806-1868`), and the
-/// destination may be the discard register, which asks for no answer.
+/// A failure answers a false rather than raising, and the destination may be
+/// the discard register, which asks for no answer.
 fn delete(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), Fault> {
     let destination = operand(code, ip, 1)?;
     let holder = operand(code, ip, 2)?;
@@ -191,9 +187,8 @@ fn delete(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), F
     let closure = as_closure(&value)?;
     let object = closure.object.as_deref().ok_or_else(null_object)?;
     let text = text_of(&name)?;
-    // the direct form hands the delete the frame's own receiver, and the
-    // indirect one hands it the closure's, which is an inconsistency of the
-    // engine and is reproduced (`:1816` against `:1847`)
+    // the direct form hands the delete the frame's own receiver and the
+    // indirect one the closure's
     let receiver = match form {
         Form::Direct => frame.receiver(),
         Form::Indirect => closure.objthis.clone().or_else(|| frame.receiver()),
@@ -209,8 +204,7 @@ fn delete(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), F
     Ok(())
 }
 
-/// The type of a member: `%d = typeof %o[@k]` and its indirect form
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1871-1988`).
+/// The type of a member: `%d = typeof %o[@k]` and its indirect form.
 fn typeof_member(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), Fault> {
     let destination = operand(code, ip, 1)?;
     let holder = operand(code, ip, 2)?;
@@ -220,18 +214,17 @@ fn typeof_member(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Resul
         Variant::String(text) => {
             let character = string_get(text, &name)?;
             // the indirect form's text branch never reaches its destination, so
-            // the character it read is the answer (`:1927`)
+            // the character it read is the answer
             match form {
                 Form::Direct => type_of(&character),
                 Form::Indirect => character,
             }
         }
-        // the byte string's branch applies the type in both forms (`:1931-1937`)
+        // the byte string's branch applies the type in both forms
         Variant::Octet(octet) => type_of(&octet_get(octet, &name)?),
         _ => match object_get(&value, form, &name, MemberFlags::MUST_EXIST) {
             Ok(read) => type_of(&read),
             // an absent member is the text `undefined`, and no other failure is
-            // (`:1906-1909`, `:1964-1967`)
             Err(Fault::Raised(Raise::MemberNotFound { .. })) => {
                 Variant::String(TjsString::from("undefined"))
             }
@@ -241,8 +234,7 @@ fn typeof_member(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Resul
     frame.set(destination, answer)
 }
 
-/// The engine's `TypeOf`: the kind of the value, in the language's spelling
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2601-2637`).
+/// The type of a value: its kind, in the language's spelling.
 fn type_of(value: &Variant) -> Variant {
     Variant::String(TjsString::from(value.type_name()))
 }
@@ -259,7 +251,6 @@ fn object_get(
     let objthis = closure.objthis.as_deref();
     match (form, name) {
         // the indirect form takes an integer subscript to the by-number entry
-        // (`:1517-1530`)
         (Form::Indirect, Variant::Integer(index)) => object
             .prop_get_by_num(*index, flags, objthis)
             .map_err(|error| member_fault(error, &TjsString::from(index.to_string()))),
@@ -302,8 +293,7 @@ fn object_set(
 ///
 /// A name that is a number is an index; the name `length` answers the number of
 /// units; a name that starts with a digit is a decimal index; anything else is
-/// not there
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:47-108`).
+/// not there.
 fn string_get(text: &TjsString, name: &Variant) -> Result<Variant, Fault> {
     if let Some(index) = index_of(name) {
         return string_index(text, index);
@@ -320,7 +310,7 @@ fn string_get(text: &TjsString, name: &Variant) -> Result<Variant, Fault> {
 
 /// A text's member write: every name is refused, and the two that name a
 /// position or the count are refused *as an access* rather than as a missing
-/// member (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:110-147`).
+/// member.
 fn write_refused(name: &Variant) -> Fault {
     if index_of(name).is_some() {
         return Fault::Raised(Raise::AccessDenied);
@@ -338,8 +328,7 @@ fn write_refused(name: &Variant) -> Fault {
 /// One unit of a text.
 ///
 /// An index exactly at the length answers the empty text, and anything outside
-/// `0 …= length` is a range error
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:64-84`).
+/// `0 …= length` is a range error.
 fn string_index(text: &TjsString, index: i64) -> Result<Variant, Fault> {
     let length = i64::try_from(text.len()).map_err(|_| Fault::Broken("a text is too long"))?;
     if index == length {
@@ -355,8 +344,7 @@ fn string_index(text: &TjsString, index: i64) -> Result<Variant, Fault> {
     }
 }
 
-/// A byte string's member read
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:128-162`).
+/// A byte string's member read.
 fn octet_get(octet: &Octet, name: &Variant) -> Result<Variant, Fault> {
     if let Some(index) = index_of(name) {
         return octet_index(octet, index);
@@ -374,7 +362,7 @@ fn octet_get(octet: &Octet, name: &Variant) -> Result<Variant, Fault> {
 /// One byte of a byte string.
 ///
 /// An index at the length is a range error: a byte string has no rule that the
-/// end is empty (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:148-155`).
+/// end is empty.
 fn octet_index(octet: &Octet, index: i64) -> Result<Variant, Fault> {
     let length =
         i64::try_from(octet.len()).map_err(|_| Fault::Broken("a byte string is too long"))?;
@@ -390,9 +378,8 @@ fn octet_index(octet: &Octet, index: i64) -> Result<Variant, Fault> {
 
 /// The index a name spells, when the name is a number.
 ///
-/// The engine converts a real with a truncating cast; a text is not a number
-/// here even when it reads as one, because the diversion tests the variant's
-/// kind (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:44`, `:166`).
+/// A real converts with a truncating cast; a text is not a number here even
+/// when it reads as one, because the diversion tests the variant's kind.
 fn index_of(name: &Variant) -> Option<i64> {
     match name {
         Variant::Integer(index) => Some(*index),
@@ -403,9 +390,8 @@ fn index_of(name: &Variant) -> Option<i64> {
     }
 }
 
-/// The name a diversion reads, or the "no such member" failure the engine
-/// answers for a value with no text
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:47-50`, `:131-134`).
+/// The name a diversion reads, or the "no such member" failure a value with no
+/// text answers.
 fn diversion_name(name: &Variant) -> Result<TjsString, Fault> {
     match name.to_string() {
         Ok(text) => Ok(text),
@@ -414,15 +400,14 @@ fn diversion_name(name: &Variant) -> Result<TjsString, Fault> {
 }
 
 /// The name a member instruction passes to an object, or the conversion failure
-/// the engine raises when the value has no text
-/// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1520-1526`).
+/// a value with no text raises.
 fn text_of(name: &Variant) -> Result<TjsString, Fault> {
     name.to_string()
         .map_err(|error| op::refused_conversion(error, name))
 }
 
-/// Whether the name begins with a decimal digit, which is the engine's test for
-/// a subscript (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:66`).
+/// Whether the name begins with a decimal digit, which is the test for a
+/// subscript.
 fn starts_with_digit(name: &TjsString) -> bool {
     matches!(name.as_utf16().first(), Some(unit) if (u16::from(b'0')..=u16::from(b'9')).contains(unit))
 }
