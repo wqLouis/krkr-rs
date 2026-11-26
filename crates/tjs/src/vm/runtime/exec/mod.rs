@@ -46,6 +46,7 @@ use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::Variant;
 
+pub mod call;
 pub mod decode;
 pub mod frame;
 pub mod member;
@@ -85,6 +86,15 @@ pub enum Raise {
     AccessDenied,
     /// A subscript is outside the value it indexes.
     RangeError,
+    /// A value a call instruction named cannot be called.
+    ///
+    /// The engine answers this as the language's own failure rather than as a
+    /// refusal of the object surface, so a script sees it; the member the call
+    /// named travels with it because a script's message names it.
+    NotCallable {
+        /// The member the call named, or nothing when it named none.
+        name: TjsString,
+    },
 }
 
 /// Two raises are the same failure when they are the same kind, name the same
@@ -112,6 +122,7 @@ impl PartialEq for Raise {
             }
             (Self::AccessDenied, Self::AccessDenied) => true,
             (Self::RangeError, Self::RangeError) => true,
+            (Self::NotCallable { name: left }, Self::NotCallable { name: right }) => left == right,
             _ => false,
         }
     }
@@ -221,13 +232,13 @@ impl Machine {
     ) -> Result<Variant, Fault> {
         let block = self.blocks.allocate(code.block_len()?);
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
-        let answer = self.execute(code, &mut frame);
+        let answer = self.execute(code, &mut frame, argv);
         self.blocks.release(frame.into_block());
         answer
     }
 
     /// Executes the code stream from its first instruction to its return.
-    fn execute(&self, code: &Code, frame: &mut Frame) -> Result<Variant, Fault> {
+    fn execute(&self, code: &Code, frame: &mut Frame, argv: &[Variant]) -> Result<Variant, Fault> {
         let mut ip: usize = 0;
         let mut flag = false;
         let mut result = Variant::Void;
@@ -429,6 +440,7 @@ impl Machine {
                 // the member instructions, then the two families, and then the
                 // parts another part owns
                 _ if member::handles(opcode) => member::execute(code, frame, ip, opcode)?,
+                _ if call::handles(opcode) => call::execute(code, frame, argv, ip, opcode)?,
                 _ => match (decode::step_of(opcode), decode::operator_of(opcode)) {
                     (Some((up, form)), _) => self.step(frame, code, ip, up, form)?,
                     (None, Some((operator, form))) => {
