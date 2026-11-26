@@ -634,23 +634,10 @@ pub fn is_operand_less(opcode: i32) -> bool {
 /// saying the opcode is unknown.
 pub fn owner(opcode: i32) -> Option<&'static str> {
     match opcode {
-        vm::GPD
-        | vm::SPD
-        | vm::SPDE
-        | vm::SPDEH
-        | vm::SPDS
-        | vm::GPI
-        | vm::SPI
-        | vm::SPIE
-        | vm::GPDS
-        | vm::GPIS
-        | vm::SPIS
-        | vm::SETP
-        | vm::GETP
-        | vm::DELD
-        | vm::DELI
-        | vm::TYPEOFD
-        | vm::TYPEOFI => Some("the member access part"),
+        // the fifteen member instructions are executed by this interpreter's
+        // member module; the two property-object instructions read and write
+        // the member as a property, which no part implements yet
+        vm::SETP | vm::GETP => Some("the property-object access part"),
         vm::CALL | vm::CALLD | vm::CALLI | vm::NEW => Some("the call part"),
         vm::ENTRY | vm::EXTRY | vm::THROW => Some("the exception part"),
         vm::CHGTHIS | vm::GLOBAL | vm::ADDCI | vm::REGMEMBER => Some("the context part"),
@@ -834,8 +821,10 @@ mod tests {
         for opcode in executed {
             assert_eq!(owner(opcode), None, "{} is executed", mnemonic(opcode));
         }
-        assert_eq!(owner(vm::GPD), Some("the member access part"));
-        assert_eq!(owner(vm::SPDEH), Some("the member access part"));
+        assert_eq!(owner(vm::GPD), None, "the member instructions execute");
+        assert_eq!(owner(vm::SPDEH), None);
+        assert_eq!(owner(vm::TYPEOFD), None);
+        assert_eq!(owner(vm::SETP), Some("the property-object access part"));
         assert_eq!(owner(vm::CALL), Some("the call part"));
         assert_eq!(owner(vm::THROW), Some("the exception part"));
         assert_eq!(owner(vm::GLOBAL), Some("the context part"));

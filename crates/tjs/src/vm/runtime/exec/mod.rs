@@ -48,6 +48,7 @@ use crate::vm::runtime::variant::Variant;
 
 pub mod decode;
 pub mod frame;
+pub mod member;
 pub mod op;
 
 pub use decode::{Operator, PropertyForm};
@@ -73,6 +74,23 @@ pub enum Raise {
     DivideByZero,
     /// An integer result does not fit a 64-bit integer.
     IntegerOutOfRange,
+    /// A member the instruction named is not there.
+    ///
+    /// The name travels because the engine's own message carries it
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1421-1426`).
+    MemberNotFound {
+        /// The name the instruction named.
+        name: TjsString,
+    },
+    /// A member the instruction named cannot be written: a text's or a byte
+    /// string's surface is read-only, and a write to it is an access denial
+    /// rather than a missing member
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:110-122`,
+    /// `:169-186`).
+    AccessDenied,
+    /// A subscript is outside the value it indexes
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:77`, `:152`).
+    RangeError,
 }
 
 /// Two raises are the same failure when they are the same kind, name the same
@@ -95,6 +113,11 @@ impl PartialEq for Raise {
             ) => left_to == right_to && op::discern_equals(left, right),
             (Self::DivideByZero, Self::DivideByZero) => true,
             (Self::IntegerOutOfRange, Self::IntegerOutOfRange) => true,
+            (Self::MemberNotFound { name: left }, Self::MemberNotFound { name: right }) => {
+                left == right
+            }
+            (Self::AccessDenied, Self::AccessDenied) => true,
+            (Self::RangeError, Self::RangeError) => true,
             _ => false,
         }
     }
@@ -409,7 +432,9 @@ impl Machine {
                     };
                     *frame.reg_mut(target)? = Variant::Integer(i64::from(belongs));
                 }
-                // the two families, and then the parts another part owns
+                // the member instructions, then the two families, and then the
+                // parts another part owns
+                _ if member::handles(opcode) => member::execute(code, frame, ip, opcode)?,
                 _ => match (decode::step_of(opcode), decode::operator_of(opcode)) {
                     (Some((up, form)), _) => self.step(frame, code, ip, up, form)?,
                     (None, Some((operator, form))) => {
@@ -687,7 +712,7 @@ fn refused(opcode: i32) -> Fault {
 /// The `slot`-th operand of the instruction at `ip`.
 ///
 /// The slot counts from the opcode, so slot 1 is the first operand.
-fn operand(code: &[i32], ip: usize, slot: usize) -> Result<i32, Fault> {
+pub(super) fn operand(code: &[i32], ip: usize, slot: usize) -> Result<i32, Fault> {
     let index = ip
         .checked_add(slot)
         .ok_or(Fault::Broken("an instruction's operand is out of range"))?;
@@ -1061,40 +1086,69 @@ mod tests {
     /// instruction and the part
     /// (`docs/code/tjs/interpreter.md` §6, the packet plan).
     #[test]
-    fn a_member_access_is_refused_by_name() {
+    fn the_property_object_access_is_refused_by_name() {
+        // `*o` forces the property surface, which no part implements yet
         let code = code_of(
-            &[vm::GPD, register(1), register(2), register(0), vm::RET],
+            &[vm::SETP, register(1), register(0), vm::RET],
             &[Variant::String(TjsString::from("m"))],
         );
         let mut machine = Machine::new();
         let answer = machine.run(&code, None, &[]);
         match answer {
             Err(Fault::Refused { opcode, part }) => {
-                assert_eq!(opcode, "GPD");
-                assert_eq!(part, "the member access part");
+                assert_eq!(opcode, "SETP");
+                assert_eq!(part, "the property-object access part");
             }
             other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
     /// The hidden write is the other instruction the generator cannot emit, and a
-    /// stream that carries it decodes it and reaches the seam by name
+    /// stream that carries it decodes it and creates a hidden member
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1186-1191`).
     #[test]
-    fn the_hidden_write_decodes_and_reaches_the_seam() {
+    fn the_hidden_write_decodes_and_writes() {
         assert_eq!(decode::length(&[vm::SPDEH, 0, 20, 40], 0), Ok(4));
-        let code = code_of(
-            &[vm::SPDEH, register(1), register(2), register(0), vm::RET],
-            &[Variant::String(TjsString::from("m"))],
-        );
+        // %2 = a plain object, %3 = #5, then spdeh %2.#m, %3 and answer the
+        // member's own value through a read that ignores the property. The
+        // name operand of a direct form is a constant-area index, not a
+        // register address.
+        let object: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let code = Code {
+            code: vec![
+                vm::CONST,
+                register(2),
+                0,
+                vm::CONST,
+                register(3),
+                1,
+                vm::SPDEH,
+                register(2),
+                2,
+                register(3),
+                vm::GPDS,
+                register(4),
+                register(2),
+                2,
+                vm::SRV,
+                register(4),
+                vm::RET,
+            ],
+            data: vec![
+                Variant::Object(crate::vm::runtime::variant::Closure {
+                    object: Some(object.clone()),
+                    objthis: Some(object),
+                }),
+                Variant::Integer(5),
+                Variant::String(TjsString::from("m")),
+            ],
+            variable_reserve_count: 2,
+            max_frame_count: 4,
+            ..Code::default()
+        };
         let mut machine = Machine::new();
-        match machine.run(&code, None, &[]) {
-            Err(Fault::Refused { opcode, part }) => {
-                assert_eq!(opcode, "SPDEH");
-                assert_eq!(part, "the member access part");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
+        let answer = machine.run(&code, None, &[]).expect("the stream runs");
+        assert!(op::discern_equals(&answer, &Variant::Integer(5)));
     }
 
     /// A code stream that ends inside an instruction is refused, not read past
