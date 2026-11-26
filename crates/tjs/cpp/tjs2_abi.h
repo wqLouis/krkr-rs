@@ -540,6 +540,38 @@ int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
                                  tjs2_value *out, char **out_error);
 
 /*
+ * Invoke a named member of a retained object value (FuncCall with the member
+ * name), so naming a method is one call rather than a read of the member
+ * followed by a call on the value the read answered. Member lookup goes
+ * through the object's own class chain, so a subclass override runs instead of
+ * the method it overrides.
+ *
+ * Returns 0 on success and, if out is non-NULL, fills it. On failure (an
+ * unknown id, a value that is not an object, a member that is not there, or a
+ * script exception) returns non-zero and, if out_error is non-NULL, points it
+ * at a malloc'd UTF-8 message (free with tjs2_free_string).
+ */
+int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
+                     int argc, const tjs2_value *argv, tjs2_value *out,
+                     char **out_error);
+
+/*
+ * Construct a new object through a retained value's default member (CreateNew
+ * with no member name, which is what `new C(...)` does on a class object)
+ * with argc arguments. The object it answers crosses as a TJS2_VAL_OBJECT
+ * value: retain it with tjs2_retain_value before the next engine call to keep
+ * it alive across the call, because the value itself carries no handle.
+ *
+ * The arguments follow tjs2_call_value's convention, and a TJS2_VAL_RETAINED
+ * argument is consumed. On failure (an unknown id, a value that is not a
+ * class, or a script exception) returns non-zero and, if out_error is
+ * non-NULL, points it at a malloc'd UTF-8 message.
+ */
+int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
+                    const tjs2_value *argv, tjs2_value *out,
+                    char **out_error);
+
+/*
  * Read a named property from a retained object value (PropGet through the
  * object's class chain). Same conventions as tjs2_call_value: returns 0 on
  * success and fills out; on failure returns non-zero with a malloc'd UTF-8
@@ -556,9 +588,15 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
 
 /*
  * Write a named property on a retained object value (PropSet through the
- * object's class chain). TJS_MEMBERENSURE is passed, matching the flag the
- * VM uses for plain assignment (tjsInterCodeExec.cpp:1182): a missing member
- * is created, and an existing native or script property setter is invoked.
+ * object's class chain).
+ *
+ * `flags` is the TJS PropSet flag set: TJS_MEMBERENSURE (0x200) creates a
+ * missing member and invokes an existing native or script property setter,
+ * which is the flag the VM's plain assignment passes; TJS_MEMBERMUSTEXIST
+ * (0x400) refuses an absent member instead of creating it; TJS_HIDDENMEMBER
+ * (0x1000) and TJS_STATICMEMBER (0x10000) set the flag of the member the
+ * write creates; TJS_IGNOREPROP (0x800) writes the property object itself
+ * instead of calling its setter.
  *
  * `value` is a tjs2_value produced by the Rust side (scalars/strings,
  * octets, null, or a TJS2_VAL_RETAINED id, which is consumed). Writing to an
@@ -568,7 +606,8 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
  * message in out_error.
  */
 int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
-                  const tjs2_value *value, char **out_error);
+                  unsigned int flags, const tjs2_value *value,
+                  char **out_error);
 
 /*
  * Create a fresh TJS Array object and retain it for the caller.
@@ -644,6 +683,55 @@ int tjs2_prop_delete(tjs2_engine *e, tjs2_value_id obj,
  */
 int tjs2_prop_set_default(void *engine, tjs2_value_id id,
                           const tjs2_value *value, char **out_error);
+
+/*
+ * Apply a compound assignment to a member of a retained object value
+ * (Operation) in one call, so a property or a container sees the read and the
+ * write as the single operation it is instead of observing both halves.
+ *
+ * `membername` names the member, or is NULL for the value's default member.
+ * `op` carries one compound-assignment code, in its low five bits:
+ *   0x0001 &=   0x0002 |=   0x0003 ^=   0x0004 -=
+ *   0x0005 +=   0x0006 %=   0x0007 /=   0x0008 \=
+ *   0x0009 *=   0x000a ||   0x000b &&   0x000c >>= (arithmetic)
+ *   0x000d <<=  0x000e >>>= 0x000f ++      0x0010 --
+ * `right` is the right-hand operand and is NULL only for 0x000f and 0x0010,
+ * which take no operand; a TJS2_VAL_RETAINED operand is consumed. On success
+ * the member's new value is written to out when it is non-NULL.
+ *
+ * Same error convention as tjs2_prop_get: returns 0 on success; on failure
+ * returns non-zero with a malloc'd UTF-8 message in out_error.
+ */
+int tjs2_operation(void *engine, tjs2_value_id id, const char *membername,
+                   unsigned int op, const tjs2_value *right, tjs2_value *out,
+                   char **out_error);
+
+/*
+ * Whether a retained value belongs to a class (IsInstanceOf with no member
+ * name). `class_name_utf8` names the class the question asks about, and `out`
+ * receives 1 or 0.
+ *
+ * Returns 0 when the question was answered. An unknown id, a value that is
+ * not an object, a null object and a raised error are failures rather than
+ * answers: they return non-zero with a malloc'd UTF-8 message in out_error.
+ */
+int tjs2_is_instance_of(void *engine, tjs2_value_id id,
+                        const char *class_name_utf8, int *out,
+                        char **out_error);
+
+/*
+ * Whether a retained object value is still usable (IsValid with no member
+ * name): `out` receives 1 for valid and 0 for invalid. An object that does
+ * not implement the question counts as valid, which is the VM's own rule for
+ * the boolean `isinvalid` operator.
+ *
+ * "Invalid" and "could not ask" are different answers. An unknown id, a
+ * value that is not an object and a null object return non-zero with a
+ * malloc'd UTF-8 message in out_error; only an object that answered returns
+ * 0.
+ */
+int tjs2_is_valid(void *engine, tjs2_value_id id, int *out,
+                  char **out_error);
 
 /*
  * Write a value back into a by-reference argument of the native method call

@@ -63,6 +63,50 @@ pub const VAL_NULL: c_int = 8;
 /// The TJS `PropGet` flag that reads a member's own value without
 /// calling the object's default member.
 pub const TJS_IGNOREPROP: c_uint = 0x0000_0800;
+/// The TJS `PropSet` flag that creates a member which is not there yet and
+/// invokes an existing property setter: the flag plain assignment passes.
+pub const TJS_MEMBERENSURE: c_uint = 0x0000_0200;
+/// The TJS `PropSet` flag that refuses an absent member instead of creating
+/// it.
+pub const TJS_MEMBERMUSTEXIST: c_uint = 0x0000_0400;
+/// The TJS `PropSet` flag that marks the member a write creates as hidden.
+pub const TJS_HIDDENMEMBER: c_uint = 0x0000_1000;
+/// The TJS `PropSet` flag that marks the member a write creates as static:
+/// it belongs to the object itself rather than to an instance.
+pub const TJS_STATICMEMBER: c_uint = 0x0001_0000;
+
+/// The compound-assignment code of `&=`, for [`Tjs2Engine::operation`].
+pub const TJS_OP_BAND: c_uint = 0x0001;
+/// The compound-assignment code of `|=`.
+pub const TJS_OP_BOR: c_uint = 0x0002;
+/// The compound-assignment code of `^=`.
+pub const TJS_OP_BXOR: c_uint = 0x0003;
+/// The compound-assignment code of `-=`.
+pub const TJS_OP_SUB: c_uint = 0x0004;
+/// The compound-assignment code of `+=`.
+pub const TJS_OP_ADD: c_uint = 0x0005;
+/// The compound-assignment code of `%=`.
+pub const TJS_OP_MOD: c_uint = 0x0006;
+/// The compound-assignment code of `/=`.
+pub const TJS_OP_DIV: c_uint = 0x0007;
+/// The compound-assignment code of `\=`, the integer division.
+pub const TJS_OP_IDIV: c_uint = 0x0008;
+/// The compound-assignment code of `*=`.
+pub const TJS_OP_MUL: c_uint = 0x0009;
+/// The compound-assignment code of `||`.
+pub const TJS_OP_LOR: c_uint = 0x000a;
+/// The compound-assignment code of `&&`.
+pub const TJS_OP_LAND: c_uint = 0x000b;
+/// The compound-assignment code of the arithmetic `>>=`.
+pub const TJS_OP_SAR: c_uint = 0x000c;
+/// The compound-assignment code of `<<=`.
+pub const TJS_OP_SAL: c_uint = 0x000d;
+/// The compound-assignment code of the logical `>>>=`.
+pub const TJS_OP_SR: c_uint = 0x000e;
+/// The increment code of `++`, whose operation takes no operand.
+pub const TJS_OP_INC: c_uint = 0x000f;
+/// The decrement code of `--`, whose operation takes no operand.
+pub const TJS_OP_DEC: c_uint = 0x0010;
 
 /// Storage read status: the entry was read and `out_data`/`out_len` are set.
 pub const STORAGE_READ_OK: c_int = 0;
@@ -629,12 +673,15 @@ unsafe extern "C" {
         out_error: *mut *mut c_char,
     ) -> c_int;
     /// Write a named property on a retained object value through its class
-    /// chain (`PropSet`, with `TJS_MEMBERENSURE` so a missing member is
-    /// created and an existing property setter is invoked).
+    /// chain (`PropSet`). `flags` is the TJS PropSet flag set:
+    /// [`TJS_MEMBERENSURE`] is what plain assignment passes and
+    /// [`TJS_MEMBERMUSTEXIST`] refuses an absent member instead of creating
+    /// it.
     fn tjs2_prop_set(
         engine: *mut Engine,
         id: Tjs2ValueId,
         membername: *const c_char,
+        flags: c_uint,
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
@@ -668,6 +715,37 @@ unsafe extern "C" {
         value: *const Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Apply a compound assignment to a member of a retained object value
+    /// (`Operation`) in one call, so a property sees the read and the write
+    /// as the single operation it is. A null `membername` names the value's
+    /// default member, and `right` is null only for [`TJS_OP_INC`] and
+    /// [`TJS_OP_DEC`].
+    fn tjs2_operation(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
+        op: c_uint,
+        right: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Whether a retained value belongs to a class (`IsInstanceOf`).
+    fn tjs2_is_instance_of(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        class_name: *const c_char,
+        out: *mut c_int,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Whether a retained object value is still usable (`IsValid`): 1 valid,
+    /// 0 invalid. A value that is not an object, an unknown id and a null
+    /// object are failures.
+    fn tjs2_is_valid(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        out: *mut c_int,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Write a value back into an out-parameter argument of the native method
     /// call currently executing on this engine (the caller's own argument
     /// slot).
@@ -689,6 +767,18 @@ unsafe extern "C" {
         engine: *mut Engine,
         id: Tjs2ValueId,
         membername: *const c_char,
+        argc: c_int,
+        argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Construct a new object through a retained value's default member
+    /// (`CreateNew`, what `new C(...)` does on a class object). An object
+    /// result carries no handle: it is the engine's most recent object
+    /// result, so retain it before the next engine call.
+    fn tjs2_create_new(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
         argc: c_int,
         argv: *const Value,
         out: *mut Value,
@@ -2463,6 +2553,51 @@ name), and none was available"
         Err(take_error_string(message))
     }
 
+    /// Whether a retained value belongs to `class`: the `instanceof`
+    /// question, answered from the value's own class chain.
+    ///
+    /// # Errors
+    ///
+    /// A message when the question could not be asked: an unknown id, a value
+    /// that is not an object, or a null object (which raises).
+    pub fn is_instance_of(&self, id: Tjs2ValueId, class: &str) -> Result<bool, String> {
+        let class = std::ffi::CString::new(class)
+            .map_err(|_| "class name contains a NUL byte".to_string())?;
+        let mut answer: c_int = 0;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // the class name follows the ABI contract for the duration of the
+        // call.
+        let rc =
+            unsafe { tjs2_is_instance_of(self.inner, id, class.as_ptr(), &mut answer, &mut error) };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        Ok(answer != 0)
+    }
+
+    /// Whether a retained object value is still usable: `Ok(true)` valid,
+    /// `Ok(false)` invalidated.
+    ///
+    /// An object that does not implement the question counts as valid, which
+    /// is the VM's rule for the `isinvalid` operator.
+    ///
+    /// # Errors
+    ///
+    /// A message when the question could not be asked: an unknown id, a value
+    /// that is not an object, or a null object. A failure is therefore never
+    /// reported as either answer.
+    pub fn is_valid(&self, id: Tjs2ValueId) -> Result<bool, String> {
+        let mut answer: c_int = 0;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id.
+        let rc = unsafe { tjs2_is_valid(self.inner, id, &mut answer, &mut error) };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        Ok(answer != 0)
+    }
+
     /// Invoke a named member on a retained object value (e.g. a Timer
     /// object's `onTimer`). Member lookup goes through the object's own
     /// class chain, so a script subclass overriding `onTimer` (the game's
@@ -2508,6 +2643,139 @@ name), and none was available"
                     ptr::null()
                 } else {
                     ffi_args.as_ptr()
+                },
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        // SAFETY: `out` was filled by the VM on success.
+        Ok(take_value(&out))
+    }
+
+    /// Construct a new object through a retained class value: the `new
+    /// C(...)` a script writes, with `id` naming the class.
+    ///
+    /// The object is retained for the caller, so it stays alive across engine
+    /// calls until the returned handle is dropped; the call itself answers a
+    /// value that carries no handle. An argument that is a
+    /// [`TjsValue::Retained`] id is consumed.
+    ///
+    /// # Errors
+    ///
+    /// The VM's own error when the value is not a class or its constructor
+    /// raised, and a message when the class produced no object at all.
+    pub fn create_new(&self, id: Tjs2ValueId, args: &[TjsValue]) -> Result<DetachedValue, String> {
+        let mut strings = Vec::new();
+        let ffi_args: Vec<Value> = args
+            .iter()
+            .map(|a| value_to_ffi(a, &mut strings))
+            .collect::<Result<_, _>>()?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // argv/out follow the ABI contract for the duration of the call.
+        let rc = unsafe {
+            tjs2_create_new(
+                self.inner,
+                id,
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        if out.ty != VAL_OBJECT {
+            return Err("the class produced no object".into());
+        }
+        // The object crosses as a value with no handle: the engine keeps it
+        // as its most recent object result, so the retention resolves against
+        // that slot and no engine call may run in between.
+        // SAFETY: self.inner is a live engine and `out` came from the call on
+        // it; a retained id keeps its own reference to the object.
+        let retained = unsafe { tjs2_retain_value(self.inner, &out) };
+        if retained.is_null() {
+            return Err("the new object could not be retained".into());
+        }
+        Ok(DetachedValue {
+            engine: self.inner,
+            id: retained,
+        })
+    }
+
+    /// Apply a compound assignment to a member of a retained object value in
+    /// one call, so a property or a container observes the read and the write
+    /// as the single operation it is.
+    ///
+    /// `membername` is `None` for the value's default member. `op` is one of
+    /// the `TJS_OP_*` codes, and `right` is the operand — `None` only for
+    /// [`TJS_OP_INC`] and [`TJS_OP_DEC`], which take none; a
+    /// [`TjsValue::Retained`] operand is consumed. The answer is the member's
+    /// value after the operation.
+    ///
+    /// # Errors
+    ///
+    /// The VM's own error when the object does not serve the operation or
+    /// raised it, and a message when the name or the operand cannot cross the
+    /// ABI.
+    pub fn operation(
+        &self,
+        id: Tjs2ValueId,
+        membername: Option<&str>,
+        op: c_uint,
+        right: Option<&TjsValue>,
+    ) -> Result<TjsValue, String> {
+        let name = match membername {
+            Some(name) => Some(
+                std::ffi::CString::new(name)
+                    .map_err(|_| "member name contains a NUL byte".to_string())?,
+            ),
+            None => None,
+        };
+        let mut strings = Vec::new();
+        let ffi_right = match right {
+            Some(value) => Some(value_to_ffi(value, &mut strings)?),
+            None => None,
+        };
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // name/operand/out follow the ABI contract for the duration of the
+        // call, and a string operand stays alive in `strings`.
+        let rc = unsafe {
+            tjs2_operation(
+                self.inner,
+                id,
+                name.as_ref().map_or(ptr::null(), |name| name.as_ptr()),
+                op,
+                match &ffi_right {
+                    Some(value) => value as *const Value,
+                    None => ptr::null(),
                 },
                 &mut out,
                 &mut error,
@@ -2654,11 +2922,11 @@ name), and none was available"
     }
 
     /// Write a named property on a retained object value through its class
-    /// chain (`PropSet`). `TJS_MEMBERENSURE` semantics match TJS plain
-    /// assignment: a missing member is created, and an existing native or
-    /// script property setter is invoked. `value` may be a scalar/string, an
-    /// octet, null, or a [`TjsValue::Retained`] id (the retention is consumed
-    /// by the write).
+    /// chain (`PropSet`) with [`TJS_MEMBERENSURE`], which is the flag TJS
+    /// plain assignment passes: a missing member is created, and an existing
+    /// native or script property setter is invoked. `value` may be a
+    /// scalar/string, an octet, null, or a [`TjsValue::Retained`] id (the
+    /// retention is consumed by the write).
     ///
     /// **Consumption contract:** a [`TjsValue::Retained`] id is consumed by
     /// the conversion *before* `PropSet` runs, so it is gone even when this
@@ -2670,6 +2938,27 @@ name), and none was available"
         membername: &str,
         value: &TjsValue,
     ) -> Result<(), String> {
+        self.set_member_with_flags(id, membername, TJS_MEMBERENSURE, value)
+    }
+
+    /// Write a named property on a retained object value through its class
+    /// chain (`PropSet`) with an explicit flag set.
+    ///
+    /// [`TJS_MEMBERENSURE`] creates a missing member and runs an existing
+    /// property setter, which is what [`Self::set_member`] passes;
+    /// [`TJS_MEMBERMUSTEXIST`] refuses an absent member instead of creating
+    /// it; [`TJS_HIDDENMEMBER`] and [`TJS_STATICMEMBER`] mark the member the
+    /// write creates; [`TJS_IGNOREPROP`] writes a property object itself
+    /// without calling its setter.
+    ///
+    /// The value and consumption rules are [`Self::set_member`]'s.
+    pub fn set_member_with_flags(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        flags: c_uint,
+        value: &TjsValue,
+    ) -> Result<(), String> {
         let mut strings = Vec::new();
         let ffi = value_to_ffi(value, &mut strings)?;
         let name = std::ffi::CString::new(membername)
@@ -2678,7 +2967,7 @@ name), and none was available"
         // SAFETY: self.inner is a live engine and id is a live retained id;
         // name/value (including any string storage in `strings`) follow the
         // ABI contract for the duration of the call.
-        let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), flags, &ffi, &mut error) };
         if rc != 0 {
             return Err(take_error_string(error));
         }
@@ -2719,7 +3008,16 @@ name), and none was available"
         // name follows the ABI contract for the duration of the call, and
         // `bytes` outlives the call — the VM copies them into the variant
         // before it returns.
-        let rc = unsafe { tjs2_prop_set(self.inner, id, name.as_ptr(), &ffi, &mut error) };
+        let rc = unsafe {
+            tjs2_prop_set(
+                self.inner,
+                id,
+                name.as_ptr(),
+                TJS_MEMBERENSURE,
+                &ffi,
+                &mut error,
+            )
+        };
         if rc != 0 {
             return Err(take_error_string(error));
         }

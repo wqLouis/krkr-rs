@@ -3477,6 +3477,92 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
     }
 }
 
+// Construct a new object through a retained value's default member
+// (CreateNew with no member name), which is what `new C(...)` does on a class
+// object. The created object is handed over as an object-typed value: the
+// value itself carries no handle, so the caller retains it (tjs2_retain_value)
+// before the next engine call. Same argument and error conventions as
+// tjs2_call_value_impl, whose shape this entry follows.
+int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
+                    const tjs2_value *argv, tjs2_value *out,
+                    char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || argc < 0 || (argc > 0 && !argv)) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        if(out) {
+            out->type = TJS2_VAL_VOID;
+            out->integer = 0;
+            out->real = 0.0;
+            out->string = nullptr;
+            out->array = nullptr;
+            out->array_count = 0;
+            out->retained = nullptr;
+        }
+
+        // The argument conversion can consume a TJS2_VAL_RETAINED entry
+        // (possibly the class object itself), so it runs before the retained
+        // id is looked up and no map iterator is held across it.
+        std::vector<TJS::tTJSVariant> arg_vars;
+        std::vector<TJS::tTJSVariant *> params;
+        arg_vars.reserve((size_t)argc);
+        params.reserve((size_t)argc);
+        for(int i = 0; i < argc; i++) {
+            arg_vars.emplace_back();
+            value_to_variant(e, &argv[i], &arg_vars.back());
+            params.push_back(&arg_vars.back());
+        }
+
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        TJS::iTJSDispatch2 *created = nullptr;
+        tjs_error hr = clo.CreateNew(
+            0, nullptr, nullptr, &created, argc,
+            params.empty() ? nullptr : params.data(), nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, nullptr); // -> catch(eTJS) below
+
+        // The created reference is transferred into the result variant, which
+        // AddRefs it, so the local reference is released right away.
+        TJS::tTJSVariant result;
+        if(created) {
+            result = TJS::tTJSVariant(created, created);
+            created->Release();
+        }
+        variant_to_value(e, result, out);
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("create_new failed");
+        return 1;
+    }
+}
+
 // Read a named property from a retained object value through its class
 // chain (PropGet). Used by natives that must resolve an object argument to
 // one of its script-visible properties (e.g. Layer.parent = <Layer object>
@@ -3544,13 +3630,17 @@ int tjs2_prop_get(void *engine, tjs2_value_id id, const char *membername,
 }
 
 // Write a named property on a retained object value through its class chain
-// (PropSet). TJS_MEMBERENSURE matches the VM's plain-assignment flag
-// (tjsInterCodeExec.cpp:1182), so a missing member is created and an existing
-// native/script property setter runs. The closure resolves objthis exactly
-// like tjs2_prop_get/tjs2_call_member (tjsVariant.h:261-269). Same error
-// convention as tjs2_prop_get.
+// (PropSet). `flags` decides what the write does with the member: the
+// ensure flag creates a missing member and runs an existing native/script
+// property setter (what a plain assignment passes), the must-exist flag
+// refuses an absent member instead, the hidden and static flags mark the
+// member the write creates, and the ignore-property flag writes the property
+// object itself without calling its setter. The closure resolves objthis the
+// same way tjs2_prop_get and tjs2_call_member do. Same error convention as
+// tjs2_prop_get.
 int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
-                  const tjs2_value *value, char **out_error) {
+                  unsigned int flags, const tjs2_value *value,
+                  char **out_error) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id || !membername || !value) {
         if(out_error)
@@ -3577,8 +3667,8 @@ int tjs2_prop_set(void *engine, tjs2_value_id id, const char *membername,
         std::u16string member16 = utf8_to_u16(membername);
         TJS::tTJSVariantClosure clo =
             it->second.AsObjectClosureNoAddRef(); // throws if not an object
-        tjs_error hr = clo.PropSet(TJS_MEMBERENSURE, member16.c_str(), nullptr,
-                                   &var, nullptr);
+        tjs_error hr = clo.PropSet(flags, member16.c_str(), nullptr, &var,
+                                   nullptr);
         if(TJS_FAILED(hr))
             TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch below
         if(out_error)
@@ -3861,6 +3951,190 @@ int tjs2_prop_set_default(void *engine, tjs2_value_id id,
     } catch(...) {
         if(out_error)
             *out_error = make_error_string("prop_set_default failed");
+        return 1;
+    }
+}
+
+// Apply a compound assignment to a member of a retained object value
+// (Operation), in one call, so a property or a container sees the read and the
+// write as the single operation it is instead of observing both halves.
+// `membername` names the member, or is null for the value's default member;
+// `right` is the right-hand operand and is null only for the increment and
+// decrement codes, which take none.
+//
+// The target is resolved before the operand is converted and again after it:
+// the conversion can consume a TJS2_VAL_RETAINED entry, possibly the target
+// itself. Same error convention as tjs2_prop_get.
+int tjs2_operation(void *engine, tjs2_value_id id, const char *membername,
+                   unsigned int op, const tjs2_value *right, tjs2_value *out,
+                   char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        if(out) {
+            out->type = TJS2_VAL_VOID;
+            out->integer = 0;
+            out->real = 0.0;
+            out->string = nullptr;
+            out->array = nullptr;
+            out->array_count = 0;
+            out->retained = nullptr;
+        }
+        if(e->retained.find((uintptr_t)id) == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariant param;
+        if(right)
+            value_to_variant(e, right, &param);
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        std::u16string member16;
+        const tjs_char *name = nullptr;
+        if(membername) {
+            member16 = utf8_to_u16(membername);
+            name = member16.c_str();
+        }
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        // A discarded result is passed on as absent, so the object skips
+        // producing a value the caller will not read.
+        TJS::tTJSVariant result;
+        tjs_error hr =
+            clo.Operation((tjs_uint32)op, name, nullptr,
+                          out ? &result : nullptr,
+                          right ? &param : nullptr, nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr, name); // -> catch below
+        if(out)
+            variant_to_value(e, result, out);
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("operation failed");
+        return 1;
+    }
+}
+
+// Whether a retained value belongs to a class (IsInstanceOf with no member
+// name). The answer is one of the VM's two truth codes, so the caller gets 1
+// or 0 and a bridge failure (no such id, a value that is not an object, a null
+// object, a raised error) is reported instead of being folded into either
+// answer.
+int tjs2_is_instance_of(void *engine, tjs2_value_id id,
+                        const char *classname, int *out, char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id || !classname) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        std::u16string class16 = utf8_to_u16(classname);
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr =
+            clo.IsInstanceOf(0, nullptr, nullptr, class16.c_str(), nullptr);
+        if(TJS_FAILED(hr))
+            TJSThrowFrom_tjs_error(hr); // -> catch below
+        if(out)
+            *out = hr == TJS_S_TRUE ? 1 : 0;
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("is_instance_of failed");
+        return 1;
+    }
+}
+
+// Whether a retained object value is still usable (IsValid with no member
+// name). The object's answer is the VM's own validity rule: the valid code is
+// valid, an object that does not implement the question is valid too, and
+// every other code is invalid.
+int tjs2_is_valid(void *engine, tjs2_value_id id, int *out,
+                  char **out_error) {
+    tjs2_engine *e = (tjs2_engine *)engine;
+    if(!e || !id) {
+        if(out_error)
+            *out_error = make_error_string("invalid retained value");
+        return 1;
+    }
+    try {
+        auto it = e->retained.find((uintptr_t)id);
+        if(it == e->retained.end()) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained value");
+            return 1;
+        }
+        TJS::tTJSVariantClosure clo =
+            it->second.AsObjectClosureNoAddRef(); // throws if not an object
+        tjs_error hr = clo.IsValid(0, nullptr, nullptr, nullptr);
+        if(out)
+            *out = TJSIsObjectValid(hr) ? 1 : 0;
+        if(out_error)
+            *out_error = nullptr;
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error)
+            *out_error = make_error_string("is_valid failed");
         return 1;
     }
 }
