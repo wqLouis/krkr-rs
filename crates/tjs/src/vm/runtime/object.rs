@@ -37,6 +37,7 @@ use std::ops::BitOr;
 use std::rc::Rc;
 
 use super::member::MemberMap;
+use super::number::Number;
 use super::string::TjsString;
 use super::variant::Variant;
 
@@ -106,7 +107,8 @@ pub enum ObjectError {
     MemberMustExist,
 
     /// The object cannot serve the call: a property answered that it does not
-    /// have the read or the write.
+    /// have the read or the write, or a value was asked to be invoked or
+    /// constructed and it is not a function or a class.
     #[error("the object cannot serve the call")]
     CallNotServed,
 
@@ -296,6 +298,85 @@ pub trait Dispatch {
     /// Answers whether the call changed anything: an object that was already
     /// invalid stays as it is.
     fn invalidate(&self) -> bool;
+
+    /// Invokes the value as a function.
+    ///
+    /// `name` is the member the invocation names, or the empty name when the
+    /// value itself is invoked; `argv` is the argument list. An object that is
+    /// not a function cannot serve the call and answers
+    /// [`ObjectError::CallNotServed`], which is the engine's own refusal for a
+    /// value it cannot invoke.
+    fn func_call(
+        &self,
+        _name: &TjsString,
+        _argv: Option<&[Variant]>,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        Err(ObjectError::CallNotServed)
+    }
+
+    /// Constructs an object.
+    ///
+    /// `name` is the member the construction names, or the empty name when the
+    /// object itself is the class; `argv` is the argument list. An object that
+    /// is not a class cannot serve the call and answers
+    /// [`ObjectError::CallNotServed`], which is the engine's own refusal.
+    fn create_new(
+        &self,
+        _name: &TjsString,
+        _argv: Option<&[Variant]>,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        Err(ObjectError::CallNotServed)
+    }
+
+    /// Applies a compound assignment to a member.
+    ///
+    /// `op` names the operator and `value` is the right operand. `Ok(false)`
+    /// means the object does **not serve** the operator — not that the
+    /// operator failed: the caller then reads the member, applies the operator
+    /// itself and writes the result back, which is what the engine's base
+    /// object does. `Ok(true)` means the object applied it, and an error means
+    /// it was attempted and failed.
+    fn operation(
+        &self,
+        _op: &TjsString,
+        _value: &Variant,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<bool, ObjectError> {
+        Ok(false)
+    }
+
+    /// Reads the member a number names.
+    ///
+    /// The default answers the number's decimal text, which is the engine's
+    /// base rule; a container overrides it to answer an index without building
+    /// the text.
+    fn prop_get_by_num(
+        &self,
+        index: i64,
+        flags: MemberFlags,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        let name = TjsString::from(&Number::Integer(index));
+        self.prop_get(&name, flags, objthis)
+    }
+
+    /// Writes the member a number names.
+    ///
+    /// The default writes the number's decimal text, which is the engine's
+    /// base rule; a container overrides it to write an index without building
+    /// the text.
+    fn prop_set_by_num(
+        &self,
+        index: i64,
+        flags: MemberFlags,
+        value: &Variant,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<(), ObjectError> {
+        let name = TjsString::from(&Number::Integer(index));
+        self.prop_set(&name, flags, value, objthis)
+    }
 }
 
 /// The object a script dictionary and a plain script object both are.
@@ -732,6 +813,59 @@ mod tests {
                 Ok(Variant::Void)
             ),
             "the created member is a void member"
+        );
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:144-168
+    #[test]
+    fn the_by_number_default_uses_the_decimal_text() {
+        let object = CustomObject::new(Vec::new());
+        object
+            .prop_set(&name("3"), MemberFlags::ENSURE, &Variant::from(30i64), None)
+            .expect("the member is stored");
+        // a numeric subscript is the member its decimal text names
+        assert_eq!(
+            object
+                .prop_get_by_num(3, MemberFlags::NONE, None)
+                .map(|value| integer(&value)),
+            Ok(Some(30))
+        );
+        assert_eq!(
+            object.prop_set_by_num(4, MemberFlags::ENSURE, &Variant::from(40i64), None),
+            Ok(())
+        );
+        assert_eq!(
+            object
+                .prop_get(&name("4"), MemberFlags::NONE, None)
+                .map(|value| integer(&value)),
+            Ok(Some(40))
+        );
+        // a number the object holds no member for is the same miss a name is
+        assert_eq!(
+            error_of(object.prop_get_by_num(5, MemberFlags::NONE, None)),
+            ObjectError::MemberNotFound
+        );
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1203-1208
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1674-1678
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:224-244
+    #[test]
+    fn an_object_that_is_not_a_function_refuses_the_call() {
+        let object = CustomObject::new(Vec::new());
+        // the base object is not a function and is not a class
+        assert_eq!(
+            error_of(object.func_call(&TjsString::new(), None, None)),
+            ObjectError::CallNotServed
+        );
+        assert_eq!(
+            error_of(object.create_new(&TjsString::new(), None, None)),
+            ObjectError::CallNotServed
+        );
+        // an operator is not served, and that is not a failure
+        assert_eq!(
+            object.operation(&name("add"), &Variant::from(1i64), None),
+            Ok(false)
         );
     }
 

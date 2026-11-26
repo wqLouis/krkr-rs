@@ -23,16 +23,9 @@ use std::fmt;
 use std::rc::Rc;
 
 use super::number::{Number, NumberError};
+use super::object::Dispatch;
 use super::octet::Octet;
 use super::string::TjsString;
-
-/// The object an object value is a handle to.
-///
-/// It is a marker today: the value layer needs nothing of an object, and the
-/// object model gives it its methods in the next part. What it carries now is
-/// the object's identity, which the closure shares and the equality rule
-/// compares.
-pub trait Dispatch {}
 
 /// An object value: the object, and the receiver its members are called on.
 ///
@@ -525,13 +518,70 @@ mod tests {
 
     use super::{Closure, Dispatch, Variant, VariantError};
     use crate::vm::runtime::number::Number;
+    use crate::vm::runtime::object::{MemberFlags, ObjectError};
     use crate::vm::runtime::octet::Octet;
     use crate::vm::runtime::string::TjsString;
 
     /// A stand-in for an object of the object model.
     struct TestObject;
 
-    impl Dispatch for TestObject {}
+    impl Dispatch for TestObject {
+        fn prop_get(
+            &self,
+            _name: &TjsString,
+            _flags: MemberFlags,
+            _objthis: Option<&dyn Dispatch>,
+        ) -> Result<Variant, ObjectError> {
+            Err(ObjectError::MemberNotFound)
+        }
+
+        fn prop_set(
+            &self,
+            _name: &TjsString,
+            _flags: MemberFlags,
+            _value: &Variant,
+            _objthis: Option<&dyn Dispatch>,
+        ) -> Result<(), ObjectError> {
+            Err(ObjectError::MemberNotFound)
+        }
+
+        fn delete_member(
+            &self,
+            _name: &TjsString,
+            _flags: MemberFlags,
+            _objthis: Option<&dyn Dispatch>,
+        ) -> Result<(), ObjectError> {
+            Err(ObjectError::MemberNotFound)
+        }
+
+        fn enum_members(
+            &self,
+            _flags: MemberFlags,
+            _callback: &mut dyn FnMut(&TjsString, u32, &Variant) -> bool,
+        ) -> Result<(), ObjectError> {
+            Ok(())
+        }
+
+        fn is_instance_of(
+            &self,
+            _class: &TjsString,
+            _objthis: Option<&dyn Dispatch>,
+        ) -> Result<bool, ObjectError> {
+            Ok(false)
+        }
+
+        fn class_names(&self) -> Vec<TjsString> {
+            Vec::new()
+        }
+
+        fn is_valid(&self) -> bool {
+            true
+        }
+
+        fn invalidate(&self) -> bool {
+            false
+        }
+    }
 
     /// The object value over a dispatch.
     fn object_of(dispatch: &Rc<dyn Dispatch>) -> Variant {

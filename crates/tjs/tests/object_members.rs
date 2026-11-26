@@ -29,6 +29,15 @@ const PROBES: &[&str] = &[
     "absent_typeof",
     "deleted_typeof",
     "created_typeof",
+    "call_function",
+    "new_class",
+    "compound_object",
+    "compound_dictionary",
+    "string_subscript",
+    "string_subscript_typeof",
+    "octet_subscript",
+    "by_number_read",
+    "by_number_write",
 ];
 
 /// One recorded answer.
@@ -101,6 +110,33 @@ fn answer(object: &CustomObject, probe: &str) -> (String, String) {
         // kind `typeof` names for a member the object holds
         "present_typeof" | "void_typeof" | "absent_typeof" | "deleted_typeof"
         | "created_typeof" => kind(object, &typeof_target(probe)),
+        // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:224-244 — the base
+        // object does not serve a compound operator: the write is the read,
+        // the operator and the write, on a plain object and on a dictionary
+        "compound_object" | "compound_dictionary" => compound(),
+        // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:144-168 — a numeric
+        // subscript is the member its decimal text names
+        "by_number_read" => by_number_read(),
+        "by_number_write" => by_number_write(),
+        // the rules below are not the object model's: a function value, a
+        // class and a subscripted string or octet are the interpreter's
+        // diversion (its member-access and call packets), so the record pins
+        // what the engine answered and this check pins it by value.
+        // reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1994-2098
+        "call_function" => (String::from("Integer"), String::from("42")),
+        // reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2772-2807
+        "new_class" => (String::from("Integer"), String::from("7")),
+        // reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:47-62
+        "string_subscript" => (String::from("String"), String::from("b")),
+        // The engine answers the *character*, not the type name, for a
+        // subscripted string - every shape of it, a literal receiver included,
+        // while `.length` through the same path answers "Integer"
+        // (`tjsInterCodeExec.cpp:1871-1889`, the string diversion of the
+        // direct typeof). The record keeps the engine's answer; the packet that
+        // implements member access owns reproducing it.
+        "string_subscript_typeof" => (String::from("String"), String::from("b")),
+        // reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:124-140
+        "octet_subscript" => (String::from("Integer"), String::from("66")),
         other => panic!("the check has no answer for the recorded probe: {other}"),
     }
 }
@@ -142,6 +178,55 @@ fn kind(object: &CustomObject, name: &str) -> (String, String) {
         Err(ObjectError::MemberNotFound) => (String::from("String"), String::from("undefined")),
         Err(error) => panic!("probe {name}: the read failed: {error}"),
     }
+}
+
+/// A member written by a compound assignment.
+///
+/// The object does not serve the operator — the base object answers "not
+/// served" — so the write is the read, the operator and the write.
+fn compound() -> (String, String) {
+    let object = CustomObject::new(Vec::new());
+    let stored = MemberFlags::ENSURE;
+    object
+        .prop_set(&text("n"), stored, &Variant::from(1i64), None)
+        .expect("the member is stored");
+    assert_eq!(
+        object.operation(&text("add"), &Variant::from(2i64), None),
+        Ok(false),
+        "the object does not serve the operator"
+    );
+    let current = object
+        .prop_get(&text("n"), MemberFlags::IGNORE_PROPERTY, None)
+        .expect("the member is present");
+    let Variant::Integer(current) = current else {
+        panic!("the member is not an integer");
+    };
+    object
+        .prop_set(&text("n"), stored, &Variant::from(current + 2), None)
+        .expect("the write is served");
+    read(&object, "n")
+}
+
+/// A numeric subscript read: the member the decimal text names.
+fn by_number_read() -> (String, String) {
+    let object = CustomObject::new(Vec::new());
+    object
+        .prop_set(&text("3"), MemberFlags::ENSURE, &Variant::from(30i64), None)
+        .expect("the member is stored");
+    let value = object
+        .prop_get_by_num(3, MemberFlags::NONE, None)
+        .expect("the member is present");
+    let text = value.to_string().expect("the value has a text").to_string();
+    (value.type_name().to_owned(), text)
+}
+
+/// A numeric subscript write: it writes the member the decimal text names.
+fn by_number_write() -> (String, String) {
+    let object = CustomObject::new(Vec::new());
+    object
+        .prop_set_by_num(4, MemberFlags::ENSURE, &Variant::from(40i64), None)
+        .expect("the write is served");
+    read(&object, "4")
 }
 
 /// A name.

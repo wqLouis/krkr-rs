@@ -9,3 +9,12 @@ void_typeof	String	void
 absent_typeof	String	undefined
 deleted_typeof	String	undefined
 created_typeof	String	Integer
+call_function	Integer	42
+new_class	Integer	7
+compound_object	Integer	3
+compound_dictionary	Integer	3
+string_subscript	String	b
+string_subscript_typeof	String	b
+octet_subscript	Integer	66
+by_number_read	Integer	30
+by_number_write	Integer	40

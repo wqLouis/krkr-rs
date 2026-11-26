@@ -24,7 +24,7 @@ use tjs::{Tjs2Engine, TjsValue};
 /// self-describing.
 const HEADER: &str = "# the engine's answers, recorded by `crates/tjs/examples/object_oracle.rs`; regenerate with the command in the example's docs";
 
-/// The script that builds the dictionary the probes read.
+/// The script that builds what the probes read.
 ///
 /// The builder is a named function because a script cannot declare one inside
 /// an anonymous body, and it is deleted after the call so the global object is
@@ -39,10 +39,42 @@ const SCRIPT: &str = r#"function objectMembers() {
     d["a"] = 4;
     d.b = d["a"] + 1;
     delete d.c;
-    return d;
+    var f = function (a) { return a + 1; };
+    var made = new Array();
+    made.v = 7;
+    var plain = new Dictionary();
+    plain.n = 1;
+    plain.n += 2;
+    var dict = new Dictionary();
+    dict.n = 1;
+    dict.n += 2;
+    var s = "abc";
+    var oct = <%41 42 43%>;
+    var bynum = new Dictionary();
+    bynum["3"] = 30;
+    bynum[4] = 40;
+    var bag = new Dictionary();
+    bag.d = d;
+    bag.f = f;
+    bag.made = made;
+    bag.plain = plain;
+    bag.dict = dict;
+    bag.s = s;
+    bag.oct = oct;
+    bag.bynum = bynum;
+    return bag;
 }
-var d = objectMembers();
+var bag = objectMembers();
+var d = bag.d;
+var f = bag.f;
+var made = bag.made;
+var plain = bag.plain;
+var dict = bag.dict;
+var s = bag.s;
+var oct = bag.oct;
+var bynum = bag.bynum;
 delete this.objectMembers;
+delete this.bag;
 "#;
 
 /// The probes: the id the check names the rule by, and the expression.
@@ -57,6 +89,15 @@ const PROBES: &[(&str, &str)] = &[
     ("absent_typeof", "typeof (d.zz)"),
     ("deleted_typeof", "typeof (d.c)"),
     ("created_typeof", "typeof (d.n)"),
+    ("call_function", "f(41)"),
+    ("new_class", "made.v"),
+    ("compound_object", "plain.n"),
+    ("compound_dictionary", "dict.n"),
+    ("string_subscript", "s[1]"),
+    ("string_subscript_typeof", "typeof (s[1])"),
+    ("octet_subscript", "oct[1]"),
+    ("by_number_read", "bynum[3]"),
+    ("by_number_write", "bynum[\"4\"]"),
 ];
 
 fn main() {
@@ -71,7 +112,7 @@ fn main() {
     table.push_str(HEADER);
     table.push('\n');
     for &(probe, expression) in PROBES {
-        let kind = answer(&engine, &format!("typeof ({expression})"), probe);
+        let kind = kind_of(&engine, expression, probe);
         let text = answer(&engine, &format!("\"\" + ({expression})"), probe);
         table.push_str(&format!("{probe}\t{kind}\t{text}\n"));
     }
@@ -95,6 +136,26 @@ fn main() {
 /// The fixture the record is written to and the check reads.
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/object_members.txt")
+}
+
+/// The kind of one evaluation, as the value itself reports it.
+///
+/// It is read from the marshalled value rather than from `typeof`, because
+/// `typeof` is one of the rules under test: on a string subscript the engine
+/// answers the character, not the word "String", and a record derived through
+/// it would pin that answer in the wrong column.
+fn kind_of(engine: &Tjs2Engine, expression: &str, probe: &str) -> String {
+    match engine.eval(expression, "object_members") {
+        Ok(TjsValue::Void) => "void".to_string(),
+        Ok(TjsValue::Integer(_)) => "Integer".to_string(),
+        Ok(TjsValue::Real(_)) => "Real".to_string(),
+        Ok(TjsValue::String(_)) => "String".to_string(),
+        Ok(TjsValue::Object) => "Object".to_string(),
+        Ok(TjsValue::Retained(id)) => fail(format_args!(
+            "probe {probe}: a retained value {id} is not an answer"
+        )),
+        Err(_) => "!raise".to_string(),
+    }
 }
 
 /// The text of one evaluation, which must be a text.
