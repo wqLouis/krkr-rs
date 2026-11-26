@@ -8,12 +8,9 @@
 //!   1. run `zig build` in `../../deps` (fetches fmt/spdlog/boost/oniguruma
 //!      via the zig package manager and stages headers + libonig.a into
 //!      `$OUT_DIR/zig-out`)
-//!   2. run `bison` on `bison/tjsdate.y` into `$OUT_DIR/gen`
-//!   3. run `python3 script/create_world_map.py` to generate
-//!      `tjsDateWordMap.inc`
-//!   4. compile all tjs2 `.cpp` sources + the shim with the C++ compiler
+//!   2. compile all tjs2 `.cpp` sources + the shim with the C++ compiler
 //!      (`-std=c++17 -fPIC`, defines matching the upstream CMake)
-//!   5. archive into `libtjs2_core.a` and emit `cargo:rustc-link-*` for
+//!   3. archive into `libtjs2_core.a` and emit `cargo:rustc-link-*` for
 //!      libonig.a and the C++ runtime (libc++).
 //!
 //! Cross-compilation
@@ -83,7 +80,6 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsMT19937ar-cok.cpp",
     "tjsArray.cpp",
     "tjsByteCodeLoader.cpp",
-    "tjsDateParser.cpp",
     "tjsGlobalStringMap.cpp",
     "tjsOctPack.cpp",
     "tjsScriptCache.cpp",
@@ -92,8 +88,6 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsVariant.cpp",
     "tjsString.cpp",
 ];
-
-const BISON_GRAMMARS: &[&str] = &["tjsdate.y"];
 
 /// The oniguruma C sources, mirroring the list in `deps/build.zig`. The
 /// `*_data.c` files are `#include`d by `unicode.c` and must not be compiled
@@ -455,45 +449,6 @@ fn main() {
         manifest_dir.join("cpp").display()
     );
 
-    let bison = env::var("BISON")
-        .ok()
-        .or_else(|| which("bison").map(|p| p.display().to_string()));
-    let Some(bison) = bison else {
-        fail("bison not found (needed to generate the TJS2 parsers)");
-    };
-    let python = env::var("PYTHON").ok().or_else(|| {
-        which("python3")
-            .map(|p| p.display().to_string())
-            .or_else(|| which("python").map(|p| p.display().to_string()))
-    });
-    let Some(python) = python else {
-        fail("python3 not found (needed to generate tjsDateWordMap.inc)");
-    };
-
-    // -- generate parsers with bison ---------------------------------------
-    let gen_dir = out_dir.join("gen");
-    std::fs::create_dir_all(&gen_dir).unwrap();
-    for y in BISON_GRAMMARS {
-        let src = tjs2_dir.join("bison").join(y);
-        let mut cmd = Command::new(&bison);
-        cmd.arg(&src).current_dir(&gen_dir);
-        run(&mut cmd, &format!("bison on {y}"));
-    }
-    println!(
-        "cargo:rerun-if-changed={}",
-        tjs2_dir.join("bison").display()
-    );
-
-    // -- generate date word map --------------------------------------------
-    let script_dir = tjs2_dir.join("script");
-    let word_map_out = gen_dir.join("tjsDateWordMap.inc");
-    let mut cmd = Command::new(&python);
-    cmd.arg("create_world_map.py")
-        .arg(&word_map_out)
-        .current_dir(&script_dir);
-    run(&mut cmd, "create_world_map.py");
-    println!("cargo:rerun-if-changed={}", script_dir.display());
-
     // -- compile ------------------------------------------------------------
     let obj_dir = out_dir.join("obj");
     std::fs::create_dir_all(&obj_dir).unwrap();
@@ -506,7 +461,6 @@ fn main() {
         // want sanitizer runtime deps in the static archive.
         "-fno-sanitize=undefined".into(),
         format!("-I{}", tjs2_dir.display()),
-        format!("-I{}", gen_dir.display()),
         format!("-I{}", manifest_dir.join("cpp").display()),
         format!("-I{}", deps_out.join("include").display()),
         "-DTJS_TEXT_OUT_CRLF".into(),
@@ -555,8 +509,8 @@ fn main() {
     //
     // The level matters because save loading parses/evaluates a multi-megabyte
     // TJS literal: measured on the real game, `-O0` spends ~670 ms in
-    // parse+eval while `-O2` spends ~136 ms. Every translation unit (vendored
-    // sources, generated parsers, ABI/stream shims) uses this same level — no
+    // parse+eval while `-O2` spends ~136 ms. Every translation unit (the
+    // vendored sources and the ABI/stream shims) uses this same level — no
     // per-file exception is needed. To special-case one translation unit, name
     // its file here. `TJS2_OPT` overrides the level for benchmarking.
     let opt = env::var("TJS2_OPT").unwrap_or_else(|_| "-O2".to_string());
@@ -568,12 +522,8 @@ fn main() {
     let extra = env::var("TJS2_EXTRA_CXXFLAGS").unwrap_or_default();
     flags.extend(extra.split_whitespace().map(str::to_string));
 
-    // Collect all sources: upstream tjs2 + generated parsers + our shim.
+    // Collect all sources: the upstream tjs2 tree and our shims.
     let mut sources: Vec<PathBuf> = TJS2_SOURCES.iter().map(|s| tjs2_dir.join(s)).collect();
-    for y in BISON_GRAMMARS {
-        let stem = y.strip_suffix(".y").unwrap();
-        sources.push(gen_dir.join(format!("{stem}.tab.cpp")));
-    }
     sources.push(manifest_dir.join("cpp/tjs2_abi.cpp"));
     sources.push(manifest_dir.join("cpp/streams.cpp"));
     // The hash table's order-list helper: it is only called from the crate's
@@ -598,7 +548,6 @@ fn main() {
             let obj_dir = obj_dir.clone();
             let failed = failed.clone();
             let lock = lock.clone();
-            let generated = src.starts_with(&gen_dir);
             std::thread::spawn(move || {
                 let obj = obj_dir.join(
                     src.file_name()
@@ -626,9 +575,7 @@ fn main() {
                     println!("cargo:warning=compile failed: {}", src.display());
                     return;
                 }
-                if !generated {
-                    println!("cargo:rerun-if-changed={}", src.display());
-                }
+                println!("cargo:rerun-if-changed={}", src.display());
             })
         })
         .collect();

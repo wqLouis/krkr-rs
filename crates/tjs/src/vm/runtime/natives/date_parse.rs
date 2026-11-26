@@ -755,7 +755,9 @@ mod tests {
     // reference/krkr2/cpp/core/tjs2/bison/tjsdate.y:54-136
     #[test]
     fn every_date_form_reads_the_same_day() {
-        let forms = [
+        // the month is the number the form's own field gives: a name form
+        // names May, and the numeric form gives the third month
+        let named = [
             "Sun, 3 May 2004 11:22:33 GMT +900",
             "Sun, 3-May 2004 11:22:33 GMT +900",
             "Sun, 3-May-2004 11:22:33 GMT +900",
@@ -766,11 +768,17 @@ mod tests {
             "Sun, 3-May 11:22:33 2004 GMT +900",
             "Sun, May 3 11:22:33 2004 GMT +900",
             "Sun, May-3 11:22:33 2004 GMT +900",
+        ];
+        for form in named {
+            assert_eq!(day(form), (2004, 4, 3), "{form}");
+            assert_eq!(time(form), (11, 22, 33), "{form}");
+        }
+        let numeric = [
             "2004/03/03 11:22:33 GMT +900",
             "2004-03-03 11:22:33 GMT +900",
         ];
-        for form in forms {
-            assert_eq!(day(form), (2004, 4, 3), "{form}");
+        for form in numeric {
+            assert_eq!(day(form), (2004, 2, 3), "{form}");
             assert_eq!(time(form), (11, 22, 33), "{form}");
         }
     }
@@ -898,7 +906,7 @@ mod tests {
         let units: Vec<u16> = "1 Jan 1970 08:59:59".encode_utf16().collect();
         assert_eq!(parse(&units, 32_400), Err(DateError::InvalidTimestamp));
         let before: Vec<u16> = "1 Jan 1970 08:59:58".encode_utf16().collect();
-        assert_eq!(parse(&before, 32_400), Ok(-2_000));
+        assert_eq!(parse(&before, 32_400), Ok(-2));
         let after: Vec<u16> = "1 Jan 1970 09:00:00".encode_utf16().collect();
         assert_eq!(parse(&after, 32_400), Ok(0));
     }

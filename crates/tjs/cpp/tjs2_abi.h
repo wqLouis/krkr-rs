@@ -278,6 +278,22 @@ int tjs2_compile_script(tjs2_engine *e, const char *script, size_t script_len,
 int tjs2_number_parse(const uint16_t *text, int *kind, long long *integer,
                       double *real, size_t *consumed);
 
+/* The outcome of the date text rule. */
+#define TJS2_DATE_OK 0
+#define TJS2_DATE_FORMAT 1
+#define TJS2_DATE_TIMESTAMP 2
+
+/*
+ * Read a date from `text`, a NUL-terminated UTF-16 string, with the engine's
+ * text-to-date rule. `system_offset` is the system zone's standard offset in
+ * seconds east of UTC. Answers TJS2_DATE_OK with the epoch seconds written to
+ * `seconds`; TJS2_DATE_FORMAT when the text is not a date the rule reads, and
+ * TJS2_DATE_TIMESTAMP when the fields name no instant. The outputs are written
+ * only on TJS2_DATE_OK.
+ */
+int tjs2_date_parse(const uint16_t *text, long long system_offset,
+                    long long *seconds);
+
 /*
  * Load and execute TJS2 precompiled bytecode from an in-memory buffer
  * (reference `tTJS::LoadByteCode(tTJSBinaryStream*, ...)`, whose only caller

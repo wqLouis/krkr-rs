@@ -56,6 +56,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::vm::codegen::ffi::{
     Image, c_string, panic_message, tjs2_codegen_block, tjs2_pp_value, tjs2_pp_values,
 };
+use crate::vm::runtime::natives::date::DateError;
+use crate::vm::runtime::natives::date_parse;
 use crate::vm::runtime::number;
 
 /// The compile succeeded.
@@ -340,6 +342,57 @@ pub unsafe extern "C" fn tjs2_number_parse(
         *consumed = parsed.consumed;
     }
     1
+}
+
+// ---------------------------------------------------------------------------
+// The text-to-date entry: the one date rule, in the C shape
+// ---------------------------------------------------------------------------
+
+/// The date the entry read: the text names an instant.
+const DATE_OK: c_int = 0;
+/// The date the entry read: the text is not a date the grammar reads.
+const DATE_FORMAT: c_int = 1;
+/// The date the entry read: the fields name no instant.
+const DATE_TIMESTAMP: c_int = 2;
+
+/// Reads a date from a NUL-terminated UTF-16 text.
+///
+/// `system_offset` is the system zone's standard offset in seconds east of
+/// UTC. Answers [`DATE_OK`] with the epoch seconds written to `seconds`,
+/// [`DATE_FORMAT`] when the text is not a date the grammar reads, and
+/// [`DATE_TIMESTAMP`] when the fields name no instant. The outputs are written
+/// only on [`DATE_OK`].
+///
+/// # Safety
+///
+/// `text` must be NUL-terminated and readable up to the terminator, and
+/// `seconds` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tjs2_date_parse(
+    text: *const u16,
+    system_offset: i64,
+    seconds: *mut i64,
+) -> c_int {
+    if text.is_null() {
+        return DATE_FORMAT;
+    }
+    // the text ends at its terminator, which is never part of a date
+    let mut length = 0usize;
+    // SAFETY: the caller promises the text is readable up to its terminator.
+    while unsafe { *text.add(length) } != 0 {
+        length += 1;
+    }
+    // SAFETY: the caller promises the text is readable up to its terminator.
+    let units = unsafe { std::slice::from_raw_parts(text, length) };
+    match date_parse::parse(units, system_offset) {
+        Ok(value) => {
+            // SAFETY: the caller promises the seconds pointer is writable.
+            unsafe { *seconds = value };
+            DATE_OK
+        }
+        Err(DateError::CannotParse) => DATE_FORMAT,
+        Err(DateError::InvalidTimestamp) => DATE_TIMESTAMP,
+    }
 }
 
 /// Frees the handle and every buffer of the image it owns.

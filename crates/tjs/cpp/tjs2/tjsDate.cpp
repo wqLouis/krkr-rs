@@ -13,7 +13,7 @@
 
 #include "tjsError.h"
 #include "tjsDate.h"
-#include "tjsDateParser.h"
+#include "tjs2_abi.h"
 
 /*
 note:
@@ -26,8 +26,18 @@ dependented problem, so any remedies are not given here.
 namespace TJS {
     //---------------------------------------------------------------------------
     static time_t TJSParseDateString(const tjs_char *str) {
-        TJSDate::tTJSDateParser parser(str);
-        return (time_t)(parser.GetTime() / 1000);
+        long long seconds = 0;
+        const int result = tjs2_date_parse(
+            reinterpret_cast<const uint16_t *>(str),
+            -(long long)TJS_timezone, &seconds);
+        if(result == TJS2_DATE_OK)
+            return (time_t)seconds;
+        if(result == TJS2_DATE_FORMAT) {
+            TJS_eTJSError(TJSCannotParseDate);
+            return 0;
+        }
+        TJS_eTJSError(TJSInvalidValueForTimestamp);
+        return 0;
     }
 
     //---------------------------------------------------------------------------
