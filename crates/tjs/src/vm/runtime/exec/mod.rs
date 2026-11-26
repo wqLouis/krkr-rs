@@ -47,6 +47,7 @@ use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::Variant;
 
 pub mod call;
+pub mod context;
 pub mod decode;
 pub mod frame;
 pub mod member;
@@ -232,13 +233,38 @@ impl Machine {
     ) -> Result<Variant, Fault> {
         let block = self.blocks.allocate(code.block_len()?);
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
-        let answer = self.execute(code, &mut frame, argv);
+        let answer = self.execute(code, &mut frame, argv, None);
+        self.blocks.release(frame.into_block());
+        answer
+    }
+
+    /// Runs one call of a context object's own code.
+    ///
+    /// This is the entry a context object is invoked through: the object's code
+    /// runs with `receiver` as its `this`, and the object itself is the context
+    /// the member registration publishes.
+    pub fn run_context(
+        &mut self,
+        context: &Rc<context::ContextObject>,
+        receiver: Option<Rc<dyn Dispatch>>,
+        argv: &[Variant],
+    ) -> Result<Variant, Fault> {
+        let code = context.code();
+        let block = self.blocks.allocate(code.block_len()?);
+        let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
+        let answer = self.execute(code, &mut frame, argv, Some(context));
         self.blocks.release(frame.into_block());
         answer
     }
 
     /// Executes the code stream from its first instruction to its return.
-    fn execute(&self, code: &Code, frame: &mut Frame, argv: &[Variant]) -> Result<Variant, Fault> {
+    fn execute(
+        &self,
+        code: &Code,
+        frame: &mut Frame,
+        argv: &[Variant],
+        context: Option<&Rc<context::ContextObject>>,
+    ) -> Result<Variant, Fault> {
         let mut ip: usize = 0;
         let mut flag = false;
         let mut result = Variant::Void;
@@ -441,6 +467,9 @@ impl Machine {
                 // parts another part owns
                 _ if member::handles(opcode) => member::execute(code, frame, ip, opcode)?,
                 _ if call::handles(opcode) => call::execute(code, frame, argv, ip, opcode)?,
+                _ if context::handles(opcode) => {
+                    context::execute(code, frame, context, self.global.as_ref(), ip, opcode)?;
+                }
                 _ => match (decode::step_of(opcode), decode::operator_of(opcode)) {
                     (Some((up, form)), _) => self.step(frame, code, ip, up, form)?,
                     (None, Some((operator, form))) => {

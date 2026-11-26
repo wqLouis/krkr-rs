@@ -1,0 +1,675 @@
+//! The context objects: a code context as the object a receiver is taken from.
+//!
+//! A context is not only a code stream. The functions a block declares become
+//! members of an object, a declared class is an object whose members are its
+//! methods, and a call reaches one through the object surface like any other
+//! member. This module is that object: [`ContextObject`] is a dispatch object
+//! over a [`Code`] and a member store, and the four instructions here are what
+//! build and rebind it.
+//!
+//! # The chain
+//!
+//! A class answers the members its own store holds and then its parent's, so
+//! `super` reaches the parent's member through the same read every other member
+//! takes. A function context does **not** chain: a nested function sees its own
+//! registers, its receiver and the global object, and nothing of the context
+//! that declared it. Chaining a function's store into its parent's would be a
+//! lexical capture, which the language does not have.
+//!
+//! # What the four instructions do
+//!
+//! | instruction | what it does |
+//! |---|---|
+//! | `GLOBAL %d` | names the machine's global object in a register |
+//! | `CHGTHIS %c %o` | rebinds the closure in `%c` so its receiver is `%o` |
+//! | `REGMEMBER` | publishes the context's own members onto the frame's receiver, rebinding each one's receiver to it |
+//! | `ADDCI %o %v` | adds `%v` to the object `%o`'s class names |
+//!
+//! `CHGTHIS` is what makes a declared function a method: a receiver is a
+//! property of the closure, so rebinding it is enough to change what the
+//! function sees as `this`, including inside a block it calls.
+//!
+//! # The one instruction this module cannot finish
+//!
+//! `ADDCI` writes a class name onto an object that is already built, and the
+//! object surface publishes class names as a read with no write beside it. The
+//! instruction therefore stops with a refusal that names the missing entry
+//! rather than dropping the name.
+
+use std::rc::Rc;
+
+use crate::vm::codegen::context::ContextType;
+use crate::vm::codegen::opcode::vm;
+use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
+use crate::vm::runtime::string::TjsString;
+use crate::vm::runtime::variant::{Closure, Variant};
+
+use super::Fault;
+use super::frame::{Code, Frame};
+
+/// The member flags a published member carries: it is created when absent, and
+/// it is written through rather than through its property.
+///
+/// A static member is not published at all, so it never reaches this: the
+/// `STATIC` flag is tested before the write.
+fn publish_flags() -> MemberFlags {
+    MemberFlags::ENSURE | MemberFlags::IGNORE_PROPERTY
+}
+
+/// Whether an opcode is one of the four context instructions.
+pub fn handles(opcode: i32) -> bool {
+    matches!(opcode, vm::CHGTHIS | vm::GLOBAL | vm::ADDCI | vm::REGMEMBER)
+}
+
+/// Executes a context instruction.
+///
+/// `context` is the object of the context being executed, which is what
+/// `REGMEMBER` publishes and what a class's own name is read from.
+pub fn execute(
+    code: &Code,
+    frame: &mut Frame,
+    context: Option<&Rc<ContextObject>>,
+    global: Option<&Rc<dyn Dispatch>>,
+    ip: usize,
+    opcode: i32,
+) -> Result<(), Fault> {
+    match opcode {
+        vm::GLOBAL => {
+            let address = operand(code, ip, 1)?;
+            let object = match global {
+                Some(global) => global.clone(),
+                None => return Err(Fault::Broken("the machine has no global object to name")),
+            };
+            let value = Variant::Object(Closure {
+                object: Some(object.clone()),
+                objthis: Some(object),
+            });
+            frame.set(address, value)
+        }
+        vm::CHGTHIS => {
+            let target = operand(code, ip, 1)?;
+            let receiver = operand(code, ip, 2)?;
+            let new = match frame.reg(receiver)? {
+                Variant::Object(closure) => closure.object.clone(),
+                _ => None,
+            };
+            let value = frame.reg(target)?.clone();
+            match &value {
+                Variant::Object(closure) => {
+                    let rebound = Variant::Object(Closure {
+                        object: closure.object.clone(),
+                        objthis: new,
+                    });
+                    frame.set(target, rebound)
+                }
+                _ => Err(Fault::Raised(super::Raise::Convert {
+                    value: Box::new(value.clone()),
+                    to: "Object",
+                })),
+            }
+        }
+        vm::REGMEMBER => {
+            let Some(context) = context else {
+                return Err(Fault::Broken(
+                    "a member registration runs with no context object",
+                ));
+            };
+            publish(context, frame)
+        }
+        vm::ADDCI => Err(Fault::Refused {
+            opcode: String::from("ADDCI"),
+            part: "the class-name write on the object surface",
+        }),
+        _ => Err(Fault::Broken("a context instruction that is not one")),
+    }
+}
+
+/// Publishes a context's members onto the frame's receiver.
+///
+/// Every member that is not static is written onto the receiver, and a member
+/// whose value is an object has its receiver rebound to the destination, so a
+/// class's functions become the instance's methods. The walk ignores properties:
+/// it publishes the values, not what a property would answer.
+fn publish(context: &Rc<ContextObject>, frame: &mut Frame) -> Result<(), Fault> {
+    let destination = match frame.receiver() {
+        Some(destination) => destination,
+        None => {
+            return Err(Fault::Broken(
+                "a member registration names no object to publish onto",
+            ));
+        }
+    };
+    let mut failure = None;
+    context
+        .enum_members(MemberFlags::IGNORE_PROPERTY, &mut |name, flags, value| {
+            if flags & MemberFlags::STATIC.bits() != 0 {
+                return true;
+            }
+            let mut copied = value.clone();
+            if let Variant::Object(closure) = &mut copied {
+                closure.objthis = Some(destination.clone());
+            }
+            match destination.prop_set(name, publish_flags(), &copied, Some(destination.as_ref())) {
+                Ok(()) => true,
+                Err(error) => {
+                    failure = Some(error);
+                    false
+                }
+            }
+        })
+        .map_err(Fault::from)?;
+    match failure {
+        Some(error) => Err(Fault::from(error)),
+        None => Ok(()),
+    }
+}
+
+/// The object one code context is.
+///
+/// It answers the members its store holds and, for a class, its parent's; it
+/// answers its own name and its parents' for a question about classes; and it
+/// answers no call, because running its code needs a frame this surface cannot
+/// be handed.
+pub struct ContextObject {
+    /// The code the context runs.
+    code: Code,
+    /// What kind of context it is.
+    kind: ContextType,
+    /// The name of the context: a class's name is the name an instance answers
+    /// to.
+    name: TjsString,
+    /// The context that holds it.
+    parent: Option<Rc<ContextObject>>,
+    /// The members the context publishes: the functions it declares and, for a
+    /// class, the members its body installs.
+    members: CustomObject,
+}
+
+impl ContextObject {
+    /// A context object of the given kind, holding the given code.
+    pub fn new(code: Code, kind: ContextType, name: impl Into<TjsString>) -> Self {
+        Self {
+            code,
+            kind,
+            name: name.into(),
+            parent: None,
+            members: CustomObject::new(Vec::new()),
+        }
+    }
+
+    /// The same context, held by `parent`.
+    pub fn with_parent(mut self, parent: Rc<ContextObject>) -> Self {
+        self.parent = Some(parent);
+        self
+    }
+
+    /// The code the context runs.
+    pub fn code(&self) -> &Code {
+        &self.code
+    }
+
+    /// The kind of the context.
+    pub fn kind(&self) -> ContextType {
+        self.kind
+    }
+
+    /// The name of the context.
+    pub fn name(&self) -> &TjsString {
+        &self.name
+    }
+
+    /// Stores a member the context publishes.
+    pub fn define(&self, name: &TjsString, value: Variant) -> Result<(), ObjectError> {
+        self.members
+            .prop_set(name, MemberFlags::ENSURE, &value, None)
+    }
+
+    /// The members the context publishes, for the block builder to fill.
+    pub fn members(&self) -> &CustomObject {
+        &self.members
+    }
+
+    /// The context a lookup of this one's members continues into.
+    ///
+    /// Only a class and the proxy that holds a class's super class continue into
+    /// their parent. A function does not, because a function that could read its
+    /// declarer's members would be a capture, and the language has none.
+    fn continuation(&self) -> Option<&Rc<ContextObject>> {
+        match self.kind {
+            ContextType::Class | ContextType::SuperClassGetter => self.parent.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// The class names the context answers to, its own first and then its
+    /// parents'.
+    fn chain(&self) -> Vec<TjsString> {
+        let mut names = Vec::new();
+        if self.kind == ContextType::Class && !self.name.is_empty() {
+            names.push(self.name.clone());
+        }
+        if let Some(parent) = self.continuation() {
+            names.extend(parent.chain());
+        }
+        names
+    }
+}
+
+impl Dispatch for ContextObject {
+    /// Reads a member: the context's own store, then — for a class — its
+    /// parent's.
+    fn prop_get(
+        &self,
+        name: &TjsString,
+        flags: MemberFlags,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        match self.members.prop_get(name, flags, objthis) {
+            Err(ObjectError::MemberNotFound) => match self.continuation() {
+                Some(parent) => parent.prop_get(name, flags, objthis),
+                None => Err(ObjectError::MemberNotFound),
+            },
+            other => other,
+        }
+    }
+
+    fn prop_set(
+        &self,
+        name: &TjsString,
+        flags: MemberFlags,
+        value: &Variant,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<(), ObjectError> {
+        self.members.prop_set(name, flags, value, objthis)
+    }
+
+    fn delete_member(
+        &self,
+        name: &TjsString,
+        flags: MemberFlags,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<(), ObjectError> {
+        self.members.delete_member(name, flags, objthis)
+    }
+
+    fn enum_members(
+        &self,
+        flags: MemberFlags,
+        callback: &mut dyn FnMut(&TjsString, u32, &Variant) -> bool,
+    ) -> Result<(), ObjectError> {
+        self.members.enum_members(flags, callback)
+    }
+
+    fn is_instance_of(
+        &self,
+        class: &TjsString,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<bool, ObjectError> {
+        if class == &TjsString::from("Object") {
+            return Ok(true);
+        }
+        Ok(self.chain().iter().any(|name| name == class))
+    }
+
+    fn class_names(&self) -> Vec<TjsString> {
+        self.chain()
+    }
+
+    fn is_valid(&self) -> bool {
+        self.members.is_valid()
+    }
+
+    fn invalidate(&self) -> bool {
+        self.members.invalidate()
+    }
+
+    /// A context answers no call here.
+    ///
+    /// Running its code needs a frame, and a frame needs the receiver as an owned
+    /// handle and a failure channel that can carry the code's own raise; the
+    /// object surface offers a borrowed receiver and an object error. The entry
+    /// that runs a context is [`super::Machine::run_context`], and this method
+    /// does not pretend to be it.
+    fn func_call(
+        &self,
+        _name: &TjsString,
+        _argv: Option<&[Variant]>,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        Err(ObjectError::CallNotServed)
+    }
+
+    /// A context is not a class a script constructs: construction runs the
+    /// context's own code, which is the same frame problem.
+    fn create_new(
+        &self,
+        _name: &TjsString,
+        _argv: Option<&[Variant]>,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        Err(ObjectError::CallNotServed)
+    }
+}
+
+impl std::fmt::Debug for ContextObject {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ContextObject")
+            .field("kind", &self.kind.name())
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// The `slot`-th operand of the instruction at `ip`.
+fn operand(code: &Code, ip: usize, slot: usize) -> Result<i32, Fault> {
+    super::operand(&code.code, ip, slot)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(value: &str) -> TjsString {
+        TjsString::from(value)
+    }
+
+    fn same(left: &Variant, right: &Variant) -> bool {
+        crate::vm::runtime::exec::op::discern_equals(left, right)
+    }
+
+    fn context(kind: ContextType, name: &str) -> Rc<ContextObject> {
+        Rc::new(ContextObject::new(Code::default(), kind, name))
+    }
+
+    fn register(number: i32) -> i32 {
+        crate::vm::codegen::opcode::vm_reg_addr(number)
+    }
+
+    fn code_of(words: Vec<i32>, data: Vec<Variant>) -> Code {
+        Code {
+            code: words,
+            data,
+            variable_reserve_count: 2,
+            max_frame_count: 4,
+            ..Code::default()
+        }
+    }
+
+    /// A context answers the members it publishes
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:886-949`,
+    /// `RegisterFunction`).
+    #[test]
+    fn a_context_answers_its_own_members() {
+        let object = context(ContextType::Class, "C");
+        object
+            .define(&text("v"), Variant::Integer(7))
+            .expect("the member is stored");
+        let read = object
+            .prop_get(&text("v"), MemberFlags::NONE, None)
+            .expect("the member is there");
+        assert!(same(&read, &Variant::Integer(7)));
+        assert!(matches!(
+            object.prop_get(&text("nope"), MemberFlags::NONE, None),
+            Err(ObjectError::MemberNotFound)
+        ));
+    }
+
+    /// A class reaches its parent's member, and a function does not reach its
+    /// declarer's — the language has no capture
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2812-2820`).
+    #[test]
+    fn a_class_reaches_its_parent_and_a_function_does_not() {
+        let parent = context(ContextType::Class, "Base");
+        parent
+            .define(&text("v"), Variant::Integer(1))
+            .expect("the member is stored");
+        let child = Rc::new(
+            ContextObject::new(Code::default(), ContextType::Class, "Child")
+                .with_parent(parent.clone()),
+        );
+        let read = child
+            .prop_get(&text("v"), MemberFlags::NONE, None)
+            .expect("the parent answers");
+        assert!(same(&read, &Variant::Integer(1)));
+
+        let declarer = context(ContextType::Function, "outer");
+        declarer
+            .define(&text("v"), Variant::Integer(1))
+            .expect("the member is stored");
+        let nested = Rc::new(
+            ContextObject::new(Code::default(), ContextType::Function, "inner")
+                .with_parent(declarer),
+        );
+        assert!(
+            matches!(
+                nested.prop_get(&text("v"), MemberFlags::NONE, None),
+                Err(ObjectError::MemberNotFound)
+            ),
+            "a nested function does not read its declarer's members"
+        );
+    }
+
+    /// The class names of a chain answer the class question, the child's name
+    /// first (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2233-2247`).
+    #[test]
+    fn a_chain_answers_the_class_names() {
+        let parent = context(ContextType::Class, "Base");
+        let child = Rc::new(
+            ContextObject::new(Code::default(), ContextType::Class, "Child").with_parent(parent),
+        );
+        let names: Vec<String> = child.class_names().iter().map(|n| n.to_string()).collect();
+        assert_eq!(names, vec!["Child".to_string(), "Base".to_string()]);
+        assert_eq!(child.is_instance_of(&text("Child"), None), Ok(true));
+        assert_eq!(child.is_instance_of(&text("Base"), None), Ok(true));
+        assert_eq!(child.is_instance_of(&text("Other"), None), Ok(false));
+        assert_eq!(child.is_instance_of(&text("Object"), None), Ok(true));
+    }
+
+    /// A function context carries no class name, so it answers only the class
+    /// every object belongs to.
+    #[test]
+    fn a_function_context_is_no_class() {
+        let object = context(ContextType::Function, "f");
+        assert!(object.class_names().is_empty());
+        assert_eq!(object.is_instance_of(&text("f"), None), Ok(false));
+        assert_eq!(object.is_instance_of(&text("Object"), None), Ok(true));
+    }
+
+    /// `GLOBAL` names the machine's global object, with itself as its receiver
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1283-1287`).
+    #[test]
+    fn global_names_the_machines_global_object() {
+        let global: Rc<dyn Dispatch> = Rc::new(CustomObject::new([text("global")]));
+        let code = code_of(
+            vec![vm::GLOBAL, register(1), vm::SRV, register(1), vm::RET],
+            vec![],
+        );
+        let mut machine = super::super::Machine::with_global(global.clone());
+        let answer = machine.run(&code, None, &[]).expect("the stream runs");
+        let Variant::Object(closure) = answer else {
+            panic!("the answer is not an object");
+        };
+        let object = closure.object.expect("an object");
+        assert!(Rc::ptr_eq(&object, &global));
+        let receiver = closure.objthis.expect("a receiver");
+        assert!(Rc::ptr_eq(&receiver, &global));
+    }
+
+    /// A machine with no global object refuses `GLOBAL` rather than naming
+    /// nothing.
+    #[test]
+    fn global_without_a_global_object_is_refused() {
+        let code = code_of(vec![vm::GLOBAL, register(1), vm::RET], vec![]);
+        let mut machine = super::super::Machine::new();
+        assert!(matches!(
+            machine.run(&code, None, &[]),
+            Err(Fault::Broken(_))
+        ));
+    }
+
+    /// `CHGTHIS` rebinds the closure's receiver, and a receiver of the null
+    /// object clears it
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1276-1281`).
+    #[test]
+    fn chgthis_rebinds_the_receiver() {
+        let callee: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let receiver: Rc<dyn Dispatch> = Rc::new(CustomObject::new([text("receiver")]));
+        let code = code_of(
+            vec![
+                vm::CONST,
+                register(1),
+                0,
+                vm::CONST,
+                register(2),
+                1,
+                vm::CHGTHIS,
+                register(1),
+                register(2),
+                vm::SRV,
+                register(1),
+                vm::RET,
+            ],
+            vec![
+                Variant::Object(Closure {
+                    object: Some(callee),
+                    objthis: None,
+                }),
+                Variant::Object(Closure {
+                    object: Some(receiver.clone()),
+                    objthis: Some(receiver.clone()),
+                }),
+            ],
+        );
+        let mut machine = super::super::Machine::new();
+        let answer = machine.run(&code, None, &[]).expect("the stream runs");
+        let Variant::Object(closure) = answer else {
+            panic!("the answer is not an object");
+        };
+        let rebound = closure.objthis.expect("a receiver");
+        assert!(Rc::ptr_eq(&rebound, &receiver));
+    }
+
+    /// `REGMEMBER` publishes the context's members onto the frame's receiver and
+    /// rebinds each one's receiver to it
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2708-2740`).
+    #[test]
+    fn regmember_publishes_the_contexts_members() {
+        let function: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let context = Rc::new(ContextObject::new(
+            Code {
+                code: vec![vm::REGMEMBER, vm::RET],
+                variable_reserve_count: 2,
+                ..Code::default()
+            },
+            ContextType::Class,
+            "C",
+        ));
+        context
+            .define(
+                &text("m"),
+                Variant::Object(Closure {
+                    object: Some(function),
+                    objthis: None,
+                }),
+            )
+            .expect("the function is stored");
+        let instance: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let mut machine = super::super::Machine::new();
+        machine
+            .run_context(&context, Some(instance.clone()), &[])
+            .expect("the context runs");
+        let member = instance
+            .prop_get(&text("m"), MemberFlags::NONE, None)
+            .expect("the member was published");
+        let Variant::Object(closure) = member else {
+            panic!("the published member is not an object");
+        };
+        let rebound = closure.objthis.expect("a receiver");
+        assert!(
+            Rc::ptr_eq(&rebound, &instance),
+            "the published function's receiver is the instance"
+        );
+    }
+
+    /// A static member is not published
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2717-2719`).
+    #[test]
+    fn regmember_skips_a_static_member() {
+        let context = Rc::new(ContextObject::new(
+            Code {
+                code: vec![vm::REGMEMBER, vm::RET],
+                variable_reserve_count: 2,
+                ..Code::default()
+            },
+            ContextType::Class,
+            "C",
+        ));
+        context
+            .members()
+            .prop_set(
+                &text("s"),
+                MemberFlags::ENSURE | MemberFlags::STATIC,
+                &Variant::Integer(1),
+                None,
+            )
+            .expect("the static member is stored");
+        let instance: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let mut machine = super::super::Machine::new();
+        machine
+            .run_context(&context, Some(instance.clone()), &[])
+            .expect("the context runs");
+        assert!(matches!(
+            instance.prop_get(&text("s"), MemberFlags::NONE, None),
+            Err(ObjectError::MemberNotFound)
+        ));
+    }
+
+    /// `ADDCI` adds a class name to an object that is already built, and the
+    /// surface publishes class names with no write beside them, so the
+    /// instruction stops and names what it is missing
+    /// (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2233-2247`).
+    #[test]
+    fn addci_names_the_missing_entry() {
+        let instance: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let code = code_of(
+            vec![
+                vm::CONST,
+                register(1),
+                0,
+                vm::CONST,
+                register(2),
+                1,
+                vm::ADDCI,
+                register(1),
+                register(2),
+                vm::RET,
+            ],
+            vec![
+                Variant::Object(Closure {
+                    object: Some(instance),
+                    objthis: None,
+                }),
+                Variant::String(text("C")),
+            ],
+        );
+        let mut machine = super::super::Machine::new();
+        match machine.run(&code, None, &[]) {
+            Err(Fault::Refused { opcode, part }) => {
+                assert_eq!(opcode, "ADDCI");
+                assert_eq!(part, "the class-name write on the object surface");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The four opcodes are the ones handled, and no others.
+    #[test]
+    fn the_four_instructions_are_the_ones_handled() {
+        for opcode in [vm::CHGTHIS, vm::GLOBAL, vm::ADDCI, vm::REGMEMBER] {
+            assert!(handles(opcode));
+        }
+        assert!(!handles(vm::CALL));
+        assert!(!handles(vm::NOP));
+    }
+}
