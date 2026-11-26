@@ -53,11 +53,13 @@ impl Closure {
     /// The object form: the two handles.
     fn form(&self) -> TjsString {
         let object = match &self.object {
-            Some(object) => format!("{:p}", Rc::as_ptr(object)),
+            // the data address, not the fat pointer: its metadata half is
+            // Rust's, and the engine's form is one address per handle
+            Some(object) => format!("{:p}", Rc::as_ptr(object) as *const ()),
             None => String::from("0x0"),
         };
         let objthis = match &self.objthis {
-            Some(objthis) => format!("{:p}", Rc::as_ptr(objthis)),
+            Some(objthis) => format!("{:p}", Rc::as_ptr(objthis) as *const ()),
             None => String::from("0x0"),
         };
         TjsString::from(format!("(object {object}:{objthis})"))

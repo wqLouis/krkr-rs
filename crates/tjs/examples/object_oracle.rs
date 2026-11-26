@@ -154,7 +154,8 @@ fn kind_of(engine: &Tjs2Engine, expression: &str, probe: &str) -> String {
         Ok(TjsValue::Retained(id)) => fail(format_args!(
             "probe {probe}: a retained value {id} is not an answer"
         )),
-        Err(_) => "!raise".to_string(),
+        // a raise is the rule's answer, not a gap in the record
+        Err(_raised) => "!raise".to_string(),
     }
 }
 

@@ -1,0 +1,26 @@
+# the engine's answers, recorded by `crates/tjs/examples/dictionary_oracle.rs`; regenerate with the command in the example's docs
+absent_typeof	String	undefined
+absent_text	String	
+void_typeof	String	void
+void_text	String	
+null_typeof	String	Object
+created_text	String	7
+deleted_text	String	
+own_class	String	1
+object_class	String	1
+instance_save_struct	String	undefined
+instance_load_struct	String	undefined
+instance_clear	String	undefined
+instance_assign	String	undefined
+instance_assign_struct	String	undefined
+instance_count	String	undefined
+instance_member	String	undefined
+instance_exists	String	undefined
+class_save_struct	String	Object
+class_load_struct	String	Object
+class_clear	String	Object
+class_assign	String	Object
+class_assign_struct	String	Object
+class_count	String	undefined
+save_struct	save	(const) %[\r\n "nan" => NaN /* NaN */,\r\n "self" => null /* object recursion detected */,\r\n "void" => void,\r\n "octet" => <% 00 AB FF %>,\r\n "tiny" => 0x1.A36E2EB1C432Dp-14 /* 0.0001 */,\r\n "integer" => -42,\r\n "text" => "quote \\" slash \\\\ tab \\t ctrl \\x01\\x61 日本語",\r\n "zero" => -0.0 /* -0.0 */,\r\n "real" => 0x1.C000000000000p1 /* 3.5 */,\r\n "inf" => +Infinity /* +Infinity */,\r\n "nested" => (const) %[\r\n  "deep" => (const) %[\r\n   "x" => "y"\r\n  ],\r\n  "inner" => 1\r\n ],\r\n "big" => 1234567890123,\r\n "nothing" => null\r\n]
+save_empty	save	(const) %[\r\n]
