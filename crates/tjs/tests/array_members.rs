@@ -16,6 +16,7 @@ use std::path::PathBuf;
 
 use tjs::vm::runtime::array::{ArrayError, ArrayObject, SortOrder};
 use tjs::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
+use tjs::vm::runtime::octet::Octet;
 use tjs::vm::runtime::string::TjsString;
 use tjs::vm::runtime::variant::Variant;
 
@@ -139,6 +140,44 @@ const PROBES: &[&str] = &[
     "instanceof_array",
     "instanceof_object",
     "instanceof_dictionary",
+    "split_text_count",
+    "split_text_first",
+    "split_text_second",
+    "split_text_third",
+    "split_text_join",
+    "split_multi_count",
+    "split_multi_join",
+    "split_empty_pattern_count",
+    "split_empty_pattern_first",
+    "split_missing_count",
+    "split_missing_first",
+    "split_leading_count",
+    "split_leading_first",
+    "split_leading_purge_count",
+    "split_trailing_count",
+    "split_trailing_last",
+    "split_trailing_purge_count",
+    "split_consecutive_count",
+    "split_consecutive_second",
+    "split_consecutive_purge_count",
+    "split_consecutive_purge_join",
+    "split_empty_text_count",
+    "split_empty_text_first",
+    "split_empty_text_purge_count",
+    "split_purge_zero_count",
+    "split_purge_one_count",
+    "split_purge_two_count",
+    "split_purge_text_count",
+    "split_reserved_ignored_count",
+    "split_number_pattern_count",
+    "split_void_pattern_count",
+    "split_void_text_count",
+    "split_void_text_first",
+    "split_one_param_refused",
+    "split_octet_pattern_refused",
+    "split_octet_pattern_cleared",
+    "split_octet_text_refused",
+    "split_octet_text_cleared",
 ];
 
 /// One recorded answer.
@@ -545,6 +584,271 @@ fn run_probe(array: &ArrayObject, probe: &str) -> Result<Variant, ()> {
         "instanceof_array" => Ok(instance_of(array, "Array")),
         "instanceof_object" => Ok(instance_of(array, "Object")),
         "instanceof_dictionary" => Ok(instance_of(array, "Dictionary")),
+        // reference/krkr2/cpp/core/tjs2/tjsArray.cpp:490-560
+        "split_text_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,b,c"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_text_first" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,b,c"),
+            &Variant::Void,
+            &Variant::Void,
+            0,
+        ),
+        "split_text_second" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,b,c"),
+            &Variant::Void,
+            &Variant::Void,
+            1,
+        ),
+        "split_text_third" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,b,c"),
+            &Variant::Void,
+            &Variant::Void,
+            2,
+        ),
+        "split_text_join" => split_join(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,b,c"),
+            &Variant::Void,
+            &Variant::Void,
+            "|",
+        ),
+        "split_multi_count" => split_count(
+            array,
+            &Variant::from(",;"),
+            &Variant::from("a,b;c"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_multi_join" => split_join(
+            array,
+            &Variant::from(",;"),
+            &Variant::from("a,b;c"),
+            &Variant::Void,
+            &Variant::Void,
+            "|",
+        ),
+        "split_empty_pattern_count" => split_count(
+            array,
+            &Variant::from(""),
+            &Variant::from("abc"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_empty_pattern_first" => split_element(
+            array,
+            &Variant::from(""),
+            &Variant::from("abc"),
+            &Variant::Void,
+            &Variant::Void,
+            0,
+        ),
+        "split_missing_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("abc"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_missing_first" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from("abc"),
+            &Variant::Void,
+            &Variant::Void,
+            0,
+        ),
+        "split_leading_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from(",a"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_leading_first" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from(",a"),
+            &Variant::Void,
+            &Variant::Void,
+            0,
+        ),
+        "split_leading_purge_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from(",a"),
+            &Variant::Void,
+            &Variant::from(1i64),
+        ),
+        "split_trailing_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_trailing_last" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,"),
+            &Variant::Void,
+            &Variant::Void,
+            1,
+        ),
+        "split_trailing_purge_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,"),
+            &Variant::Void,
+            &Variant::from(1i64),
+        ),
+        "split_consecutive_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_consecutive_second" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::Void,
+            1,
+        ),
+        "split_consecutive_purge_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::from(1i64),
+        ),
+        "split_consecutive_purge_join" => split_join(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::from(1i64),
+            "|",
+        ),
+        "split_empty_text_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from(""),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_empty_text_first" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::from(""),
+            &Variant::Void,
+            &Variant::Void,
+            0,
+        ),
+        "split_empty_text_purge_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from(""),
+            &Variant::Void,
+            &Variant::from(1i64),
+        ),
+        "split_purge_zero_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::from(0i64),
+        ),
+        "split_purge_one_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::from(1i64),
+        ),
+        "split_purge_two_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::from(2i64),
+        ),
+        "split_purge_text_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,,b"),
+            &Variant::Void,
+            &Variant::from("abc"),
+        ),
+        "split_reserved_ignored_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::from("a,b"),
+            &Variant::from(1i64),
+            &Variant::from(0i64),
+        ),
+        "split_number_pattern_count" => split_count(
+            array,
+            &Variant::from(1i64),
+            &Variant::from("a1b"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_void_pattern_count" => split_count(
+            array,
+            &Variant::Void,
+            &Variant::from("abc"),
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_void_text_count" => split_count(
+            array,
+            &Variant::from(","),
+            &Variant::Void,
+            &Variant::Void,
+            &Variant::Void,
+        ),
+        "split_void_text_first" => split_element(
+            array,
+            &Variant::from(","),
+            &Variant::Void,
+            &Variant::Void,
+            &Variant::Void,
+            0,
+        ),
+        "split_one_param_refused" => {
+            let answer = array.func_call(&text("split"), Some(&[Variant::from(",")]), None);
+            assert!(
+                matches!(answer, Err(ObjectError::CallNotServed)),
+                "the one-parameter call was served"
+            );
+            Err(())
+        }
+        "split_octet_pattern_refused" => split_refused(
+            array,
+            &Variant::Octet(Octet::from_slice(&[1])),
+            &Variant::from("a,b"),
+        ),
+        "split_octet_pattern_cleared" => Ok(count(array)),
+        "split_octet_text_refused" => split_refused(
+            array,
+            &Variant::from(","),
+            &Variant::Octet(Octet::from_slice(&[1])),
+        ),
+        "split_octet_text_cleared" => Ok(count(array)),
         other => panic!("the check has no replay for the recorded probe: {other}"),
     }
 }
@@ -647,6 +951,81 @@ fn instance_of(array: &ArrayObject, class: &str) -> Variant {
         Ok(true) => Variant::from(1i64),
         Ok(false) => Variant::from(0i64),
         Err(error) => panic!("the class test for {class:?} failed: {error}"),
+    }
+}
+
+/// Calls the array's `split` member through the dispatch surface.
+fn call_split(
+    array: &ArrayObject,
+    pattern: &Variant,
+    subject: &Variant,
+    reserved: &Variant,
+    purge: &Variant,
+) -> Result<(), ObjectError> {
+    array
+        .func_call(
+            &text("split"),
+            Some(&[
+                pattern.clone(),
+                subject.clone(),
+                reserved.clone(),
+                purge.clone(),
+            ]),
+            None,
+        )
+        .map(|_answer| ())
+}
+
+/// Splits and answers the count.
+fn split_count(
+    array: &ArrayObject,
+    pattern: &Variant,
+    text: &Variant,
+    reserved: &Variant,
+    purge: &Variant,
+) -> Result<Variant, ()> {
+    match call_split(array, pattern, text, reserved, purge) {
+        Ok(()) => Ok(count(array)),
+        Err(error) => panic!("the split failed: {error}"),
+    }
+}
+
+/// Splits and answers the element at `index`.
+fn split_element(
+    array: &ArrayObject,
+    pattern: &Variant,
+    text: &Variant,
+    reserved: &Variant,
+    purge: &Variant,
+    index: i64,
+) -> Result<Variant, ()> {
+    match call_split(array, pattern, text, reserved, purge) {
+        Ok(()) => read_at(array, index),
+        Err(error) => panic!("the split failed: {error}"),
+    }
+}
+
+/// Splits and answers the elements joined with `delimiter`.
+fn split_join(
+    array: &ArrayObject,
+    pattern: &Variant,
+    text: &Variant,
+    reserved: &Variant,
+    purge: &Variant,
+    delimiter: &str,
+) -> Result<Variant, ()> {
+    match call_split(array, pattern, text, reserved, purge) {
+        Ok(()) => Ok(joined(array, delimiter)),
+        Err(error) => panic!("the split failed: {error}"),
+    }
+}
+
+/// Splits and asserts the dispatch surface refused the call.
+fn split_refused(array: &ArrayObject, pattern: &Variant, text: &Variant) -> Result<Variant, ()> {
+    match call_split(array, pattern, text, &Variant::Void, &Variant::Void) {
+        Err(ObjectError::CallNotServed) => Err(()),
+        Ok(()) => panic!("the split answered where the engine raised"),
+        Err(error) => panic!("the split failed with another error: {error}"),
     }
 }
 

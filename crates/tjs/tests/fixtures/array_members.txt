@@ -117,3 +117,41 @@ named_survives_assign	String	void
 instanceof_array	Integer	0
 instanceof_object	!raise	
 instanceof_dictionary	Integer	0
+split_text_count	Integer	3
+split_text_first	String	a
+split_text_second	String	b
+split_text_third	String	c
+split_text_join	String	a|b|c
+split_multi_count	Integer	3
+split_multi_join	String	a|b|c
+split_empty_pattern_count	Integer	1
+split_empty_pattern_first	String	abc
+split_missing_count	Integer	1
+split_missing_first	String	abc
+split_leading_count	Integer	2
+split_leading_first	String	
+split_leading_purge_count	Integer	1
+split_trailing_count	Integer	2
+split_trailing_last	String	
+split_trailing_purge_count	Integer	1
+split_consecutive_count	Integer	3
+split_consecutive_second	String	
+split_consecutive_purge_count	Integer	2
+split_consecutive_purge_join	String	a|b
+split_empty_text_count	Integer	1
+split_empty_text_first	String	
+split_empty_text_purge_count	Integer	0
+split_purge_zero_count	Integer	3
+split_purge_one_count	Integer	2
+split_purge_two_count	Integer	2
+split_purge_text_count	Integer	3
+split_reserved_ignored_count	Integer	2
+split_number_pattern_count	Integer	2
+split_void_pattern_count	Integer	1
+split_void_text_count	Integer	1
+split_void_text_first	String	
+split_one_param_refused	!raise	
+split_octet_pattern_refused	!raise	
+split_octet_pattern_cleared	Integer	0
+split_octet_text_refused	!raise	
+split_octet_text_cleared	Integer	0

@@ -56,6 +56,18 @@ delete this.arrayMembers;
 function arrayProbe(value) {
     return (typeof (value)) + ":" + ("" + value);
 }
+function splitCount(array, pattern, text, reserved, purge) {
+    array.split(pattern, text, reserved, purge);
+    return array.count;
+}
+function splitElement(array, pattern, text, reserved, purge, index) {
+    array.split(pattern, text, reserved, purge);
+    return array[index];
+}
+function splitJoin(array, pattern, text, reserved, purge, delimiter) {
+    array.split(pattern, text, reserved, purge);
+    return array.join(delimiter);
+}
 "#;
 
 /// The probes: the id the check names the rule by, and the expression.
@@ -195,6 +207,151 @@ const PROBES: &[(&str, &str)] = &[
     ("instanceof_array", "a instanceof Array"),
     ("instanceof_object", "a instanceof Object"),
     ("instanceof_dictionary", "a instanceof Dictionary"),
+    // split uses every character of the pattern as a boundary, and the purge
+    // flag drops the empty fields a boundary leaves
+    (
+        "split_text_count",
+        "splitCount(a, \",\", \"a,b,c\", void, void)",
+    ),
+    (
+        "split_text_first",
+        "splitElement(a, \",\", \"a,b,c\", void, void, 0)",
+    ),
+    (
+        "split_text_second",
+        "splitElement(a, \",\", \"a,b,c\", void, void, 1)",
+    ),
+    (
+        "split_text_third",
+        "splitElement(a, \",\", \"a,b,c\", void, void, 2)",
+    ),
+    (
+        "split_text_join",
+        "splitJoin(a, \",\", \"a,b,c\", void, void, \"|\")",
+    ),
+    (
+        "split_multi_count",
+        "splitCount(a, \",;\", \"a,b;c\", void, void)",
+    ),
+    (
+        "split_multi_join",
+        "splitJoin(a, \",;\", \"a,b;c\", void, void, \"|\")",
+    ),
+    (
+        "split_empty_pattern_count",
+        "splitCount(a, \"\", \"abc\", void, void)",
+    ),
+    (
+        "split_empty_pattern_first",
+        "splitElement(a, \"\", \"abc\", void, void, 0)",
+    ),
+    (
+        "split_missing_count",
+        "splitCount(a, \",\", \"abc\", void, void)",
+    ),
+    (
+        "split_missing_first",
+        "splitElement(a, \",\", \"abc\", void, void, 0)",
+    ),
+    (
+        "split_leading_count",
+        "splitCount(a, \",\", \",a\", void, void)",
+    ),
+    (
+        "split_leading_first",
+        "splitElement(a, \",\", \",a\", void, void, 0)",
+    ),
+    (
+        "split_leading_purge_count",
+        "splitCount(a, \",\", \",a\", void, true)",
+    ),
+    (
+        "split_trailing_count",
+        "splitCount(a, \",\", \"a,\", void, void)",
+    ),
+    (
+        "split_trailing_last",
+        "splitElement(a, \",\", \"a,\", void, void, 1)",
+    ),
+    (
+        "split_trailing_purge_count",
+        "splitCount(a, \",\", \"a,\", void, true)",
+    ),
+    (
+        "split_consecutive_count",
+        "splitCount(a, \",\", \"a,,b\", void, void)",
+    ),
+    (
+        "split_consecutive_second",
+        "splitElement(a, \",\", \"a,,b\", void, void, 1)",
+    ),
+    (
+        "split_consecutive_purge_count",
+        "splitCount(a, \",\", \"a,,b\", void, true)",
+    ),
+    (
+        "split_consecutive_purge_join",
+        "splitJoin(a, \",\", \"a,,b\", void, true, \"|\")",
+    ),
+    (
+        "split_empty_text_count",
+        "splitCount(a, \",\", \"\", void, void)",
+    ),
+    (
+        "split_empty_text_first",
+        "splitElement(a, \",\", \"\", void, void, 0)",
+    ),
+    (
+        "split_empty_text_purge_count",
+        "splitCount(a, \",\", \"\", void, true)",
+    ),
+    (
+        "split_purge_zero_count",
+        "splitCount(a, \",\", \"a,,b\", void, 0)",
+    ),
+    (
+        "split_purge_one_count",
+        "splitCount(a, \",\", \"a,,b\", void, 1)",
+    ),
+    (
+        "split_purge_two_count",
+        "splitCount(a, \",\", \"a,,b\", void, 2)",
+    ),
+    (
+        "split_purge_text_count",
+        "splitCount(a, \",\", \"a,,b\", void, \"abc\")",
+    ),
+    (
+        "split_reserved_ignored_count",
+        "splitCount(a, \",\", \"a,b\", true, false)",
+    ),
+    (
+        "split_number_pattern_count",
+        "splitCount(a, 1, \"a1b\", void, void)",
+    ),
+    (
+        "split_void_pattern_count",
+        "splitCount(a, void, \"abc\", void, void)",
+    ),
+    (
+        "split_void_text_count",
+        "splitCount(a, \",\", void, void, void)",
+    ),
+    (
+        "split_void_text_first",
+        "splitElement(a, \",\", void, void, void, 0)",
+    ),
+    ("split_one_param_refused", "a.split(\",\")"),
+    (
+        "split_octet_pattern_refused",
+        "splitCount(a, [1].pack(\"C1\"), \"a,b\", void, void)",
+    ),
+    ("split_octet_pattern_cleared", "a.count"),
+    (
+        "split_octet_text_refused",
+        "splitCount(a, \",\", [1].pack(\"C1\"), void, void)",
+    ),
+    ("split_octet_text_cleared", "a.count"),
 ];
 
 fn main() {

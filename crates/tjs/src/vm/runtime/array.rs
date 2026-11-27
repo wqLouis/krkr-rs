@@ -489,6 +489,29 @@ impl ArrayObject {
         Ok(())
     }
 
+    /// Splits `text` around the characters of `pattern` and replaces the
+    /// elements.
+    ///
+    /// Every character the pattern holds is a boundary, and the boundary
+    /// characters are not kept. A boundary that leaves an empty field is
+    /// skipped when `purge` reads as true. The elements are cleared before the
+    /// values are converted, so a conversion failure leaves the array empty.
+    pub fn split(
+        &self,
+        pattern: &Variant,
+        text: &Variant,
+        purge: &Variant,
+    ) -> Result<(), ArrayError> {
+        self.check()?;
+        self.elements.borrow_mut().clear();
+        let text = text.to_string()?;
+        let purge = truthy(purge)?;
+        let pattern = pattern.to_string()?;
+        let fields = split_fields(&text, &pattern, purge);
+        *self.elements.borrow_mut() = fields;
+        Ok(())
+    }
+
     /// Joins the elements with `delimiter` and answers the text.
     ///
     /// Every element becomes its text; with `purge_empty` the elements holding
@@ -842,6 +865,31 @@ impl Dispatch for ArrayObject {
         self.elements.borrow_mut().clear();
         true
     }
+
+    fn func_call(
+        &self,
+        name: &TjsString,
+        argv: Option<&[Variant]>,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        self.check_valid()?;
+        let Some(ArrayMember::Split) = ArrayMember::lookup(name) else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let required = ArrayMember::Split
+            .min_params()
+            .ok_or(ObjectError::CallNotServed)?;
+        let argv = argv.unwrap_or(&[]);
+        if argv.len() < required {
+            return Err(ObjectError::CallNotServed);
+        }
+        let purge = argv.get(3).cloned().unwrap_or(Variant::Void);
+        self.split(&argv[0], &argv[1], &purge)
+            .map_err(object_error)?;
+        // The member answers the array itself. The surface cannot hand its
+        // receiver back, and the callers that use the member ignore the answer.
+        Ok(Variant::Void)
+    }
 }
 
 /// Maps an array operation's failure onto the dispatch surface.
@@ -857,6 +905,38 @@ fn object_error(error: ArrayError) -> ObjectError {
         | ArrayError::Convert(_)
         | ArrayError::Pack(_) => ObjectError::CallNotServed,
     }
+}
+
+/// The boolean a purge flag's value reads as.
+fn truthy(value: &Variant) -> Result<bool, ArrayError> {
+    match value {
+        Variant::Void => Ok(false),
+        Variant::Integer(value) => Ok(*value != 0),
+        Variant::Real(value) => Ok(*value != 0.0),
+        Variant::String(_) => Ok(value.to_integer()? != 0),
+        Variant::Octet(value) => Ok(!value.is_empty()),
+        Variant::Object(value) => Ok(!value.is_null()),
+    }
+}
+
+/// The fields a text splits into around the characters of a pattern.
+fn split_fields(text: &TjsString, pattern: &TjsString, purge: bool) -> Vec<Variant> {
+    let units = text.as_utf16();
+    let pattern = pattern.as_utf16();
+    let mut fields = Vec::new();
+    let mut start = 0usize;
+    for (index, unit) in units.iter().enumerate() {
+        if pattern.contains(unit) {
+            if !purge || index > start {
+                fields.push(Variant::from(TjsString::from(&units[start..index])));
+            }
+            start = index + 1;
+        }
+    }
+    if !purge || units.len() > start {
+        fields.push(Variant::from(TjsString::from(&units[start..])));
+    }
+    fields
 }
 
 /// The index a negative position resolves to, counting from the end.
@@ -1335,5 +1415,40 @@ mod tests {
             Ok(Variant::Octet(octet)) => assert_eq!(octet.as_slice(), &[1, 0, 0, 0]),
             other => panic!("the pack answered {other:?}"),
         }
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsArray.cpp:490-560
+    #[test]
+    fn split_uses_every_pattern_character_as_a_boundary() {
+        let array = ArrayObject::new();
+        array
+            .split(
+                &Variant::from(",;"),
+                &Variant::from("a,b;c"),
+                &Variant::Void,
+            )
+            .expect("the text splits");
+        assert_eq!(array.len(), 3);
+        let second = array
+            .prop_get_by_num(1, MemberFlags::NONE)
+            .expect("the field is present")
+            .to_string()
+            .expect("the field has a text");
+        assert_eq!(second, TjsString::from("b"));
+        // a boundary that leaves an empty field is skipped with the purge flag
+        array
+            .split(
+                &Variant::from(","),
+                &Variant::from("a,,b,"),
+                &Variant::from(1i64),
+            )
+            .expect("the text splits");
+        assert_eq!(array.len(), 2);
+        let last = array
+            .prop_get_by_num(1, MemberFlags::NONE)
+            .expect("the field is present")
+            .to_string()
+            .expect("the field has a text");
+        assert_eq!(last, TjsString::from("b"));
     }
 }
