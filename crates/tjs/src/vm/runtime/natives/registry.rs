@@ -20,9 +20,11 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::rc::{Rc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::date::{self, Date, DateMember};
 use super::exception::{CLASS_NAME as EXCEPTION, Exception, ExceptionMember};
 use super::math::MathMember;
 use super::random::{RandomGenerator, RandomGeneratorMember, Seed, Xorshift};
@@ -60,11 +62,15 @@ impl NativeRegistry {
         });
         let exception = class_object(ExceptionClass);
         let regexp = class_object(RegExpClass { last });
+        let date = class_object(DateClass {
+            zone: system_offset(),
+        });
 
         let mut classes = BTreeMap::new();
         classes.insert(MATH, math);
         classes.insert(EXCEPTION, exception);
         classes.insert(REGEXP, regexp);
+        classes.insert(date::CLASS_NAME, date);
         Self { classes }
     }
 
@@ -96,7 +102,7 @@ impl Default for NativeRegistry {
 /// The registry key a name denotes, when the name is one of the global classes.
 fn class_key(name: &TjsString) -> Option<&'static str> {
     let units = name.as_utf16();
-    [MATH, EXCEPTION, REGEXP]
+    [MATH, EXCEPTION, REGEXP, date::CLASS_NAME]
         .iter()
         .copied()
         .find(|candidate| units.iter().copied().eq(candidate.encode_utf16()))
@@ -447,6 +453,71 @@ impl Class for RegExpClass {
     }
 }
 
+/// The date class object.
+struct DateClass {
+    /// The system zone's standard offset, or the failure that reading it gave.
+    zone: Result<i64, ZoneError>,
+}
+
+impl DateClass {
+    /// The offset a class operation places a date at.
+    fn offset(&self) -> Result<i64, ObjectError> {
+        self.zone.clone().map_err(|_| ObjectError::CallNotServed)
+    }
+}
+
+impl Class for DateClass {
+    fn name(&self) -> &'static str {
+        date::CLASS_NAME
+    }
+
+    fn members(&self) -> Vec<&'static str> {
+        DateMember::ALL.iter().map(|member| member.name()).collect()
+    }
+
+    fn get(&self, name: &TjsString) -> Option<Variant> {
+        let member = DateMember::lookup(name)?;
+        if member == DateMember::Finalize {
+            return Some(empty_method());
+        }
+        if member != DateMember::GetTimezoneOffset {
+            return Some(refused_method());
+        }
+        let zone = self.zone.clone();
+        Some(method(move |arguments| {
+            let offset = zone.clone().map_err(|_| ObjectError::CallNotServed)?;
+            let mut date = Date { seconds: 0, offset };
+            DateMember::GetTimezoneOffset
+                .call(&mut date, arguments)
+                .map_err(|_| ObjectError::CallNotServed)
+        }))
+    }
+
+    fn call(&self, name: &TjsString, arguments: &[Variant]) -> Result<Variant, ObjectError> {
+        let Some(member) = DateMember::lookup(name) else {
+            return Err(ObjectError::CallNotServed);
+        };
+        match member {
+            DateMember::Finalize => Ok(Variant::Void),
+            DateMember::GetTimezoneOffset => {
+                let mut date = Date {
+                    seconds: 0,
+                    offset: self.offset()?,
+                };
+                member
+                    .call(&mut date, arguments)
+                    .map_err(|_| ObjectError::CallNotServed)
+            }
+            _ => Err(ObjectError::CallNotServed),
+        }
+    }
+
+    fn construct(&self, arguments: &[Variant]) -> Result<Variant, ObjectError> {
+        let date = Date::new(arguments, self.offset()?).map_err(|_| ObjectError::CallNotServed)?;
+        Ok(date_value(date))
+    }
+}
+
 /// The value the last `test` or `exec` recorded for the class object.
 #[derive(Default)]
 struct LastRegExp {
@@ -727,6 +798,148 @@ impl Dispatch for RandomGeneratorObject {
     }
 }
 
+/// A date instance.
+struct DateObject {
+    /// The instant and the zone its fields are placed in.
+    state: Rc<RefCell<Date>>,
+    /// Members a script added to the instance, and the object's class names.
+    members: CustomObject,
+}
+
+impl DateObject {
+    /// The instance a construction makes.
+    fn new(date: Date) -> Self {
+        Self {
+            state: Rc::new(RefCell::new(date)),
+            members: CustomObject::new([TjsString::from(date::CLASS_NAME)]),
+        }
+    }
+}
+
+impl Dispatch for DateObject {
+    fn prop_get(
+        &self,
+        name: &TjsString,
+        flags: MemberFlags,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        match self.members.prop_get(name, flags, objthis) {
+            Ok(value) => return Ok(value),
+            Err(ObjectError::MemberNotFound | ObjectError::MemberMustExist) => {}
+            Err(error) => return Err(error),
+        }
+        let Some(member) = DateMember::lookup(name) else {
+            return Err(ObjectError::MemberNotFound);
+        };
+        let state = Rc::clone(&self.state);
+        Ok(method(move |arguments| {
+            let mut date = state.borrow_mut();
+            member
+                .call(&mut date, arguments)
+                .map_err(|_| ObjectError::CallNotServed)
+        }))
+    }
+
+    fn prop_set(
+        &self,
+        name: &TjsString,
+        flags: MemberFlags,
+        value: &Variant,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<(), ObjectError> {
+        self.members.prop_set(name, flags, value, objthis)
+    }
+
+    fn delete_member(
+        &self,
+        name: &TjsString,
+        flags: MemberFlags,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<(), ObjectError> {
+        self.members.delete_member(name, flags, objthis)
+    }
+
+    fn enum_members(
+        &self,
+        flags: MemberFlags,
+        callback: &mut dyn FnMut(&TjsString, u32, &Variant) -> bool,
+    ) -> Result<(), ObjectError> {
+        let mut seen: Vec<TjsString> = Vec::new();
+        let mut stopped = false;
+        self.members
+            .enum_members(flags, &mut |name, member_flags, value| {
+                seen.push(name.clone());
+                let keep = callback(name, member_flags, value);
+                stopped = !keep;
+                keep
+            })?;
+        if stopped {
+            return Ok(());
+        }
+        for member in DateMember::ALL {
+            let name = TjsString::from(member.name());
+            if seen.contains(&name) {
+                continue;
+            }
+            let value = if flags.contains(MemberFlags::ENUM_NO_VALUE) {
+                Variant::Void
+            } else {
+                let state = Rc::clone(&self.state);
+                method(move |arguments| {
+                    let mut date = state.borrow_mut();
+                    member
+                        .call(&mut date, arguments)
+                        .map_err(|_| ObjectError::CallNotServed)
+                })
+            };
+            if !callback(&name, 0, &value) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_instance_of(
+        &self,
+        class: &TjsString,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<bool, ObjectError> {
+        self.members.is_instance_of(class, objthis)
+    }
+
+    fn class_names(&self) -> Vec<TjsString> {
+        self.members.class_names()
+    }
+
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.members.add_class_name(name)
+    }
+
+    fn is_valid(&self) -> bool {
+        self.members.is_valid()
+    }
+
+    fn invalidate(&self) -> bool {
+        self.members.invalidate()
+    }
+
+    fn func_call(
+        &self,
+        name: &TjsString,
+        argv: Option<&[Variant]>,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        let Some(member) = DateMember::lookup(name) else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let arguments = argv.unwrap_or(&[]);
+        let mut date = self.state.borrow_mut();
+        member
+            .call(&mut date, arguments)
+            .map_err(|_| ObjectError::CallNotServed)
+    }
+}
+
 /// A method value: an object a script can call and read as a function.
 struct NativeMethod {
     /// The rule the call runs.
@@ -850,6 +1063,12 @@ fn random_generator_value(generator: RandomGenerator) -> Variant {
     object_value(object)
 }
 
+/// The instance value a date construction makes.
+fn date_value(date: Date) -> Variant {
+    let object: Rc<dyn Dispatch> = Rc::new(DateObject::new(date));
+    object_value(object)
+}
+
 /// Records the instance a `test` or `exec` call ran on.
 fn record_last(last: &Weak<LastRegExp>, this: &Weak<TrackedRegExp>) {
     let (Some(last), Some(this)) = (last.upgrade(), this.upgrade()) else {
@@ -892,4 +1111,214 @@ fn clock_word() -> u32 {
 /// The seed a generator uses when a call gives none.
 fn fresh_seed() -> Seed {
     Seed::Time(clock_word())
+}
+
+/// The system zone's standard offset, or the failure that reading it gave.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+enum ZoneError {
+    /// The zone file cannot be read.
+    #[error("the system zone file cannot be read")]
+    Read,
+    /// The text is not a zone the reader knows.
+    #[error("the system zone text is not a zone")]
+    Text,
+    /// The file is not a zone image the reader knows.
+    #[error("the system zone image is not a zone file")]
+    Format,
+    /// The zone image names no standard offset.
+    #[error("the system zone names no standard offset")]
+    NoStandard,
+}
+
+/// The system zone's standard offset, in seconds east of UTC.
+///
+/// `TZ` selects the zone when it is set: a POSIX form carries its offset, and
+/// a zone name or a path names a zone image. With no `TZ`, the system's own
+/// `/etc/localtime` is the image. A zone that cannot be read is a typed
+/// failure, not an assumed offset.
+fn system_offset() -> Result<i64, ZoneError> {
+    let Some(value) = std::env::var_os("TZ") else {
+        return zone_file(Path::new("/etc/localtime"));
+    };
+    let text = value.to_string_lossy();
+    // a zone may name its image with the leading colon the POSIX form allows
+    let name = match text.strip_prefix(':') {
+        Some(name) => name,
+        None => text.as_ref(),
+    };
+    if name.is_empty() {
+        return Ok(0);
+    }
+    if name.starts_with('/') {
+        return zone_file(Path::new(name));
+    }
+    let path = Path::new("/usr/share/zoneinfo").join(name);
+    if path.is_file() {
+        return zone_file(&path);
+    }
+    posix_offset(name)
+}
+
+/// The standard offset a zone image carries.
+fn zone_file(path: &Path) -> Result<i64, ZoneError> {
+    let bytes = std::fs::read(path).map_err(|_| ZoneError::Read)?;
+    zone_image(&bytes)
+}
+
+/// The standard offset a TZif image carries: the last type that is not a
+/// daylight-saving one.
+fn zone_image(bytes: &[u8]) -> Result<i64, ZoneError> {
+    let (version, first_counts) = zone_header(bytes, 0)?;
+    let (time_size, start, counts) = if version >= b'2' {
+        let first = zone_block_length(first_counts, 4, 8)?;
+        let second = 44usize.checked_add(first).ok_or(ZoneError::Format)?;
+        let (_, counts) = zone_header(bytes, second)?;
+        (
+            8usize,
+            second.checked_add(44).ok_or(ZoneError::Format)?,
+            counts,
+        )
+    } else {
+        (4usize, 44usize, first_counts)
+    };
+    let timecnt = usize::try_from(counts[3]).map_err(|_| ZoneError::Format)?;
+    let typecnt = usize::try_from(counts[4]).map_err(|_| ZoneError::Format)?;
+    let transitions = timecnt.checked_mul(time_size).ok_or(ZoneError::Format)?;
+    let types_start = start
+        .checked_add(transitions)
+        .and_then(|value| value.checked_add(timecnt))
+        .ok_or(ZoneError::Format)?;
+    let types_length = typecnt.checked_mul(6).ok_or(ZoneError::Format)?;
+    let types_end = types_start
+        .checked_add(types_length)
+        .ok_or(ZoneError::Format)?;
+    let types = bytes.get(types_start..types_end).ok_or(ZoneError::Format)?;
+    let mut standard = None;
+    for entry in types.as_chunks::<6>().0 {
+        let offset = i32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
+        if entry[4] == 0 {
+            standard = Some(i64::from(offset));
+        }
+    }
+    standard.ok_or(ZoneError::NoStandard)
+}
+
+/// The version and the six counts of a TZif header at `offset`.
+fn zone_header(bytes: &[u8], offset: usize) -> Result<(u8, [u32; 6]), ZoneError> {
+    let magic_end = offset.checked_add(4).ok_or(ZoneError::Format)?;
+    if bytes.get(offset..magic_end).ok_or(ZoneError::Format)? != b"TZif" {
+        return Err(ZoneError::Format);
+    }
+    let version = *bytes.get(magic_end).ok_or(ZoneError::Format)?;
+    let mut counts = [0u32; 6];
+    for (index, count) in counts.iter_mut().enumerate() {
+        let start = offset
+            .checked_add(20)
+            .and_then(|value| value.checked_add(index.checked_mul(4)?))
+            .ok_or(ZoneError::Format)?;
+        let end = start.checked_add(4).ok_or(ZoneError::Format)?;
+        let field: [u8; 4] = bytes
+            .get(start..end)
+            .ok_or(ZoneError::Format)?
+            .try_into()
+            .map_err(|_| ZoneError::Format)?;
+        *count = u32::from_be_bytes(field);
+    }
+    Ok((version, counts))
+}
+
+/// The length of one TZif data block, from its header counts.
+fn zone_block_length(
+    counts: [u32; 6],
+    time_size: usize,
+    leap_size: usize,
+) -> Result<usize, ZoneError> {
+    let timecnt = usize::try_from(counts[3]).map_err(|_| ZoneError::Format)?;
+    let typecnt = usize::try_from(counts[4]).map_err(|_| ZoneError::Format)?;
+    let charcnt = usize::try_from(counts[5]).map_err(|_| ZoneError::Format)?;
+    let leapcnt = usize::try_from(counts[2]).map_err(|_| ZoneError::Format)?;
+    let stdcnt = usize::try_from(counts[0]).map_err(|_| ZoneError::Format)?;
+    let gmtcnt = usize::try_from(counts[1]).map_err(|_| ZoneError::Format)?;
+    let parts = [
+        timecnt.checked_mul(time_size),
+        Some(timecnt),
+        typecnt.checked_mul(6),
+        Some(charcnt),
+        leapcnt.checked_mul(leap_size),
+        Some(stdcnt),
+        Some(gmtcnt),
+    ];
+    let mut total = 0usize;
+    for part in parts {
+        total = total
+            .checked_add(part.ok_or(ZoneError::Format)?)
+            .ok_or(ZoneError::Format)?;
+    }
+    Ok(total)
+}
+
+/// The standard offset a POSIX zone text names, in seconds east of UTC.
+fn posix_offset(text: &str) -> Result<i64, ZoneError> {
+    let rest = if let Some(after) = text.strip_prefix('<') {
+        let end = after.find('>').ok_or(ZoneError::Text)?;
+        &after[end + 1..]
+    } else {
+        let end = text
+            .find(|character: char| !character.is_ascii_alphabetic())
+            .unwrap_or(text.len());
+        if end < 3 {
+            return Err(ZoneError::Text);
+        }
+        &text[end..]
+    };
+    let (west, _) = posix_duration(rest)?;
+    west.checked_neg().ok_or(ZoneError::Text)
+}
+
+/// A POSIX offset, and the text after it.
+fn posix_duration(text: &str) -> Result<(i64, &str), ZoneError> {
+    let (sign, rest) = match text.as_bytes().first() {
+        Some(b'-') => (-1i64, &text[1..]),
+        Some(b'+') => (1i64, &text[1..]),
+        _ => (1i64, text),
+    };
+    let end = rest
+        .find(|character: char| !(character.is_ascii_digit() || character == ':'))
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return Err(ZoneError::Text);
+    }
+    let (field, tail) = rest.split_at(end);
+    let mut parts = field.split(':');
+    let hours = posix_part(parts.next())?;
+    let minutes = match parts.next() {
+        Some(part) => posix_part(Some(part))?,
+        None => 0,
+    };
+    let seconds = match parts.next() {
+        Some(part) => posix_part(Some(part))?,
+        None => 0,
+    };
+    if parts.next().is_some() || hours > 24 || minutes > 59 || seconds > 59 {
+        return Err(ZoneError::Text);
+    }
+    let value = hours
+        .checked_mul(3_600)
+        .and_then(|value| {
+            minutes
+                .checked_mul(60)
+                .and_then(|minutes| value.checked_add(minutes))
+        })
+        .and_then(|value| value.checked_add(seconds))
+        .ok_or(ZoneError::Text)?;
+    Ok((sign.checked_mul(value).ok_or(ZoneError::Text)?, tail))
+}
+
+/// One field of a POSIX offset, one or two digits.
+fn posix_part(text: Option<&str>) -> Result<i64, ZoneError> {
+    let text = text.ok_or(ZoneError::Text)?;
+    if text.is_empty() || text.len() > 2 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ZoneError::Text);
+    }
+    text.parse::<i64>().map_err(|_| ZoneError::Text)
 }

@@ -5,23 +5,11 @@
 //! engine's classes. The global handle answers the Rust class registry first,
 //! so these probes run the Rust classes through `runtime::engine::run` rather
 //! than their module tests.
-//!
-//! `Date` is the one class this check cannot reach yet: the calendar and the
-//! grammar are in `natives::date`, but the module publishes no member table the
-//! registry could read, so the class is named as deferred with that reason.
 
 use std::rc::Rc;
 
-use tjs::Tjs2Engine;
 use tjs::vm::runtime::engine::run;
-
-/// The class this check cannot reach, and why.
-const DEFERRED: &[(&str, &str)] = &[(
-    "Date",
-    "`natives::date` owns the calendar and the grammar but publishes no member table, and this \
-     change may not add one outside that module; `String(new Date(0))` therefore still has no \
-     Rust class to run",
-)];
+use tjs::{Tjs2Engine, TjsValue};
 
 /// Runs one script and answers its text, so a case checks one line.
 fn answer(engine: &Rc<Tjs2Engine>, script: &str) -> String {
@@ -37,6 +25,14 @@ fn answer(engine: &Rc<Tjs2Engine>, script: &str) -> String {
 /// The kinds of two class objects, so a read proves the registry answered.
 fn kind(engine: &Rc<Tjs2Engine>, expression: &str) -> String {
     answer(engine, &format!("return typeof ({expression});"))
+}
+/// The integer the engine's own class answers, for a comparison.
+fn integer(engine: &Rc<Tjs2Engine>, expression: &str, what: &str) -> i64 {
+    match engine.eval(expression, "native_classes") {
+        Ok(TjsValue::Integer(value)) => value,
+        Ok(other) => panic!("{what} is not an integer: {other:?}"),
+        Err(error) => panic!("{what}: {error}"),
+    }
 }
 
 #[test]
@@ -110,12 +106,93 @@ fn the_native_classes_are_reachable_from_a_script() {
         "aXc"
     );
 
-    // A deferred case is named with its reason, so it cannot become a silent
-    // skip when the class is added.
-    for (class, reason) in DEFERRED {
-        assert!(
-            !reason.is_empty(),
-            "the deferred class {class} does not say why it is deferred"
-        );
-    }
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:28-32 — a text is read by the
+    // date grammar, and tjsDate.cpp:62 is the constructor's text branch.
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:300-309 — getTime answers the
+    // instant in milliseconds.
+    assert_eq!(
+        answer(
+            &engine,
+            "var d = new Date(\"1 Jan 1970 09:00:00 JST\");\n\
+             return d.getTime();"
+        ),
+        "0"
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:53-93 — a numeric
+    // construction names the year, the month, the day and the time of day.
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:222-332 — the accessors read
+    // the fields the construction placed.
+    assert_eq!(
+        answer(
+            &engine,
+            "var d = new Date(2020, 5, 15, 12, 30, 45);\n\
+             return d.getYear() + \"-\" + d.getMonth() + \"-\" + d.getDate();"
+        ),
+        "2020-5-15"
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:53-93 — the numeric
+    // construction places the same instant the engine's own class does.
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:300-309 — getTime reads it.
+    let built = integer(
+        &engine,
+        "(new Date(2020, 5, 15, 12, 30, 45)).getTime()",
+        "the built instant",
+    );
+    assert_eq!(
+        answer(
+            &engine,
+            "var d = new Date(2020, 5, 15, 12, 30, 45);\n\
+             return d.getTime();"
+        ),
+        built.to_string()
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:334-345 — parse replaces the
+    // instance's instant from a text.
+    assert_eq!(
+        answer(
+            &engine,
+            "var d = new Date(0);\n\
+             d.parse(\"1 Jan 1970 09:00:00 JST\");\n\
+             return d.getTime();"
+        ),
+        "0"
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:95-112 — setYear replaces the
+    // year at the instance's zone.
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:321-332 — getYear reads it.
+    assert_eq!(
+        answer(
+            &engine,
+            "var d = new Date(\"1 Jan 2004 00:00:00 JST\");\n\
+             d.setYear(1999);\n\
+             return d.getYear();"
+        ),
+        "1999"
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:311-319 — getTimezoneOffset
+    // answers the zone's standard offset, from the class and from an
+    // instance. The engine's own class answers the same, so the comparison
+    // holds at whatever zone the host runs in.
+    let zone = integer(
+        &engine,
+        "(new Date(0)).getTimezoneOffset()",
+        "the zone offset",
+    );
+    assert_eq!(
+        answer(
+            &engine,
+            "var d = new Date(0);\nreturn d.getTimezoneOffset();"
+        ),
+        zone.to_string()
+    );
+    assert_eq!(
+        answer(&engine, "return Date.getTimezoneOffset();"),
+        zone.to_string()
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:46-345 — the class publishes
+    // no `now`, no `UTC` and no text conversion member; a date is an object.
+    assert_eq!(kind(&engine, "new Date(0)"), "Object");
+    assert_eq!(kind(&engine, "Date.now"), "undefined");
+    assert_eq!(kind(&engine, "Date.UTC"), "undefined");
+    assert_eq!(kind(&engine, "(new Date(0)).toString"), "undefined");
 }

@@ -36,6 +36,25 @@
 //! does not fit the epoch's 64 bits. The class raises its invalid-timestamp
 //! error for both; a date that was already stored may still be -1, because
 //! only the field-to-epoch direction has the refusal.
+//!
+//! # The class table
+//!
+//! [`DateMember`] is the class's surface: the accessors, the setters, the
+//! millisecond pair, the zone offset and the text grammar, each with the rule
+//! that answers it. [`Date`] is the state a call reads and writes: one instant
+//! and the zone its fields are placed in. [`Date::new`] is the construction's
+//! own rule: no argument is the clock, one text is the grammar, and the rest
+//! are the fields, where a void argument is absent.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use super::date_parse;
+use crate::vm::runtime::natives::string::Arity;
+use crate::vm::runtime::string::TjsString;
+use crate::vm::runtime::variant::{Target, Variant, VariantError};
+
+/// The name the class is registered under.
+pub const CLASS_NAME: &str = "Date";
 
 /// The seconds in one minute.
 const SECONDS_PER_MINUTE: i64 = 60;
@@ -260,12 +279,300 @@ pub enum DateError {
     InvalidTimestamp,
 }
 
+/// A member of the date class.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DateMember {
+    /// The empty finalizer every instance carries.
+    Finalize,
+    /// Replaces the year.
+    SetYear,
+    /// Replaces the month, counted from zero.
+    SetMonth,
+    /// Replaces the day of the month.
+    SetDate,
+    /// Replaces the hour of the day.
+    SetHours,
+    /// Replaces the minute of the hour.
+    SetMinutes,
+    /// Replaces the second of the minute.
+    SetSeconds,
+    /// Replaces the instant from a millisecond count.
+    SetTime,
+    /// The day of the month.
+    GetDate,
+    /// The day of the week, from Sunday as zero.
+    GetDay,
+    /// The hour of the day.
+    GetHours,
+    /// The minute of the hour.
+    GetMinutes,
+    /// The month, counted from zero.
+    GetMonth,
+    /// The second of the minute.
+    GetSeconds,
+    /// The instant, in milliseconds.
+    GetTime,
+    /// The zone's offset in minutes west of UTC.
+    GetTimezoneOffset,
+    /// The civil year.
+    GetYear,
+    /// Replaces the instant from a text.
+    Parse,
+}
+
+impl DateMember {
+    /// Every member, in the order the class registers them.
+    pub const ALL: &'static [DateMember] = &[
+        Self::Finalize,
+        Self::SetYear,
+        Self::SetMonth,
+        Self::SetDate,
+        Self::SetHours,
+        Self::SetMinutes,
+        Self::SetSeconds,
+        Self::SetTime,
+        Self::GetDate,
+        Self::GetDay,
+        Self::GetHours,
+        Self::GetMinutes,
+        Self::GetMonth,
+        Self::GetSeconds,
+        Self::GetTime,
+        Self::GetTimezoneOffset,
+        Self::GetYear,
+        Self::Parse,
+    ];
+
+    /// The member `name` denotes, or `None` when it names no member.
+    pub fn lookup(name: &TjsString) -> Option<Self> {
+        let units = name.as_utf16();
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|member| units.iter().copied().eq(member.name().encode_utf16()))
+    }
+
+    /// The name the class publishes the member under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Finalize => "finalize",
+            Self::SetYear => "setYear",
+            Self::SetMonth => "setMonth",
+            Self::SetDate => "setDate",
+            Self::SetHours => "setHours",
+            Self::SetMinutes => "setMinutes",
+            Self::SetSeconds => "setSeconds",
+            Self::SetTime => "setTime",
+            Self::GetDate => "getDate",
+            Self::GetDay => "getDay",
+            Self::GetHours => "getHours",
+            Self::GetMinutes => "getMinutes",
+            Self::GetMonth => "getMonth",
+            Self::GetSeconds => "getSeconds",
+            Self::GetTime => "getTime",
+            Self::GetTimezoneOffset => "getTimezoneOffset",
+            Self::GetYear => "getYear",
+            Self::Parse => "parse",
+        }
+    }
+
+    /// The parameter counts a call accepts.
+    ///
+    /// An accessor ignores the parameters after the ones it reads, and a
+    /// setter and the grammar need their one parameter.
+    pub fn arity(self) -> Arity {
+        match self {
+            Self::SetYear
+            | Self::SetMonth
+            | Self::SetDate
+            | Self::SetHours
+            | Self::SetMinutes
+            | Self::SetSeconds
+            | Self::SetTime
+            | Self::Parse => Arity::AtLeast(1),
+            Self::Finalize
+            | Self::GetDate
+            | Self::GetDay
+            | Self::GetHours
+            | Self::GetMinutes
+            | Self::GetMonth
+            | Self::GetSeconds
+            | Self::GetTime
+            | Self::GetTimezoneOffset
+            | Self::GetYear => Arity::AtLeast(0),
+        }
+    }
+
+    /// Calls the member on `date`.
+    ///
+    /// A setter reads the local fields, replaces the one field it owns and
+    /// places the result back at the same offset. The grammar's refusal and
+    /// the calendar's invalid instant are the date's own failures; a parameter
+    /// that has no integer or no text is a conversion failure.
+    ///
+    /// # Errors
+    ///
+    /// [`DateMemberError::ParameterCount`] when the call gives a count the
+    /// member does not accept, [`DateMemberError::Convert`] when a parameter
+    /// has no kind the rule reads, and [`DateError`] when the fields or the
+    /// text name no instant.
+    pub fn call(self, date: &mut Date, parameters: &[Variant]) -> Result<Variant, DateMemberError> {
+        let arity = self.arity();
+        if !arity.accepts(parameters.len()) {
+            return Err(DateMemberError::ParameterCount { arity });
+        }
+        match self {
+            Self::Finalize => Ok(Variant::Void),
+            Self::SetYear => set_field(date, parameters, |fields| &mut fields.year),
+            Self::SetMonth => set_field(date, parameters, |fields| &mut fields.month),
+            Self::SetDate => set_field(date, parameters, |fields| &mut fields.day),
+            Self::SetHours => set_field(date, parameters, |fields| &mut fields.hour),
+            Self::SetMinutes => set_field(date, parameters, |fields| &mut fields.minute),
+            Self::SetSeconds => set_field(date, parameters, |fields| &mut fields.second),
+            Self::SetTime => {
+                date.seconds = seconds_from_milliseconds(parameters[0].to_integer()?);
+                Ok(Variant::Void)
+            }
+            Self::GetDate => get_field(date, |fields| fields.day),
+            Self::GetDay => get_field(date, |fields| fields.weekday),
+            Self::GetHours => get_field(date, |fields| fields.hour),
+            Self::GetMinutes => get_field(date, |fields| fields.minute),
+            Self::GetMonth => get_field(date, |fields| fields.month),
+            Self::GetSeconds => get_field(date, |fields| fields.second),
+            Self::GetTime => Ok(Variant::Integer(milliseconds(date.seconds))),
+            Self::GetTimezoneOffset => Ok(Variant::Integer(timezone_minutes(date.offset)?)),
+            Self::GetYear => get_field(date, |fields| fields.year),
+            Self::Parse => {
+                let Variant::String(text) = &parameters[0] else {
+                    return Err(VariantError::Convert {
+                        to: Target::Text.name(),
+                    }
+                    .into());
+                };
+                date.seconds = date_parse::parse(text.as_utf16(), date.offset)?;
+                Ok(Variant::Void)
+            }
+        }
+    }
+}
+
+/// A date: one instant and the zone its fields are read and written at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Date {
+    /// The instant, in seconds from 1970-01-01 00:00:00 UTC.
+    pub seconds: i64,
+    /// The zone's offset, in seconds east of UTC.
+    pub offset: i64,
+}
+
+impl Date {
+    /// The date a construction's arguments name, at `offset` seconds east of
+    /// UTC.
+    ///
+    /// No argument is the clock. One text is read by the grammar at the zone
+    /// the text names, or at `offset` when it names none. Any other first
+    /// argument is the year, and the arguments after it are the month, the
+    /// day, the hour, the minute and the second; a field that is absent or
+    /// void keeps its default, and the arguments after the sixth are ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`DateMemberError::Convert`] when a field has no integer, and
+    /// [`DateError`] when the text or the field set names no instant.
+    pub fn new(arguments: &[Variant], offset: i64) -> Result<Self, DateMemberError> {
+        let seconds = match arguments.first() {
+            None => now_seconds()?,
+            Some(Variant::String(text)) => date_parse::parse(text.as_utf16(), offset)?,
+            Some(year) => {
+                let mut fields = Fields {
+                    year: year.to_integer()?,
+                    month: 0,
+                    day: 1,
+                    hour: 0,
+                    minute: 0,
+                    second: 0,
+                    weekday: 0,
+                };
+                let slots: [&mut i64; 5] = [
+                    &mut fields.month,
+                    &mut fields.day,
+                    &mut fields.hour,
+                    &mut fields.minute,
+                    &mut fields.second,
+                ];
+                for (position, slot) in slots.into_iter().enumerate() {
+                    let Some(value) = arguments.get(position + 1) else {
+                        break;
+                    };
+                    if !matches!(value, Variant::Void) {
+                        *slot = value.to_integer()?;
+                    }
+                }
+                local_seconds(&fields, offset)?
+            }
+        };
+        Ok(Self { seconds, offset })
+    }
+}
+
+/// The current instant, in seconds from 1970-01-01 00:00:00 UTC.
+fn now_seconds() -> Result<i64, DateError> {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(elapsed) => i64::try_from(elapsed.as_secs()).map_err(|_| DateError::InvalidTimestamp),
+        Err(error) => {
+            let seconds = i64::try_from(error.duration().as_secs())
+                .map_err(|_| DateError::InvalidTimestamp)?;
+            seconds.checked_neg().ok_or(DateError::InvalidTimestamp)
+        }
+    }
+}
+
+/// The local fields with the one the call names taken from its parameter.
+fn set_field(
+    date: &mut Date,
+    parameters: &[Variant],
+    select: for<'a> fn(&'a mut Fields) -> &'a mut i64,
+) -> Result<Variant, DateMemberError> {
+    let value = parameters[0].to_integer()?;
+    let mut fields = local_fields(date.seconds, date.offset)?;
+    *select(&mut fields) = value;
+    date.seconds = local_seconds(&fields, date.offset)?;
+    Ok(Variant::Void)
+}
+
+/// One local field, as the accessor answers it.
+fn get_field(date: &Date, select: fn(&Fields) -> i64) -> Result<Variant, DateMemberError> {
+    let fields = local_fields(date.seconds, date.offset)?;
+    Ok(Variant::Integer(select(&fields)))
+}
+
+/// The failure of a date member's call.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum DateMemberError {
+    /// The call gives a number of parameters the member does not accept.
+    #[error("the member does not accept this many parameters")]
+    ParameterCount {
+        /// The counts the member accepts.
+        arity: Arity,
+    },
+    /// The calendar refused the field set or the text.
+    #[error(transparent)]
+    Date(#[from] DateError),
+    /// A parameter has no conversion the rule needs.
+    #[error(transparent)]
+    Convert(#[from] VariantError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        DateError, Fields, local_fields, local_seconds, milliseconds, utc_fields, utc_seconds,
+        Date, DateError, DateMember, DateMemberError, Fields, local_fields, local_seconds,
+        milliseconds, utc_fields, utc_seconds,
     };
     use super::{seconds_from_milliseconds, timezone_minutes};
+    use crate::vm::runtime::string::TjsString;
+    use crate::vm::runtime::variant::Variant;
 
     /// A field set with the time of day and an unused weekday.
     fn fields(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Fields {
@@ -415,5 +722,170 @@ mod tests {
             utc_fields(utc_seconds(&fields(2019, 1, 29, 12, 0, 0)).expect("the day carries"))
                 .expect("the instant has fields");
         assert_eq!((common.year, common.month, common.day), (2019, 2, 1));
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:46-345
+    #[test]
+    fn the_member_table_is_the_class_surface() {
+        let names: Vec<&str> = DateMember::ALL.iter().map(|member| member.name()).collect();
+        assert_eq!(
+            names.as_slice(),
+            &[
+                "finalize",
+                "setYear",
+                "setMonth",
+                "setDate",
+                "setHours",
+                "setMinutes",
+                "setSeconds",
+                "setTime",
+                "getDate",
+                "getDay",
+                "getHours",
+                "getMinutes",
+                "getMonth",
+                "getSeconds",
+                "getTime",
+                "getTimezoneOffset",
+                "getYear",
+                "parse",
+            ]
+        );
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:53-93
+    #[test]
+    fn a_construction_reads_its_fields_at_the_zone() {
+        let date = Date::new(
+            &[
+                Variant::Integer(2020),
+                Variant::Integer(5),
+                Variant::Integer(15),
+                Variant::Integer(12),
+                Variant::Integer(30),
+                Variant::Integer(45),
+            ],
+            32_400,
+        )
+        .expect("the fields name an instant");
+        let fields = local_fields(date.seconds, date.offset).expect("the instant has fields");
+        assert_eq!(
+            (
+                fields.year,
+                fields.month,
+                fields.day,
+                fields.hour,
+                fields.minute,
+                fields.second
+            ),
+            (2020, 5, 15, 12, 30, 45)
+        );
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:53-93
+    #[test]
+    fn a_void_field_is_absent_and_an_extra_field_is_ignored() {
+        let one = Date::new(&[Variant::Integer(2020)], 32_400).expect("the year is a date");
+        let void = Date::new(
+            &[Variant::Integer(2020), Variant::Void, Variant::Void],
+            32_400,
+        )
+        .expect("the year is a date");
+        assert_eq!(one.seconds, void.seconds);
+        let fields = local_fields(void.seconds, void.offset).expect("the instant has fields");
+        assert_eq!((fields.year, fields.month, fields.day), (2020, 0, 1));
+        let six = Date::new(
+            &[
+                Variant::Integer(2020),
+                Variant::Integer(5),
+                Variant::Integer(15),
+                Variant::Integer(12),
+                Variant::Integer(30),
+                Variant::Integer(45),
+            ],
+            32_400,
+        )
+        .expect("the fields name an instant");
+        let seven = Date::new(
+            &[
+                Variant::Integer(2020),
+                Variant::Integer(5),
+                Variant::Integer(15),
+                Variant::Integer(12),
+                Variant::Integer(30),
+                Variant::Integer(45),
+                Variant::Integer(999),
+            ],
+            32_400,
+        )
+        .expect("the fields name an instant");
+        assert_eq!(six.seconds, seven.seconds);
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:28-32
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:62
+    #[test]
+    fn a_text_construction_reads_the_grammar() {
+        let zoned = Date::new(
+            &[Variant::String(TjsString::from("1 Jan 1970 09:00:00 JST"))],
+            32_400,
+        )
+        .expect("the text names an instant");
+        assert_eq!(zoned.seconds, 0);
+        let local = Date::new(
+            &[Variant::String(TjsString::from("1 Jan 1970 09:00:00"))],
+            32_400,
+        )
+        .expect("the text names an instant");
+        assert_eq!(local.seconds, 0);
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:95-220
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:222-332
+    #[test]
+    fn a_setter_places_its_field_at_the_zone() {
+        let mut date = Date::new(
+            &[
+                Variant::Integer(2004),
+                Variant::Integer(4),
+                Variant::Integer(3),
+                Variant::Integer(11),
+                Variant::Integer(22),
+                Variant::Integer(33),
+            ],
+            32_400,
+        )
+        .expect("the fields name an instant");
+        let answer = DateMember::call(DateMember::SetYear, &mut date, &[Variant::Integer(1999)])
+            .expect("the year is a field");
+        assert!(matches!(answer, Variant::Void));
+        let year = DateMember::call(DateMember::GetYear, &mut date, &[])
+            .expect("the year reads back")
+            .to_integer()
+            .expect("the year is an integer");
+        assert_eq!(year, 1999);
+        DateMember::call(DateMember::SetTime, &mut date, &[Variant::Integer(1_500)])
+            .expect("the millisecond count is an instant");
+        let time = DateMember::call(DateMember::GetTime, &mut date, &[])
+            .expect("the instant reads back")
+            .to_integer()
+            .expect("the instant is an integer");
+        assert_eq!(time, 1_000);
+        let zone = DateMember::call(DateMember::GetTimezoneOffset, &mut date, &[])
+            .expect("the zone answers")
+            .to_integer()
+            .expect("the zone is an integer");
+        assert_eq!(zone, -540);
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsDate.cpp:99-100
+    #[test]
+    fn a_member_that_needs_its_parameter_refuses_a_call_without_one() {
+        let mut date = Date::new(&[Variant::Integer(2020)], 32_400).expect("the year is a date");
+        let answer = DateMember::call(DateMember::SetYear, &mut date, &[]);
+        assert!(matches!(
+            answer,
+            Err(DateMemberError::ParameterCount { .. })
+        ));
     }
 }

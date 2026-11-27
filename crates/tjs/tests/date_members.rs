@@ -1,11 +1,12 @@
-//! The calendar and the date grammar against the engine's recorded answers.
+//! The date class's rules against the engine's recorded answers.
 //!
 //! `tests/fixtures/date_members.txt` holds what the engine answered for a
 //! date's fields, its epoch, its setters and its text grammar;
 //! `crates/tjs/examples/date_oracle.rs` records it. The check below replays
-//! the same probes through the calendar (`tjs::vm::runtime::natives::date`)
-//! and the grammar (`tjs::vm::runtime::natives::date_parse`) and compares the
-//! kind and the text of every answer.
+//! the same probes through the class's own table
+//! (`tjs::vm::runtime::natives::date`) — its construction, its accessors, its
+//! setters and its grammar — and compares the kind and the text of every
+//! answer.
 //!
 //! The record carries its zone in `instance_timezone_offset`: the fields a
 //! script reads are local, so a record taken at one offset is replayed at that
@@ -19,8 +20,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use tjs::vm::runtime::natives::date::{self, DateError, Fields};
-use tjs::vm::runtime::natives::date_parse;
+use tjs::vm::runtime::natives::date::{self, Date, DateError, DateMember, DateMemberError};
+use tjs::vm::runtime::string::TjsString;
+use tjs::vm::runtime::variant::Variant;
 
 /// The probes the record must hold, in the recorder's order.
 const PROBES: &[&str] = &[
@@ -249,7 +251,7 @@ fn raised() -> (String, String) {
 }
 
 /// The text a probe's expression answers, or the refusal.
-fn expected(probe: &str, offset: i64) -> Result<String, DateError> {
+fn expected(probe: &str, offset: i64) -> Result<String, DateMemberError> {
     match probe {
         // The class surface is the class object's; the record pins it so the
         // calendar never invents a member the engine does not publish.
@@ -263,14 +265,14 @@ fn expected(probe: &str, offset: i64) -> Result<String, DateError> {
         | "absent_get_milliseconds" => Ok(String::from("undefined")),
         // a method reference is an object (a closure), not a function value
         "member_get_time" | "member_parse" | "member_set_year" => Ok(String::from("Object")),
-        "class_parse_raises" | "class_set_year_raises" => Err(DateError::CannotParse),
+        "class_parse_raises" | "class_set_year_raises" => Err(DateError::CannotParse.into()),
         "set_year_missing"
         | "set_month_missing"
         | "set_date_missing"
         | "set_hours_missing"
         | "set_minutes_missing"
         | "set_seconds_missing"
-        | "set_time_missing" => Err(DateError::CannotParse),
+        | "set_time_missing" => Err(DateError::CannotParse.into()),
         // The constructor and its getters.
         "built_fields" => construct(&[2004, 4, 3, 11, 22, 33], offset),
         "built_one_arg" => construct(&[2020], offset),
@@ -296,8 +298,21 @@ fn expected(probe: &str, offset: i64) -> Result<String, DateError> {
         "built_year_1900" => construct(&[1900, 0, 1, 0, 0, 0], offset),
         "built_year_100000" => construct(&[100000, 0, 1, 0, 0, 0], offset),
         "built_year_wrapped" => construct(&[4_294_969_296, 0, 1, 0, 0, 0], offset),
-        "built_real_fields" => construct(&[2020, 5, 15, 12, 30, 45], offset),
-        "built_void_day" => construct(&[2020], offset),
+        "built_real_fields" => construct_values(
+            &[
+                Variant::Real(2020.9),
+                Variant::Real(5.9),
+                Variant::Real(15.9),
+                Variant::Real(12.9),
+                Variant::Real(30.9),
+                Variant::Real(45.9),
+            ],
+            offset,
+        ),
+        "built_void_day" => construct_values(
+            &[Variant::Integer(2020), Variant::Void, Variant::Void],
+            offset,
+        ),
         "built_epoch_before" => construct(&[1970, 0, 1, 8, 59, 58], offset),
         "built_epoch_exact" => construct(&[1970, 0, 1, 8, 59, 59], offset),
         "built_epoch_after" => construct(&[1970, 0, 1, 9, 0, 0], offset),
@@ -385,7 +400,7 @@ fn expected(probe: &str, offset: i64) -> Result<String, DateError> {
         "parse_wday_dotted" => parsed("Mon., 3 May 2004 11:22:33 GMT", offset),
         "parse_wday_wrong" => parsed("Sun, 3 May 2004 11:22:33 GMT", offset),
         "parse_year_wrap" => parsed("3 May 4294969296 11:22:33 GMT", offset),
-        "parse_new_string" => parsed("3 May 2004 11:22:33 GMT +900", offset),
+        "parse_new_string" => parse_new("3 May 2004 11:22:33 GMT +900", offset),
         "parse_epoch_before" => parsed("1 Jan 1970 08:59:58", offset),
         "parse_epoch_exact" => parsed("1 Jan 1970 08:59:59", offset),
         "parse_epoch_after" => parsed("1 Jan 1970 09:00:00", offset),
@@ -430,58 +445,62 @@ fn text(seconds: i64, offset: i64) -> Result<String, DateError> {
     ))
 }
 
-/// A field set with an unused weekday.
-fn fields(year: i64, month: i64, day: i64, hour: i64, minute: i64, second: i64) -> Fields {
-    Fields {
-        year,
-        month,
-        day,
-        hour,
-        minute,
-        second,
-        weekday: 0,
-    }
+/// The script arguments an integer construction receives.
+fn values(arguments: &[i64]) -> Vec<Variant> {
+    arguments.iter().copied().map(Variant::Integer).collect()
 }
 
-/// The answer of the constructor with the given arguments.
-fn construct(arguments: &[i64], offset: i64) -> Result<String, DateError> {
-    let year = arguments.first().copied().unwrap_or(0);
-    let month = arguments.get(1).copied().unwrap_or(0);
-    let day = arguments.get(2).copied().unwrap_or(1);
-    let hour = arguments.get(3).copied().unwrap_or(0);
-    let minute = arguments.get(4).copied().unwrap_or(0);
-    let second = arguments.get(5).copied().unwrap_or(0);
-    let seconds = date::local_seconds(&fields(year, month, day, hour, minute, second), offset)?;
-    text(seconds, offset)
+/// The answer of the constructor with the given integer arguments.
+fn construct(arguments: &[i64], offset: i64) -> Result<String, DateMemberError> {
+    construct_values(&values(arguments), offset)
+}
+
+/// The answer of the constructor with the given script arguments.
+fn construct_values(arguments: &[Variant], offset: i64) -> Result<String, DateMemberError> {
+    let date = Date::new(arguments, offset)?;
+    Ok(text(date.seconds, offset)?)
+}
+
+/// The base date the setter probes start from.
+fn base(offset: i64) -> Result<Date, DateMemberError> {
+    Date::new(&values(&[2004, 4, 3, 11, 22, 33]), offset)
 }
 
 /// The answer of one setter on the base date.
-fn set(member: &str, value: i64, offset: i64) -> Result<String, DateError> {
-    let mut fields = fields(2004, 4, 3, 11, 22, 33);
-    match member {
-        "setYear" => fields.year = value,
-        "setMonth" => fields.month = value,
-        "setDate" => fields.day = value,
-        "setHours" => fields.hour = value,
-        "setMinutes" => fields.minute = value,
-        "setSeconds" => fields.second = value,
-        other => panic!("the check has no setter named {other}"),
-    }
-    let seconds = date::local_seconds(&fields, offset)?;
-    text(seconds, offset)
+fn set(member: &str, value: i64, offset: i64) -> Result<String, DateMemberError> {
+    let member = DateMember::lookup(&TjsString::from(member))
+        .expect("the check names a setter the member table holds");
+    let mut date = base(offset)?;
+    DateMember::call(member, &mut date, &[Variant::Integer(value)])?;
+    Ok(text(date.seconds, offset)?)
 }
 
 /// The answer of the millisecond setter.
-fn set_time(milliseconds: i64, offset: i64) -> Result<String, DateError> {
-    let seconds = date::seconds_from_milliseconds(milliseconds);
-    text(seconds, offset)
+fn set_time(milliseconds: i64, offset: i64) -> Result<String, DateMemberError> {
+    let mut date = base(offset)?;
+    DateMember::call(
+        DateMember::SetTime,
+        &mut date,
+        &[Variant::Integer(milliseconds)],
+    )?;
+    Ok(text(date.seconds, offset)?)
 }
 
-/// The answer of a text parsed at the recorded zone.
-fn parsed(date_text: &str, offset: i64) -> Result<String, DateError> {
-    let units: Vec<u16> = date_text.encode_utf16().collect();
-    let seconds = date_parse::parse(&units, offset)?;
-    text(seconds, offset)
+/// The answer of a text parsed by the member at the recorded zone.
+fn parsed(date_text: &str, offset: i64) -> Result<String, DateMemberError> {
+    let mut date = Date::new(&values(&[2000, 0, 1, 0, 0, 0]), offset)?;
+    DateMember::call(
+        DateMember::Parse,
+        &mut date,
+        &[Variant::String(TjsString::from(date_text))],
+    )?;
+    Ok(text(date.seconds, offset)?)
+}
+
+/// The answer of a text construction.
+fn parse_new(date_text: &str, offset: i64) -> Result<String, DateMemberError> {
+    let date = Date::new(&[Variant::String(TjsString::from(date_text))], offset)?;
+    Ok(text(date.seconds, offset)?)
 }
 
 /// The records of the fixture; a record with no data line is a failure.
