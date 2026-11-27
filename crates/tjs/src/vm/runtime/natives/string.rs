@@ -734,7 +734,7 @@ fn format_string(format: &TjsString, parameters: &[Variant]) -> Result<TjsString
         if kind == u16::from(b'c') || kind == u16::from(b's') {
             let text = text_of(parameter(parameters, next, Arity::AtLeast(0))?, next)?;
             next += 1;
-            let field = text_field(&text, kind == u16::from(b'c'), flag, width, precision);
+            let field = text_field(&text, kind == u16::from(b'c'), flag, width, precision)?;
             out.extend(field);
             continue;
         }
@@ -812,10 +812,10 @@ fn text_field(
     flag: Option<u16>,
     width: i64,
     precision: Option<i64>,
-) -> Vec<u16> {
+) -> Result<Vec<u16>, StringError> {
     let length = text.len();
     let mut cut = match precision {
-        Some(precision) => usize::try_from(precision).unwrap_or_default(),
+        Some(precision) => usize::try_from(precision).map_err(|_| StringError::FormatString)?,
         None => length,
     };
     if cut == 0 {
@@ -826,7 +826,7 @@ fn text_field(
     }
     let cut = cut.min(length);
     let width = i64::try_from(cut).map_or(width, |cut| width.max(cut));
-    let width = usize::try_from(width).unwrap_or_default();
+    let width = usize::try_from(width).map_err(|_| StringError::FormatString)?;
     let pad = width.saturating_sub(cut);
     let mut units = Vec::with_capacity(width);
     if flag == Some(FLAG_LEFT) {
@@ -836,7 +836,7 @@ fn text_field(
         units.extend(std::iter::repeat_n(u16::from(b' '), pad));
         units.extend_from_slice(&text.as_utf16()[..cut]);
     }
-    units
+    Ok(units)
 }
 
 /// The text of one integer field.
@@ -874,14 +874,7 @@ fn integer_field(
         } else {
             ""
         };
-        return Ok(padded(
-            sign,
-            "",
-            &digits,
-            width,
-            zero,
-            flag == Some(FLAG_LEFT),
-        ));
+        return padded(sign, "", &digits, width, zero, flag == Some(FLAG_LEFT));
     }
     let digits = match kind {
         k if k == u16::from(b'o') => format!("{magnitude:o}"),
@@ -902,14 +895,7 @@ fn integer_field(
         k if k == u16::from(b'X') && flag == Some(FLAG_ALTERNATE) && magnitude != 0 => "0X",
         _ => "",
     };
-    Ok(padded(
-        "",
-        prefix,
-        &digits,
-        width,
-        zero,
-        flag == Some(FLAG_LEFT),
-    ))
+    padded("", prefix, &digits, width, zero, flag == Some(FLAG_LEFT))
 }
 
 /// The digits of an integer field with the precision's zero padding.
@@ -973,14 +959,7 @@ fn real_field(
     } else {
         ""
     };
-    Ok(padded(
-        sign,
-        "",
-        &body,
-        width,
-        zero,
-        flag == Some(FLAG_LEFT),
-    ))
+    padded(sign, "", &body, width, zero, flag == Some(FLAG_LEFT))
 }
 
 /// The fixed-point form of a real.
@@ -1059,20 +1038,27 @@ fn strip_zeros(text: &str) -> String {
 }
 
 /// A field's text with its sign, its prefix and its width.
-fn padded(sign: &str, prefix: &str, body: &str, width: i64, zero: bool, left: bool) -> String {
+fn padded(
+    sign: &str,
+    prefix: &str,
+    body: &str,
+    width: i64,
+    zero: bool,
+    left: bool,
+) -> Result<String, StringError> {
     let used = sign.len() + prefix.len() + body.len();
-    let width = usize::try_from(width).unwrap_or_default();
+    let width = usize::try_from(width).map_err(|_| StringError::FormatString)?;
     if width <= used {
-        return format!("{sign}{prefix}{body}");
+        return Ok(format!("{sign}{prefix}{body}"));
     }
     let pad = width - used;
     if left {
-        return format!("{sign}{prefix}{body}{}", " ".repeat(pad));
+        return Ok(format!("{sign}{prefix}{body}{}", " ".repeat(pad)));
     }
     if zero {
-        return format!("{sign}{prefix}{}{body}", "0".repeat(pad));
+        return Ok(format!("{sign}{prefix}{}{body}", "0".repeat(pad)));
     }
-    format!("{}{sign}{prefix}{body}", " ".repeat(pad))
+    Ok(format!("{}{sign}{prefix}{body}", " ".repeat(pad)))
 }
 
 #[cfg(test)]
