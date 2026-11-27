@@ -638,7 +638,6 @@ pub fn owner(opcode: i32) -> Option<&'static str> {
         // member module; the two property-object instructions read and write
         // the member as a property, which no part implements yet
         vm::ENTRY | vm::EXTRY | vm::THROW => Some("the exception part"),
-        vm::EVAL | vm::EEXP => Some("the compile entry"),
         _ => None,
     }
 }
@@ -823,6 +822,7 @@ mod tests {
         assert_eq!(owner(vm::TYPEOFD), None);
         assert_eq!(owner(vm::THROW), Some("the exception part"));
         assert_eq!(owner(vm::ADDCI), None, "the class-name write executes");
-        assert_eq!(owner(vm::EVAL), Some("the compile entry"));
+        assert_eq!(owner(vm::EVAL), None, "the compile instructions execute");
+        assert_eq!(owner(vm::EEXP), None);
     }
 }

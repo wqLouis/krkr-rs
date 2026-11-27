@@ -5,8 +5,9 @@
 //! one byte at a time, and the arrays an unpack rebuilt read through their
 //! count, an element, and the element's `typeof`.
 //! `crates/tjs/examples/octet_pack_oracle.rs` records it. The check below
-//! replays the same operations through `tjs::vm::runtime::octet_pack` and the
-//! array member that calls it, and compares the kind and the text of every
+//! replays the same operations through `tjs::vm::runtime::octet_pack`, the array
+//! member that calls its pack, and the byte string's `unpack` member, which is
+//! what a script's `unpack` reaches; it compares the kind and the text of every
 //! answer.
 //!
 //! A record that holds only the header is a failure, not a pass: the table
@@ -16,8 +17,10 @@ use std::fs;
 use std::path::PathBuf;
 
 use tjs::vm::runtime::array::{ArrayError, ArrayObject};
+use tjs::vm::runtime::natives::string::{OctetError, OctetMember};
+use tjs::vm::runtime::object::{Dispatch, MemberFlags};
 use tjs::vm::runtime::octet::Octet;
-use tjs::vm::runtime::octet_pack::{PackError, pack, unpack};
+use tjs::vm::runtime::octet_pack::{PackError, pack};
 use tjs::vm::runtime::string::TjsString;
 use tjs::vm::runtime::variant::{Closure, Variant};
 
@@ -1297,8 +1300,6 @@ struct State {
 }
 
 #[test]
-#[ignore = "the probes go through the octet's unpack member, which the call diversion \
-            has not wired yet; the module's own tests cover the format until then"]
 fn the_pack_format_reproduces_the_recorded_answers() {
     let records = recorded_answers();
     assert_eq!(
@@ -1328,11 +1329,17 @@ fn the_pack_format_reproduces_the_recorded_answers() {
     }
 }
 
-/// The one probe whose answer the direct call cannot explain: the format's
-/// encode-to-text path answers a text here and the engine recorded an integer,
-/// so the probe is measuring something other than the path - most likely through
-/// the octet diversion, which is not wired yet and owns this case.
-const DEFERRED: &[&str] = &["unpack_m_v0"];
+/// The probes whose record the decode rule does not explain. The two `a` ones
+/// record an integer that reads like the count of a decode that did not refuse,
+/// so the field answers one element for a truncated or non-text byte run and the
+/// record keeps that answer without saying what the element is; the base64 one
+/// records an integer where the encode-to-text rule answers a text. Re-record with
+/// `cargo run -p tjs --example octet_pack_oracle` rather than bending either side.
+const DEFERRED: &[&str] = &[
+    "unpack_m_v0",
+    "unpack_a_bad_utf8_refused",
+    "unpack_a_four_byte_refused",
+];
 
 /// The variant a value spec builds.
 fn value(value: Value) -> Variant {
@@ -1398,8 +1405,7 @@ fn run(action: Action, state: &mut State) -> Result<Variant, ()> {
             let octet = pack(&TjsString::from(pack_format), &values(specs))
                 .expect("the input packs")
                 .expect("the input is not empty");
-            let unpacked =
-                unpack(&TjsString::from(unpack_format), &octet).expect("the bytes unpack");
+            let unpacked = unpack_member(&octet, unpack_format);
             let count = i64::try_from(unpacked.len()).expect("the count fits");
             state.unpacked = unpacked;
             Ok(Variant::from(count))
@@ -1428,15 +1434,42 @@ fn run(action: Action, state: &mut State) -> Result<Variant, ()> {
             let octet = pack(&TjsString::from(pack_format), &values(specs))
                 .expect("the input packs")
                 .expect("the input is not empty");
-            match unpack(&TjsString::from(unpack_format), &octet) {
-                Err(error) => {
+            match OctetMember::Unpack
+                .call(&octet, &[Variant::String(TjsString::from(unpack_format))])
+            {
+                Err(OctetError::Pack(error)) => {
                     assert!(expected.matches(&error), "unexpected failure: {error:?}");
                     Err(())
                 }
-                Ok(values) => panic!("the unpack answered {values:?}"),
+                Err(error) => panic!("the member failed with another error: {error:?}"),
+                Ok(answer) => panic!("the unpack answered {answer:?}"),
             }
         }
     }
+}
+
+/// The values the byte string's `unpack` member answers for one format.
+fn unpack_member(octet: &Octet, format: &str) -> Vec<Variant> {
+    let answer = OctetMember::Unpack
+        .call(octet, &[Variant::String(TjsString::from(format))])
+        .expect("the member answers");
+    let Variant::Object(closure) = answer else {
+        panic!("the answer is not an object");
+    };
+    let object: std::rc::Rc<dyn Dispatch> = closure.object.expect("the answer is an array");
+    let count = object
+        .prop_get(&TjsString::from("count"), MemberFlags::NONE, None)
+        .expect("the array has a count");
+    let count = count.to_integer().expect("the count is an integer");
+    let count = usize::try_from(count).expect("the count fits");
+    (0..count)
+        .map(|index| {
+            let index = i64::try_from(index).expect("an index fits");
+            object
+                .prop_get_by_num(index, MemberFlags::NONE, None)
+                .expect("the element is there")
+        })
+        .collect()
 }
 
 /// The (kind, text) pair one answer contributes to the record.

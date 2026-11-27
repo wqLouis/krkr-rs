@@ -12,14 +12,15 @@
 //! | the step instructions | `18 … 25` | `++` and `--`, on a register and on a member |
 //! | the two-operand operators | `26 … 81` | the fourteen compound assignments, on a register and on a member |
 //! | the single-operand operators | `82 … 98` | `~`, `typeof`, `#`, `$`, `+`, `-`, `int`, `real`, `string`, `octet`, `invalidate`, `isvalid`, `instanceof` |
+//! | the compile instructions | `86`, `87` | the text a register holds, compiled and run as an expression |
 //! | the frame instructions | `118`, `119`, `127` | the result, the return, the debugger break |
 //!
 //! Everything else is owned by another part of the interpreter and is named as
 //! such: [`Fault::Refused`] carries the opcode and the part that owns it, so a
 //! refusal says who is missing rather than saying the opcode is unknown. The
 //! opcodes outside this part are the fifteen member accesses and the two `typeof`
-//! member forms, the four calls, the three exception instructions, the four
-//! context instructions and the two compile-and-run instructions.
+//! member forms, the four calls, the three exception instructions and the four
+//! context instructions.
 //!
 //! # The two opcodes the generator cannot emit
 //!
@@ -37,7 +38,16 @@
 //! seam. The compound assignment on a member is not that seam: it reads, applies
 //! and writes through the object surface, which is the engine's own base-object
 //! behaviour, and the closure form asks the object's `operation` entry instead.
+//!
+//! # The compile instructions
+//!
+//! A compile instruction holds script text and not a value: the text is compiled
+//! into a block of its own and run in this machine, so the text sees the frame's
+//! receiver and the machine's global object. The block it makes belongs to the
+//! instruction, which is why the text's own declared functions do not outlive the
+//! statement that evaluated it.
 
+use std::cell::{Ref, RefCell};
 use std::cmp::Ordering;
 use std::rc::Rc;
 
@@ -99,6 +109,14 @@ pub enum Raise {
         /// The member the call named, or nothing when it named none.
         name: TjsString,
     },
+    /// The text a compile instruction holds does not compile.
+    ///
+    /// The message is the front end's own, so a handler that reads it reads what
+    /// the parse failed on rather than a summary of it.
+    ScriptError {
+        /// The front end's message for the first failure.
+        message: TjsString,
+    },
 }
 
 /// Two raises are the same failure when they are the same kind, name the same
@@ -127,6 +145,9 @@ impl PartialEq for Raise {
             (Self::AccessDenied, Self::AccessDenied) => true,
             (Self::RangeError, Self::RangeError) => true,
             (Self::NotCallable { name: left }, Self::NotCallable { name: right }) => left == right,
+            (Self::ScriptError { message: left }, Self::ScriptError { message: right }) => {
+                left == right
+            }
             _ => false,
         }
     }
@@ -239,12 +260,31 @@ impl From<ObjectError> for Fault {
     }
 }
 
+// A script that does not compile is the language's own failure and a script can
+// catch it; the two failures after it are defects of the front end, and no
+// script can see them.
+impl From<build::CompileError> for Fault {
+    fn from(error: build::CompileError) -> Self {
+        match error {
+            build::CompileError::Syntax { message } => Self::Raised(Raise::ScriptError { message }),
+            build::CompileError::Image(_) | build::CompileError::Build(_) => {
+                Self::Broken("the compiled script does not describe a block")
+            }
+        }
+    }
+}
+
 /// The interpreter: the pages a call's block comes from, and the global object
 /// its scope falls back to.
 #[derive(Default)]
 pub struct Machine {
     /// The pages blocks are taken from.
-    blocks: BlockStack,
+    ///
+    /// The pool is behind a cell because running a call does not change what the
+    /// machine is: it takes a page and gives it back. An instruction that runs a
+    /// block of its own — a compiled text — therefore enters the same machine
+    /// while the call that reads the instruction is still borrowing it.
+    blocks: RefCell<BlockStack>,
     /// The object a frame's scope falls back to, when there is one.
     global: Option<Rc<dyn Dispatch>>,
 }
@@ -268,14 +308,14 @@ impl Machine {
     /// A machine whose frames fall back to `global`.
     pub fn with_global(global: Rc<dyn Dispatch>) -> Self {
         Self {
-            blocks: BlockStack::new(),
+            blocks: RefCell::new(BlockStack::new()),
             global: Some(global),
         }
     }
 
     /// The pages the machine has handed out and taken back.
-    pub fn blocks(&self) -> &BlockStack {
-        &self.blocks
+    pub fn blocks(&self) -> Ref<'_, BlockStack> {
+        self.blocks.borrow()
     }
 
     /// Runs one call of `code` with `receiver` as its `this` and `argv` as the
@@ -289,11 +329,7 @@ impl Machine {
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
     ) -> Result<Variant, Fault> {
-        let block = self.blocks.allocate(code.block_len()?);
-        let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
-        let answer = self.execute(code, &mut frame, argv, None, 0);
-        self.blocks.release(frame.into_block());
-        answer.map_err(throw::Unwind::fault)
+        self.run_frame(code, None, receiver, argv)
     }
 
     /// Runs one call of a context object's own code.
@@ -303,15 +339,30 @@ impl Machine {
     /// the member registration publishes.
     pub fn run_context(
         &mut self,
-        context: &Rc<context::ContextObject>,
+        context: &Rc<ContextObject>,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
     ) -> Result<Variant, Fault> {
-        let code = context.code();
-        let block = self.blocks.allocate(code.block_len()?);
+        self.run_frame(context.code(), Some(context), receiver, argv)
+    }
+
+    /// Runs one call of `code` in a frame of its own.
+    ///
+    /// `context` is the context object the call is the code of, when it is one:
+    /// it is what a member registration publishes and what a trace names. The
+    /// pool is behind a cell, so an instruction that runs a block of its own — a
+    /// compiled text — enters here without taking the machine for change.
+    fn run_frame(
+        &self,
+        code: &Code,
+        context: Option<&Rc<ContextObject>>,
+        receiver: Option<Rc<dyn Dispatch>>,
+        argv: &[Variant],
+    ) -> Result<Variant, Fault> {
+        let block = self.blocks.borrow_mut().allocate(code.block_len()?);
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
-        let answer = self.execute(code, &mut frame, argv, Some(context), 0);
-        self.blocks.release(frame.into_block());
+        let answer = self.execute(code, &mut frame, argv, context, 0);
+        self.blocks.borrow_mut().release(frame.into_block());
         answer.map_err(throw::Unwind::fault)
     }
 
@@ -480,6 +531,16 @@ impl Machine {
                         .map_err(|error| op::refused_conversion(error, &value))?;
                     *frame.reg_mut(address)? = Variant::Octet(octet);
                 }
+                // the compile instructions: the text a register holds, compiled
+                // and run as an expression of its own
+                vm::EVAL | vm::EEXP => {
+                    let address = operand(&code.code, ip, 1)?;
+                    let value = frame.reg(address)?.clone();
+                    let answer = self.evaluate(&*frame, &value, opcode == vm::EVAL)?;
+                    if let Some(answer) = answer {
+                        *frame.reg_mut(address)? = answer;
+                    }
+                }
                 vm::TYPEOF => {
                     let address = operand(&code.code, ip, 1)?;
                     let value = frame.reg(address)?.clone();
@@ -549,6 +610,38 @@ impl Machine {
             }
             ip = next;
         }
+    }
+
+    /// Compiles and runs the script text a compile instruction holds.
+    ///
+    /// The text is an expression of its own: it is compiled the way the compile
+    /// entry compiles an expression, and its top-level context runs in this
+    /// machine, with this frame's receiver as its `this` and the machine's global
+    /// object behind it. The answer is the value the expression produced when the
+    /// instruction keeps a result, and empty when it does not.
+    fn evaluate(
+        &self,
+        frame: &Frame,
+        value: &Variant,
+        result_needed: bool,
+    ) -> Result<Option<Variant>, Fault> {
+        let text = value
+            .to_string()
+            .map_err(|error| op::refused_conversion(error, value))?;
+        // a text with nothing in it is nothing to run, and the register a result
+        // would be kept in is left empty
+        if text.is_empty() {
+            return Ok(result_needed.then_some(Variant::Void));
+        }
+        let block = build::compile(&text, true, result_needed)?;
+        let top = block
+            .top_level()
+            .ok_or(Fault::Broken("an evaluated script has no top level"))?;
+        // the scope the text runs in: this frame's receiver, and the global object
+        // when the frame has none
+        let receiver = frame.receiver().or_else(|| self.global.clone());
+        let answer = self.run_frame(top.object().code(), Some(top.object()), receiver, &[])?;
+        Ok(result_needed.then_some(answer))
     }
 
     /// Applies a step instruction.
@@ -1107,6 +1200,202 @@ mod tests {
             matches!(answer, Variant::Void),
             "the run is cleared before it is read"
         );
+    }
+
+    /// The compile instruction compiles the text its register holds and runs it
+    /// in this machine, and the result register receives what the expression
+    /// answered
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1129-1142`,
+    /// `:2638-2658`).
+    #[test]
+    fn the_compile_instruction_runs_the_text_it_holds() {
+        let code = code_of(
+            &[
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::EVAL,
+                register(1),
+                vm::SRV,
+                register(1),
+                vm::RET,
+            ],
+            &[Variant::String(TjsString::from("1 + 2"))],
+        );
+        let mut machine = Machine::new();
+        let answer = machine.run(&code, None, &[]).expect("the stream runs");
+        assert!(
+            op::discern_equals(&answer, &Variant::Integer(3)),
+            "the evaluated text answered three"
+        );
+    }
+
+    /// The text runs in the frame's scope: a name the frame's receiver holds is
+    /// the value the expression sees
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1130-1134`: the
+    /// evaluation context is the frame's receiver).
+    #[test]
+    fn the_evaluated_text_sees_the_frame_receiver() {
+        let receiver = Rc::new(CustomObject::new(Vec::new()));
+        receiver
+            .prop_set(
+                &TjsString::from("x"),
+                MemberFlags::ENSURE,
+                &Variant::Integer(5),
+                None,
+            )
+            .expect("the receiver holds the member");
+        let handle: Rc<dyn Dispatch> = receiver;
+        let code = code_of(
+            &[
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::EVAL,
+                register(1),
+                vm::SRV,
+                register(1),
+                vm::RET,
+            ],
+            &[Variant::String(TjsString::from("x + 1"))],
+        );
+        let mut machine = Machine::new();
+        let answer = machine
+            .run(&code, Some(handle), &[])
+            .expect("the stream runs");
+        assert!(
+            op::discern_equals(&answer, &Variant::Integer(6)),
+            "the receiver's member is five"
+        );
+    }
+
+    /// A name the frame's receiver does not hold falls back to the machine's
+    /// global object, which is the scope a frame's lookup continues into
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:670-683`).
+    #[test]
+    fn the_evaluated_text_falls_back_to_the_global_object() {
+        let global = Rc::new(CustomObject::new([TjsString::from("global")]));
+        global
+            .prop_set(
+                &TjsString::from("x"),
+                MemberFlags::ENSURE,
+                &Variant::Integer(9),
+                None,
+            )
+            .expect("the global holds the member");
+        let handle: Rc<dyn Dispatch> = global.clone();
+        let code = code_of(
+            &[
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::EVAL,
+                register(1),
+                vm::SRV,
+                register(1),
+                vm::RET,
+            ],
+            &[Variant::String(TjsString::from("x + 1"))],
+        );
+        let mut machine = Machine::with_global(handle);
+        let receiver = Rc::new(CustomObject::new(Vec::new())) as Rc<dyn Dispatch>;
+        let answer = machine
+            .run(&code, Some(receiver), &[])
+            .expect("the stream runs");
+        assert!(
+            op::discern_equals(&answer, &Variant::Integer(10)),
+            "the global's member is nine"
+        );
+    }
+
+    /// The expression form keeps no result, so the register holds the text it
+    /// read
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2638-2652`: the
+    /// register is written only when the result is needed).
+    #[test]
+    fn the_expression_form_leaves_the_register_alone() {
+        let code = code_of(
+            &[
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::EEXP,
+                register(1),
+                vm::SRV,
+                register(1),
+                vm::RET,
+            ],
+            &[Variant::String(TjsString::from("1 + 2"))],
+        );
+        let mut machine = Machine::new();
+        let answer = machine.run(&code, None, &[]).expect("the stream runs");
+        assert!(
+            op::discern_equals(&answer, &Variant::String(TjsString::from("1 + 2"))),
+            "the register still holds the text"
+        );
+    }
+
+    /// A text that does not compile raises the front end's own failure, and the
+    /// caller's protected region catches it like any other
+    /// (`reference/krkr2/cpp/core/tjs2/tjsScriptBlock.cpp:441-443`: a compile
+    /// failure throws the script's error).
+    #[test]
+    fn a_text_that_does_not_compile_raises() {
+        let code = code_of(
+            &[
+                vm::ENTRY,
+                crate::vm::codegen::opcode::vm_code_addr(11),
+                register(1),
+                vm::CONST,
+                register(2),
+                register(0),
+                vm::EVAL,
+                register(2),
+                vm::SRV,
+                register(2),
+                vm::RET,
+                vm::CONST,
+                register(3),
+                register(1),
+                vm::SRV,
+                register(3),
+                vm::RET,
+            ],
+            &[Variant::String(TjsString::from("1 +")), Variant::Integer(7)],
+        );
+        let mut machine = Machine::new();
+        let answer = machine.run(&code, None, &[]).expect("the catch runs");
+        assert!(
+            op::discern_equals(&answer, &Variant::Integer(7)),
+            "the catch's own value is the answer"
+        );
+    }
+
+    /// A value the instruction cannot read as text raises, and the reason is the
+    /// conversion's own
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2643`: the text is
+    /// the value converted, and an octet has no conversion, `tjsVariant.cpp:434-436`).
+    #[test]
+    fn a_value_that_cannot_be_read_as_text_raises() {
+        let code = code_of(
+            &[
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::EVAL,
+                register(1),
+                vm::RET,
+            ],
+            &[Variant::Octet(
+                crate::vm::runtime::octet::Octet::from_slice(&[1]),
+            )],
+        );
+        let mut machine = Machine::new();
+        let answer = machine.run(&code, None, &[]);
+        assert!(matches!(
+            answer,
+            Err(Fault::Raised(Raise::Convert { to: "String", .. }))
+        ));
     }
 
     /// `typeof` answers the language's spellings

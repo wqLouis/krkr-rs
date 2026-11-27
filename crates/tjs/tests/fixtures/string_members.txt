@@ -1,0 +1,82 @@
+# the engine's answers, recorded by `crates/tjs/examples/string_oracle.rs`; regenerate with the command in the example's docs
+surface_class_typeof	!raise	
+property_length	Integer	3
+property_index	String	b
+property_method_read	!raise	
+property_method_typeof	!raise	
+property_octet_unpack_read	!raise	
+property_octet_unpack_typeof	!raise	
+char_at	String	b
+char_at_end	String	
+char_at_negative	String	
+char_at_blank	String	
+char_at_text_index	String	b
+char_at_missing	!raise	
+char_at_extra	!raise	
+index_of	Integer	1
+index_of_start	Integer	4
+index_of_miss	Integer	-1
+index_of_empty_needle	Integer	-1
+index_of_empty_target	Integer	-1
+index_of_number_needle	Integer	1
+index_of_start_past	Integer	-1
+index_of_missing	!raise	
+index_of_three	!raise	
+upper	String	ABC1
+upper_count	!raise	
+lower	String	abc1
+lower_count	!raise	
+substring_start	String	cdef
+substring_count	String	cde
+substring_past	String	cdef
+substring_negative_count	String	
+substring_at_end	String	
+substring_negative_start	String	
+substr_count	String	bc
+substring_missing	!raise	
+sprintf_text	String	5 and x
+sprintf_width	String	[   42]
+sprintf_zero_width	String	[-0042]
+sprintf_left	String	[42   ]
+sprintf_plus	String	+42
+sprintf_hex	String	ff FF
+sprintf_alternate	String	0xff 010
+sprintf_unsigned	String	18446744073709551615
+sprintf_real	String	3.14
+sprintf_real_width	String	[   1.500]
+sprintf_exponent	String	1.235e+04
+sprintf_general	String	0.0001
+sprintf_percent	String	50%
+sprintf_character	String	6
+sprintf_text_precision	String	ab
+sprintf_unknown_kind	String	q
+sprintf_truncated	!raise	
+sprintf_missing	!raise	
+sprintf_extra	String	1
+sprintf_real_as_integer	String	1
+replace_text_pattern	!raise	
+replace_missing	!raise	
+replace_regex	String	aXb
+escape	String	a\\tb
+split_count	Integer	3
+split_first	String	a
+split_purge_count	Integer	2
+split_missing	!raise	
+trim	String	ab
+trim_blank	String	
+trim_count	!raise	
+reverse	String	cba
+reverse_count	!raise	
+repeat	String	ababab
+repeat_zero	String	
+repeat_negative	String	
+repeat_missing	!raise	
+unpack_count	Integer	3
+unpack_first	Integer	1
+unpack_third	Integer	3
+unpack_type	String	Integer
+unpack_ascii	String	\x01\x02\x03
+unpack_extra_argument	Integer	3
+unpack_missing	!raise	
+unpack_number	!raise	
+unpack_unknown_format	!raise	

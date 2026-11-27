@@ -510,7 +510,7 @@ fn member_fault(error: ObjectError, name: &TjsString) -> Fault {
 }
 
 /// The raise for a name that is not there.
-fn member_not_found(name: &TjsString) -> Fault {
+pub(super) fn member_not_found(name: &TjsString) -> Fault {
     Fault::Raised(Raise::MemberNotFound { name: name.clone() })
 }
 

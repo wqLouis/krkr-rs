@@ -266,6 +266,7 @@ fn message_of(raise: &Raise) -> String {
         Raise::AccessDenied => String::from("Access denied"),
         Raise::RangeError => String::from("RangeError"),
         Raise::NotCallable { .. } => String::from("Not a function or invalid method/property type"),
+        Raise::ScriptError { message } => message.to_string(),
     }
 }
 

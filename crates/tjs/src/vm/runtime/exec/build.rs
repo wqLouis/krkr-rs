@@ -32,20 +32,26 @@
 //! context's constant is that context's object, so a function value and the
 //! member registered for it are one object and not two.
 //!
+//! # The parent link is made last
+//!
+//! A context is built before the context that holds it, so its object cannot
+//! be given its parent when it is made: the link is set once every object
+//! exists, and it is a weak link, because a parent's members hold its children.
+//!
 //! # What the object does not hold
 //!
-//! A context's parent, its property's setter and getter, its super-class
-//! proxy, the places the super class is evaluated at, and the labels belong to
-//! the context and not to its object: [`ContextObject`] has no entry for them
-//! and cannot be changed once it is made. The block holds them, so that they
-//! cross the seam with the code: [`Relations`] answers the first four,
-//! [`ContextRecord::super_class_code`] the places, and [`Block::source_position`]
-//! the place in the script a code position came from.
+//! A context's property setter and getter, its super-class proxy, the places
+//! the super class is evaluated at, and the labels belong to the context and
+//! not to its object: [`ContextObject`] has no entry for them. The block holds
+//! them, so that they cross the seam with the code: [`Relations`] answers the
+//! relations, [`ContextRecord::super_class_code`] the places, and
+//! [`Block::source_position`] the place in the script a code position came
+//! from.
 
 use std::rc::Rc;
 
 use crate::vm::codegen::context::{Context as GeneratedContext, SourcePos};
-use crate::vm::codegen::ffi::{Image, tjs2_codegen_context};
+use crate::vm::codegen::ffi::{Image, build_image, line_table, tjs2_codegen_context};
 use crate::vm::codegen::value::Value;
 use crate::vm::runtime::array::{ArrayError, ArrayObject};
 use crate::vm::runtime::dictionary::Dictionary;
@@ -53,6 +59,7 @@ use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant, VariantError};
+use crate::vm::{Generator, Lexer, Parser};
 
 use super::context::ContextObject;
 use super::frame::Code;
@@ -109,6 +116,66 @@ pub struct Line {
     pub position: i32,
     /// The length of the line, in code units, without its break.
     pub length: i32,
+}
+
+/// The reason a script could not become a block.
+///
+/// A script that does not compile is the front end's own report, and the two
+/// failures after it are the ones a compile that finished can hit: an image
+/// that did not build, and an image that does not describe a block.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CompileError {
+    /// The script does not compile.
+    #[error("the script does not compile: {message}")]
+    Syntax {
+        /// The front end's message for the first failure.
+        message: TjsString,
+    },
+
+    /// The image of a compile that did not finish cannot be built.
+    #[error("the image of the script cannot be built: {0}")]
+    Image(String),
+
+    /// The image does not describe a block.
+    #[error(transparent)]
+    Build(BuildError),
+}
+
+/// Compiles script text into the block the executor runs.
+///
+/// The front end and the seam in one step: the analyser, the parser and the
+/// generator make the image, and [`Block::build`] makes the block from it. A
+/// script that does not compile answers the failure the parser reported, so no
+/// block is ever built from a failed compile.
+///
+/// `expression` reads the text as an expression instead of a statement script,
+/// and `result_needed` makes it keep the value the expression produced.
+pub fn compile(
+    text: &TjsString,
+    expression: bool,
+    result_needed: bool,
+) -> Result<Block, CompileError> {
+    let units = text.as_utf16();
+    let mut lexer = if expression {
+        Lexer::expression(units, result_needed)
+    } else {
+        Lexer::new(units)
+    };
+    let mut generator = Generator::new();
+    let parsed = Parser::new(&mut lexer, &mut generator).parse();
+    if let Some(error) = parsed.first_error {
+        return Err(CompileError::Syntax {
+            message: TjsString::from(error.message()),
+        });
+    }
+    let mut image = Image {
+        generator,
+        lines: line_table(units),
+        ..Image::default()
+    };
+    build_image(&mut image).map_err(CompileError::Image)?;
+    Block::build(&image).map_err(CompileError::Build)
 }
 
 /// The reason an image could not become a block.
@@ -300,6 +367,16 @@ impl Block {
                     function_value(child),
                 )?;
             }
+        }
+
+        // the parent links, now that every object exists: a context is built
+        // before the one that holds it, so the link cannot be made when the
+        // context's own object is
+        for (index, context) in generated.iter().enumerate() {
+            let Some(parent) = context.parent else {
+                continue;
+            };
+            object_of(&objects, index)?.set_parent(object_of(&objects, parent)?);
         }
 
         // the records, in the image's order
@@ -633,40 +710,16 @@ fn relation(
 mod tests {
     use super::*;
     use crate::vm::codegen::context::ContextType;
-    use crate::vm::codegen::ffi::{build_image, line_table};
     use crate::vm::codegen::value::{ObjectId, Value as GeneratedValue};
     use crate::vm::runtime::exec::Machine;
     use crate::vm::runtime::exec::op::discern_equals;
     use crate::vm::runtime::object::CustomObject;
-    use crate::vm::{Generator, Lexer, Parser};
 
     /// A block compiled from the script text, the way the compile entry
     /// compiles one: the analyser, the parser and the generator, and then the
     /// image the block is built from.
     fn compiled(text: &str, expression: bool) -> Block {
-        let units: Vec<u16> = text.encode_utf16().collect();
-        let mut lexer = if expression {
-            Lexer::expression(&units, true)
-        } else {
-            Lexer::new(&units)
-        };
-        let mut generator = Generator::new();
-        let parsed = Parser::new(&mut lexer, &mut generator).parse();
-        assert!(
-            parsed.first_error.is_none(),
-            "the script does not compile: {:?}",
-            parsed
-                .first_error
-                .as_ref()
-                .map(|error| error.message().to_string())
-        );
-        let mut image = Image {
-            generator,
-            lines: line_table(&units),
-            ..Image::default()
-        };
-        build_image(&mut image).expect("the image builds");
-        Block::build(&image).expect("the block builds")
+        compile(&TjsString::from(text), expression, expression).expect("the script compiles")
     }
 
     /// Equality over every kind, which a variant does not carry.
@@ -826,6 +879,14 @@ mod tests {
         assert_eq!(inner.object().kind(), ContextType::Function);
         assert_eq!(inner.object().name(), &TjsString::from("inner"));
         assert_eq!(inner.relations().parent, Some(1));
+        let holder = inner
+            .object()
+            .parent()
+            .expect("the inner is held by the outer");
+        assert!(
+            std::ptr::eq(Rc::as_ptr(&holder), Rc::as_ptr(outer.object())),
+            "the parent link names the context that holds it"
+        );
         let member = outer
             .object()
             .prop_get(&TjsString::from("inner"), MemberFlags::NONE, None)
@@ -874,6 +935,39 @@ mod tests {
             .run_context(inner.object(), Some(receiver), &[Variant::Integer(4)])
             .expect("the inner runs");
         assert!(same(&answer, &Variant::Integer(14)), "4 + 10");
+    }
+
+    /// The builder attaches every context to the context that holds it, after
+    /// every object exists: a context is built before the one that holds it, so
+    /// the link cannot be made when the context's own object is.
+    ///
+    /// reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:176 (the parent is the
+    /// context the child was made in) and :886-949 (`RegisterFunction`).
+    #[test]
+    fn the_builder_attaches_each_context_to_the_one_that_holds_it() {
+        let block = compiled("class C extends B { function m() { return 1; } }", false);
+        let top = block.top_level().expect("the block names its top level");
+        assert!(
+            top.object().parent().is_none(),
+            "the top level is held by none"
+        );
+        let class = block
+            .contexts()
+            .iter()
+            .find(|record| record.object().kind() == ContextType::Class)
+            .expect("the class is a context");
+        assert_eq!(class.relations().parent, Some(0));
+        let holder = class
+            .object()
+            .parent()
+            .expect("the class is held by the top level");
+        assert!(
+            std::ptr::eq(Rc::as_ptr(&holder), Rc::as_ptr(top.object())),
+            "the class's parent is the context that holds it"
+        );
+        // the class carries its own name and nothing of the context that holds
+        // it, which has no name of its own
+        assert_eq!(class.object().class_names(), vec![TjsString::from("C")]);
     }
 
     /// A function expression is a constant of the context it sits in, and the

@@ -1,0 +1,8 @@
+# the engine's answers, recorded by `crates/tjs/examples/config_oracle.rs`; regenerate with the command in the example's docs
+surface_config	String	undefined
+surface_script_config	String	Object
+surface_screen_width	String	undefined
+surface_throttle	String	undefined
+deferred_surface_math_generator	String	Object
+value_script_config_screen_width	Integer	1280
+value_global_config_screen_width	Integer	1280

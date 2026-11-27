@@ -16,6 +16,11 @@
 //! that declared it. Chaining a function's store into its parent's would be a
 //! lexical capture, which the language does not have.
 //!
+//! The link to the parent is set after the object is made, because a context is
+//! built before the one that holds it, and it is a weak link: a parent's members
+//! hold its children, so a strong link would close a cycle and keep the whole
+//! block alive as long as one of its contexts is.
+//!
 //! # What the four instructions do
 //!
 //! | instruction | what it does |
@@ -28,16 +33,9 @@
 //! `CHGTHIS` is what makes a declared function a method: a receiver is a
 //! property of the closure, so rebinding it is enough to change what the
 //! function sees as `this`, including inside a block it calls.
-//!
-//! # The one instruction this module cannot finish
-//!
-//! `ADDCI` writes a class name onto an object that is already built, and the
-//! object surface publishes class names as a read with no write beside it. The
-//! instruction therefore stops with a refusal that names the missing entry
-//! rather than dropping the name.
 
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::vm::codegen::context::ContextType;
 use crate::vm::codegen::opcode::vm;
@@ -202,7 +200,12 @@ pub struct ContextObject {
     /// to.
     name: TjsString,
     /// The context that holds it.
-    parent: Option<Rc<ContextObject>>,
+    ///
+    /// The link is weak, because a parent's members hold its children: a strong
+    /// link would close a cycle, and every context of a block would then live as
+    /// long as one of them. The block owns every context it built, so the link
+    /// answers for as long as the block does.
+    parent: RefCell<Option<Weak<ContextObject>>>,
     /// The members the context publishes: the functions it declares and, for a
     /// class, the members its body installs.
     members: CustomObject,
@@ -221,16 +224,23 @@ impl ContextObject {
             code,
             kind,
             name: name.into(),
-            parent: None,
+            parent: RefCell::new(None),
             members: CustomObject::new(Vec::new()),
             added: RefCell::new(Vec::new()),
         }
     }
 
-    /// The same context, held by `parent`.
-    pub fn with_parent(mut self, parent: Rc<ContextObject>) -> Self {
-        self.parent = Some(parent);
-        self
+    /// Makes `parent` the context that holds this one.
+    ///
+    /// A context is built before the context that holds it, so the link is made
+    /// after both objects exist.
+    pub fn set_parent(&self, parent: &Rc<ContextObject>) {
+        *self.parent.borrow_mut() = Some(Rc::downgrade(parent));
+    }
+
+    /// The context that holds this one, while it is alive.
+    pub fn parent(&self) -> Option<Rc<ContextObject>> {
+        self.parent.borrow().as_ref().and_then(Weak::upgrade)
     }
 
     /// The code the context runs.
@@ -264,9 +274,9 @@ impl ContextObject {
     /// Only a class and the proxy that holds a class's super class continue into
     /// their parent. A function does not, because a function that could read its
     /// declarer's members would be a capture, and the language has none.
-    fn continuation(&self) -> Option<&Rc<ContextObject>> {
+    fn continuation(&self) -> Option<Rc<ContextObject>> {
         match self.kind {
-            ContextType::Class | ContextType::SuperClassGetter => self.parent.as_ref(),
+            ContextType::Class | ContextType::SuperClassGetter => self.parent(),
             _ => None,
         }
     }
@@ -363,11 +373,15 @@ impl Dispatch for ContextObject {
 
     /// A context answers no call here.
     ///
-    /// Running its code needs a frame, and a frame needs the receiver as an owned
-    /// handle and a failure channel that can carry the code's own raise; the
-    /// object surface offers a borrowed receiver and an object error. The entry
-    /// that runs a context is [`super::Machine::run_context`], and this method
-    /// does not pretend to be it.
+    /// Running its code needs three things this surface does not carry: the
+    /// receiver as an owned handle (a frame's `this` register holds a value, so a
+    /// borrowed receiver cannot be placed in it), the machine the call runs in,
+    /// and a failure channel that can carry the code's own raise — the object
+    /// surface offers an object error instead. A context does not even hold a
+    /// handle to itself to hand [`super::Machine::run_context`], because a call
+    /// reaches it by `&self`. The call instruction is where all three are in
+    /// hand: it owns the callee's closure, it runs inside a machine, and it can
+    /// answer a [`Fault`].
     fn func_call(
         &self,
         _name: &TjsString,
@@ -462,10 +476,12 @@ mod tests {
         parent
             .define(&text("v"), Variant::Integer(1))
             .expect("the member is stored");
-        let child = Rc::new(
-            ContextObject::new(Code::default(), ContextType::Class, "Child")
-                .with_parent(parent.clone()),
-        );
+        let child = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Class,
+            "Child",
+        ));
+        child.set_parent(&parent);
         let read = child
             .prop_get(&text("v"), MemberFlags::NONE, None)
             .expect("the parent answers");
@@ -475,10 +491,12 @@ mod tests {
         declarer
             .define(&text("v"), Variant::Integer(1))
             .expect("the member is stored");
-        let nested = Rc::new(
-            ContextObject::new(Code::default(), ContextType::Function, "inner")
-                .with_parent(declarer),
-        );
+        let nested = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Function,
+            "inner",
+        ));
+        nested.set_parent(&declarer);
         assert!(
             matches!(
                 nested.prop_get(&text("v"), MemberFlags::NONE, None),
@@ -488,14 +506,74 @@ mod tests {
         );
     }
 
+    /// The parent link does not keep the parent alive. A parent's members hold
+    /// its children, so a strong link back would close a cycle and neither
+    /// object would ever be freed; the reference keeps a plain pointer and takes a
+    /// reference on it only in its debug build
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:176`, `:210-212`).
+    #[test]
+    fn the_parent_link_does_not_close_a_cycle() {
+        let parent = context(ContextType::Class, "Base");
+        let child = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Class,
+            "Child",
+        ));
+        parent
+            .define(
+                &text("m"),
+                Variant::Object(Closure {
+                    object: Some(child.clone()),
+                    objthis: None,
+                }),
+            )
+            .expect("the member is stored");
+        child.set_parent(&parent);
+        let parent_link = Rc::downgrade(&parent);
+        let child_link = Rc::downgrade(&child);
+        drop(parent);
+        drop(child);
+        assert!(
+            parent_link.upgrade().is_none(),
+            "the parent is freed with its last handle"
+        );
+        assert!(
+            child_link.upgrade().is_none(),
+            "the child is freed with its last handle"
+        );
+    }
+
+    /// The parent link answers only while the parent is alive, because it holds
+    /// no reference to it
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeGen.cpp:176`, `:210-212`).
+    #[test]
+    fn the_parent_link_answers_only_while_the_parent_is_alive() {
+        let parent = context(ContextType::Class, "Base");
+        let child = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Class,
+            "Child",
+        ));
+        child.set_parent(&parent);
+        assert_eq!(
+            child.parent().map(|parent| parent.name().clone()),
+            Some(text("Base"))
+        );
+        drop(parent);
+        assert!(child.parent().is_none(), "the link holds no reference");
+    }
+
     /// The class names of a chain answer the class question, the child's name
     /// first (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:2233-2247`).
     #[test]
     fn a_chain_answers_the_class_names() {
         let parent = context(ContextType::Class, "Base");
-        let child = Rc::new(
-            ContextObject::new(Code::default(), ContextType::Class, "Child").with_parent(parent),
-        );
+        let child = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Class,
+            "Child",
+        ));
+        child.set_parent(&parent);
         let names: Vec<String> = child.class_names().iter().map(|n| n.to_string()).collect();
         assert_eq!(names, vec!["Child".to_string(), "Base".to_string()]);
         assert_eq!(child.is_instance_of(&text("Child"), None), Ok(true));
@@ -706,9 +784,12 @@ mod tests {
     #[test]
     fn a_name_added_to_a_class_joins_its_chain() {
         let base = context(ContextType::Class, "Base");
-        let child = Rc::new(
-            ContextObject::new(Code::default(), ContextType::Class, "Child").with_parent(base),
-        );
+        let child = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Class,
+            "Child",
+        ));
+        child.set_parent(&base);
         child
             .add_class_name(&text("Alias"))
             .expect("the name is added");
