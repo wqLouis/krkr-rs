@@ -19,16 +19,17 @@
 //! its receiver, which is the execution context the compatibility surface
 //! exposes.
 //!
-//! # Why the global handle carries a store
+//! # Why every handle carries a store
 //!
 //! The engine's global can hold a scalar, an octet and an engine object, but it
 //! cannot hold a context object of the Rust object model. A declared function is
-//! exactly such an object. The global handle therefore carries a
+//! exactly such an object. Every handle therefore carries a
 //! [`GlobalMembers`] store: a write of a Rust-owned object stays there, while
-//! every value the engine can hold is written to the engine's global. A read
-//! checks the store first and then the engine, so the script sees one global
-//! object in both cases. The store is shared across calls, which is what keeps
-//! a function declared by one script callable by the next.
+//! every value the engine can hold is written to the engine's object. A read
+//! checks the store first and then the engine, so the script sees one object in
+//! both cases. The global store is shared across calls, and a context store is
+//! keyed by the context object's retained id in that same scope, which is what
+//! keeps a function declared by one script callable by the next in either one.
 
 use std::rc::Rc;
 
@@ -72,10 +73,10 @@ pub enum EngineError {
 
 /// The reason a script answer cannot leave the runtime.
 ///
-/// A scalar crosses as itself, and an object the engine owns crosses as the
-/// engine's handle or as a retention of it. An object the Rust object model
-/// owns has no engine handle, so it cannot cross; the answer is refused rather
-/// than reported as an empty value.
+/// A scalar crosses as itself, and an object crosses as the engine's handle or
+/// as a retention of it. The retained form publishes an object the Rust object
+/// model owns behind an engine anchor; the plain host value has no anchor to
+/// carry, so it refuses such an object rather than reporting an empty value.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum AnswerError {
@@ -182,8 +183,8 @@ pub struct ScriptOptions {
 ///
 /// Scalars cross as themselves. An object crosses as the engine's object
 /// marker when it stands for an engine object (or is `null`); an object the
-/// Rust object model owns has no engine handle, so the answer is refused
-/// rather than reported as an empty value.
+/// Rust object model owns has no engine handle in this plain form, so the
+/// answer is refused rather than reported as an empty value.
 ///
 /// # Errors
 ///
@@ -207,14 +208,31 @@ pub fn host_value(answer: Variant) -> Result<TjsValue, AnswerError> {
 ///
 /// Scalars cross as themselves. An object crosses as a retention of its engine
 /// handle, and `null` crosses as a retention of `null`. An object the Rust
-/// object model owns has no engine handle, so the answer is refused rather
-/// than retained against another object.
+/// object model owns is published as an engine object whose store keeps the
+/// object itself, so the answer keeps working after the call that made it.
 ///
 /// # Errors
 ///
-/// [`AnswerError::ObjectWithoutHandle`] for an object the Rust object model
-/// owns, and [`AnswerError::Retain`] when the engine refuses the retention.
+/// [`AnswerError::Retain`] when the engine refuses the retention or the
+/// object's members cannot be published.
 pub fn retained_value(engine: &Tjs2Engine, answer: Variant) -> Result<RetainedValue, AnswerError> {
+    retained_value_with_members(engine, answer, &global_members())
+}
+
+/// The retained value a runtime answer crosses as, in `globals`'s scope.
+///
+/// This is [`retained_value`] with the scope that keeps the object a
+/// Rust-owned answer stands for.
+///
+/// # Errors
+///
+/// [`AnswerError::Retain`] when the engine refuses the retention or the
+/// object's members cannot be published.
+pub fn retained_value_with_members(
+    engine: &Tjs2Engine,
+    answer: Variant,
+    globals: &SharedGlobals,
+) -> Result<RetainedValue, AnswerError> {
     match answer {
         Variant::Void => Ok(RetainedValue::Value(TjsValue::Void)),
         Variant::Integer(value) => Ok(RetainedValue::Value(TjsValue::Integer(value))),
@@ -223,22 +241,28 @@ pub fn retained_value(engine: &Tjs2Engine, answer: Variant) -> Result<RetainedVa
         Variant::Octet(octet) => Ok(RetainedValue::Value(TjsValue::Octet(
             octet.as_slice().to_vec(),
         ))),
-        Variant::Object(closure) => match engine_id(&closure)? {
-            Some(id) => engine
-                .duplicate_retained(id)
-                .map(RetainedValue::Object)
-                .map_err(AnswerError::Retain),
+        Variant::Object(closure) => match &closure.object {
             None => engine
                 .retain_null()
                 .map(RetainedValue::Object)
                 .map_err(AnswerError::Retain),
+            Some(object) => match object.engine_id() {
+                Some(id) => engine
+                    .duplicate_retained(id)
+                    .map(RetainedValue::Object)
+                    .map_err(AnswerError::Retain),
+                None => crate::vm::runtime::bridge::retain_host_object(engine, object, globals)
+                    .map(RetainedValue::Object)
+                    .map_err(|error| AnswerError::Retain(error.to_string())),
+            },
         },
     }
 }
 
 /// The engine id a variant's object carries, if it carries one.
 ///
-/// `None` is the null object, which crosses as a retained `null`.
+/// `None` is the null object. An object the Rust object model owns has no
+/// engine handle, and the plain host value cannot carry one.
 fn engine_id(
     closure: &crate::vm::runtime::variant::Closure,
 ) -> Result<Option<Tjs2ValueId>, AnswerError> {
@@ -380,15 +404,17 @@ fn run_block(
         )
     })?;
     let global: Rc<dyn Dispatch> = Rc::new(
-        CHandle::with_members(Rc::clone(&engine), global_id, globals).map_err(|error| {
-            ScriptFailure::before_run(
-                EngineError::Object(error),
-                name,
-                source,
-                options.lineofs,
-                None,
-            )
-        })?,
+        CHandle::with_members(Rc::clone(&engine), global_id, Rc::clone(&globals)).map_err(
+            |error| {
+                ScriptFailure::before_run(
+                    EngineError::Object(error),
+                    name,
+                    source,
+                    options.lineofs,
+                    None,
+                )
+            },
+        )?,
     );
     let top_level = block
         .top_level()
@@ -416,15 +442,17 @@ fn run_block(
                     None,
                 )
             })?;
-            let handle = CHandle::new(Rc::clone(&engine), retained).map_err(|error| {
-                ScriptFailure::before_run(
-                    EngineError::Object(error),
-                    name,
-                    source,
-                    options.lineofs,
-                    None,
-                )
-            })?;
+            let store = crate::vm::runtime::bridge::context_members(&globals, id);
+            let handle =
+                CHandle::with_context(Rc::clone(&engine), retained, store).map_err(|error| {
+                    ScriptFailure::before_run(
+                        EngineError::Object(error),
+                        name,
+                        source,
+                        options.lineofs,
+                        None,
+                    )
+                })?;
             Some(Rc::new(handle) as Rc<dyn Dispatch>)
         }
     };

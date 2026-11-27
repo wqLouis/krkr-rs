@@ -237,7 +237,8 @@ edited in place — including the undefined-behaviour fixes the compiler would
 otherwise exploit at `-O1` and above. The tree is never regenerated from the
 reference checkout, so a change to it is an ordinary change here and needs
 no separate record. The reference checkout (§1.3 of `AGENTS.md`) is read-only
-material — the behaviour oracle.
+material — the behaviour oracle. What still enters the tree, and the order that
+deletes it, is [`../code/tjs/engine.md`](../code/tjs/engine.md) §4.
 
 ---
 

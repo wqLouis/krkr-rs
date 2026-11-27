@@ -522,20 +522,6 @@ unsafe extern "C" {
         lineofs: c_int,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer.
-    /// Writes the `out_is_bytecode` flag and a
-    /// `TJS2_VAL_*` result; returns 0 on success and non-zero with a malloc'd
-    /// message in `out_error` on a genuine loader failure.
-    fn tjs2_load_bytecode(
-        e: *mut Engine,
-        buff: *const c_char,
-        len: usize,
-        name: *const c_char,
-        context: *mut c_void,
-        out_is_bytecode: *mut c_int,
-        out_result: *mut Value,
-        out_error: *mut *mut c_char,
-    ) -> c_int;
     /// Dump all live script blocks to the console/log output (`tTJS::Dump`).
     fn tjs2_dump(e: *mut Engine, out_error: *mut *mut c_char) -> c_int;
     /// Run the TJS2 garbage collector (`tTJS::DoGarbageCollection`); the
@@ -1715,58 +1701,6 @@ impl Tjs2Engine {
             return Err(take_error(error));
         }
         Ok(())
-    }
-
-    /// Load and execute TJS2 precompiled bytecode from an in-memory buffer.
-    ///
-    /// Returns `Ok(Some(result))` when the loader recognized and consumed
-    /// `bytes` (TJS2 bytecode, or the binary-serialized data the same loader
-    /// entry also accepts), `Ok(None)` when it did not (the caller then decodes
-    /// the same bytes as text), and `Err` when the loader recognized bytecode
-    /// and rejected it. `context` is the script's `this` (a raw
-    /// `iTJSDispatch2*`), or null for the global object.
-    pub fn load_bytecode(
-        &self,
-        bytes: &[u8],
-        name: &str,
-        context: impl Into<Tjs2ValueId>,
-    ) -> Result<Option<RetainedValue>, TjsError> {
-        let context = context.into();
-        // `bytes` is handed over as a pointer and a length; `name` is a
-        // diagnostic label and stays a NUL-terminated C string.
-        let name = CString::new(name).map_err(|_| TjsError("name contains NUL".into()))?;
-        let mut is_bytecode: c_int = 0;
-        let mut result = Value {
-            ty: VAL_VOID,
-            integer: 0,
-            real: 0.0,
-            string: ptr::null(),
-            array: ptr::null(),
-            array_count: 0,
-            retained: 0,
-        };
-        let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: all pointers point to valid, live data for the call; the
-        // caller guarantees `context` is a live object handle or null.
-        let rc = unsafe {
-            tjs2_load_bytecode(
-                self.inner,
-                bytes.as_ptr().cast::<c_char>(),
-                bytes.len(),
-                name.as_ptr(),
-                context.as_ptr(),
-                &mut is_bytecode,
-                &mut result,
-                &mut error,
-            )
-        };
-        if rc != 0 {
-            return Err(take_error(error));
-        }
-        if is_bytecode == 0 {
-            return Ok(None);
-        }
-        self.retain_object_result(take_value(&result)).map(Some)
     }
 
     /// Dump all live script blocks through the log callback installed with

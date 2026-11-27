@@ -31,7 +31,7 @@ current contract for a topic is always a page under `arch/`, `code/` or
 | [`platform/`](platform/README.md) | `api`, `fs`, `media`, `psd`, `render`, `platform` | L1 — the stateless platform core |
 | [`engine/`](engine/README.md) | `engine` | L2 — the middle layer: all evolving state |
 | [`compat/`](compat/README.md) | `compat` | L3 — the KiriKiri compatibility surface |
-| [`vm.md`](vm.md), [`tjs.md`](tjs.md), [`tjs/columns.md`](tjs/columns.md), [`tjs/seam.md`](tjs/seam.md) | `vm`, `tjs`, `tjs::vm` | L4 — the TJS VM host, the vendored VM, the Rust script columns and the seam between them |
+| [`vm.md`](vm.md), [`tjs.md`](tjs.md), [`tjs/columns.md`](tjs/columns.md), [`tjs/seam.md`](tjs/seam.md), [`tjs/engine.md`](tjs/engine.md) | `vm`, `tjs`, `tjs::vm` | L4 — the TJS VM host, the vendored VM, the Rust script columns, the seam between them, and the handle that still holds the C++ |
 | [`app/`](app/README.md) | `app` | root — the desktop composition root |
 | [`android/`](android/README.md) | `android` | root — the Android composition root |
 | [`testkit.md`](testkit.md) | `testkit` | dev-only — the shared test helpers |
@@ -119,6 +119,7 @@ per-plugin pages are indexed in [`compat/README.md`](compat/README.md).
 | [`tjs/corpus.md`](tjs/corpus.md) | `tjs::vm` | the corpus digest: the fixture of every script's compiled block, and the check that compares the front end with it |
 | [`tjs/runtime.md`](tjs/runtime.md) | `tjs::vm::runtime` | the runtime in Rust: the value layer, its parts, and what each later part deletes |
 | [`tjs/interpreter.md`](tjs/interpreter.md) | `tjs::vm::runtime::exec` | the interpreter: the 128 instructions, the frame, `this`/`objthis`, calls, exceptions, the inline cache, the packet plan and the A/B bar |
+| [`tjs/engine.md`](tjs/engine.md) | `tjs`, `tjs::vm::runtime` | the engine handle: every `Tjs2Engine` item, who calls it, what the Rust side already answers, and the order that removes the C++ |
 
 ---
 

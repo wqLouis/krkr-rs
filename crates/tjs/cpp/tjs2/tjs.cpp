@@ -27,7 +27,6 @@
 #include "tjsRandomGenerator.h"
 #include "tjsGlobalStringMap.h"
 #include "tjsDebug.h"
-#include "tjsByteCodeLoader.h"
 #include "tjsBinarySerializer.h"
 #include "tjsRegExp.h"
 
@@ -500,56 +499,6 @@ namespace TJS {
         // do garbage collection
         TJSVariantArrayStackCompactNow();
         TJSCompactStringHeap();
-    }
-
-    //---------------------------------------------------------------------------
-    // for Bytecode
-    void tTJS::LoadByteCode(const tjs_uint8 *buff, size_t len,
-                            tTJSVariant *result, iTJSDispatch2 *context,
-                            const tjs_char *name) {
-        TJSSetFPUE();
-        if(Cache)
-            Cache->LoadByteCode(buff, len, result, context, name);
-    }
-
-    //---------------------------------------------------------------------------
-    bool tTJS::LoadByteCode(class tTJSBinaryStream *stream, tTJSVariant *result,
-                            iTJSDispatch2 *context, const tjs_char *name) {
-        bool ret = false;
-        tjs_uint8 *buff = nullptr;
-        try {
-            tjs_uint64 streamlen = stream->GetSize();
-            if(streamlen >= tTJSScriptBlock::BYTECODE_FILE_TAG_SIZE) {
-                tjs_uint8 header[tTJSScriptBlock::BYTECODE_FILE_TAG_SIZE];
-                stream->Read(header, tTJSScriptBlock::BYTECODE_FILE_TAG_SIZE);
-                if(tTJSByteCodeLoader::IsTJS2ByteCode(header)) {
-                    stream->Seek(0, TJS_BS_SEEK_SET);
-                    buff = new tjs_uint8[static_cast<unsigned int>(streamlen)];
-                    stream->Read(buff, static_cast<tjs_uint>(streamlen));
-                    LoadByteCode(buff, static_cast<size_t>(streamlen), result,
-                                 context, name);
-                    ret = true;
-                } else {
-                    assert(tTJSScriptBlock::BYTECODE_FILE_TAG_SIZE ==
-                           tTJSBinarySerializer::HEADER_LENGTH);
-                    if(result != nullptr &&
-                       tTJSBinarySerializer::IsBinary(header)) {
-                        tTJSBinarySerializer binload;
-                        tTJSVariant *var = binload.Read(stream);
-                        if(var) {
-                            *result = *var;
-                            delete var;
-                            ret = true;
-                        }
-                    }
-                }
-            }
-        } catch(...) {
-            delete[] buff;
-            throw;
-        }
-        delete[] buff;
-        return ret;
     }
 
     //---------------------------------------------------------------------------

@@ -55,6 +55,7 @@ use tjs::{
 use super::system::{get_command_line, resolve, set_string_out, try_value_as_i64, value_as_bool};
 use crate::native_util::{args, report_error, services, set_bool, set_void, value_as_string};
 use crate::natives::storages::normalize_storage_name;
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -754,7 +755,12 @@ fn debug_window_property(
     };
     if !cached {
         let class = which.class();
-        let object = match host.eval_retained(&format!("new {class}()"), "Debug") {
+        let scripts = ScriptScope::new(host, &ctx);
+        let object = match scripts.eval(
+            &format!("new {class}()"),
+            "Debug",
+            ScriptOptions::default(),
+        ) {
             Ok(RetainedValue::Object(object)) => object,
             Ok(RetainedValue::Value(_)) => {
                 return report_error(

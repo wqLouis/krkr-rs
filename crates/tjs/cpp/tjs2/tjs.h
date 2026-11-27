@@ -181,17 +181,6 @@ namespace TJS {
 
         void DoGarbageCollection();
 
-        // for Bytecode
-        void LoadByteCode(const tjs_uint8 *buff, size_t len,
-                          tTJSVariant *result = nullptr,
-                          iTJSDispatch2 *context = nullptr,
-                          const tjs_char *name = nullptr);
-
-        bool LoadByteCode(class tTJSBinaryStream *stream,
-                          tTJSVariant *result = nullptr,
-                          iTJSDispatch2 *context = nullptr,
-                          const tjs_char *name = nullptr);
-
         // for Binary Dictionay Array
         static bool LoadBinaryDictionayArray(class tTJSBinaryStream *stream,
                                              tTJSVariant *result);

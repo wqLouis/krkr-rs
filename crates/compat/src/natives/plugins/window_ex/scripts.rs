@@ -17,7 +17,7 @@ use tjs::{Engine, NativeMethodDef, NativeStaticMembers, Value};
 
 use crate::binding;
 use crate::native_util::{args, report_error, set_bool, value_as_string};
-use crate::natives::scripts::{context_argument, lineofs_argument};
+use crate::natives::scripts::{context_argument, lineofs_argument, run_text, script_options};
 use crate::{CompatCtx, CompatError};
 
 use super::util::{as_bool, finish_retained};
@@ -74,10 +74,16 @@ extern "C" fn scripts_eval(
         std::ptr::null_mut()
     };
     let need_result = resolved.engine().result_needed();
-    let result = resolved
-        .engine()
-        .eval_retained_with_context_result(&expression, &name, context, lineofs, need_result)
-        .map_err(|error| error.to_string());
+    let globals = services.script_globals();
+    let result = run_text(
+        resolved.engine(),
+        &expression,
+        &name,
+        true,
+        script_options(context, lineofs, need_result),
+        &globals,
+    )
+    .map_err(|error| error.to_string());
     if log_errors && let Err(error) = &result {
         log::error!("Scripts.eval({name:?}): {error}");
     }

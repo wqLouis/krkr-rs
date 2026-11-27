@@ -96,7 +96,7 @@ the Rust side — no bindgen.
 | group | entry points |
 |---|---|
 | lifecycle | `tjs2_create`, `tjs2_destroy`, `tjs2_set_data_dir`, `tjs2_wire_stream_factories` |
-| execution | `tjs2_exec_script`, `tjs2_eval`, and their UTF-16 (`_wide`) counterparts, `tjs2_load_bytecode`, `tjs2_compile_script` |
+| execution | `tjs2_exec_script`, `tjs2_eval`, and their UTF-16 (`_wide`) counterparts, `tjs2_compile_script` |
 | logging | `tjs2_set_log_cb` with the `LOG_DEBUG`/`LOG_INFO`/`LOG_WARN`/`LOG_ERROR` levels |
 | storage | `tjs2_set_storage_read_callback` — the process-wide read hook the text and binary stream factories use |
 | text decode | `tjs2_set_text_decode_callback` — the process-wide hook that decodes a BOM-less text payload into UTF-16 code units |
@@ -136,7 +136,7 @@ impl Tjs2Engine {
     pub fn retain_null(&self) -> Result<DetachedValue, String>;
     pub fn global_object(&self) -> Result<DetachedValue, String>;
     pub fn script_evaluation_count(&self) -> u64;
-    // … retained values, member access, bytecode, GC, introspection
+    // … retained values, member access, GC, introspection
 }
 ```
 
@@ -286,8 +286,11 @@ state makes concurrent engines unsafe.
 * **The TJS stream IO bypasses Rust.** `cpp/streams.cpp` implements the
   `Array.save` / `load` / `saveStruct` paths with `std::fopen` directly.
   It is the one IO path the stateless file-system surface cannot reach.
-* **The Rust port of the VM is deferred**, so the build keeps the
-  zig / bison / python / oniguruma dependency set.
+* **The Rust port of the VM is in progress**: the front end and the executor
+  are Rust, and the C++ that is still entered is what `Tjs2Engine`'s own
+  entries call. The order that removes it, and the point after which no script
+  enters the C++ engine, is [tjs/engine.md](tjs/engine.md) §4–§5; the build
+  keeps zig and oniguruma until then.
 * `docs.old/vm-defects.md` records the VM and reference defects a rewrite must
   not rediscover.
 
@@ -302,5 +305,6 @@ state makes concurrent engines unsafe.
 | the layer rules and the ABI constraint | [`../rules/arch_rules.md`](../rules/arch_rules.md) §2, §8 |
 | the VM, the compatibility surface and the plugins | [`../migration/08-tjs-vm-and-native-plugins.md`](../../docs.old/migration/08-tjs-vm-and-native-plugins.md) |
 | the TJS2 language, the VM's architecture and the Rust port audit | [`../arch/l4.md`](../arch/l4.md) §4–§6 |
+| the engine handle, and the order that removes the C++ | [tjs/engine.md](tjs/engine.md) |
 | the VM defect record | [`../vm-defects.md`](../../docs.old/vm-defects.md) |
 | the evidence trail for the VM decisions | [`../../docs.old/migration/08-tjs-vm-and-native-plugins.md`](../../docs.old/migration/08-tjs-vm-and-native-plugins.md) |

@@ -79,7 +79,6 @@ const TJS2_SOURCES: &[&str] = &[
     "tjsError.cpp",
     "tjsMT19937ar-cok.cpp",
     "tjsArray.cpp",
-    "tjsByteCodeLoader.cpp",
     "tjsGlobalStringMap.cpp",
     "tjsOctPack.cpp",
     "tjsScriptCache.cpp",

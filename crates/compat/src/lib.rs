@@ -65,6 +65,7 @@ mod natives;
 mod plugin;
 mod plugins_native;
 mod resource;
+mod script;
 mod storage;
 mod text;
 

@@ -312,6 +312,16 @@ pub trait Dispatch {
         None
     }
 
+    /// Whether this value is a Rust-owned object published through an engine
+    /// anchor.
+    ///
+    /// An anchor carries an engine id so it can cross the engine's value
+    /// surface, but the object itself is still the Rust object behind it: a
+    /// store keeps the value as that object rather than as the anchor.
+    fn is_host_proxy(&self) -> bool {
+        false
+    }
+
     /// The member this value keeps outside the engine, when it has one.
     ///
     /// An engine object cannot hold a value of the Rust object model. A handle

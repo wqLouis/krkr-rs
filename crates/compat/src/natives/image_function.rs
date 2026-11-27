@@ -57,6 +57,7 @@ use crate::natives::system::{
 };
 use crate::natives::visual::swap_red_blue;
 use crate::resource::{TextDrawParams, draw_text_into_bitmap, glyph_text, resource_state};
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::{CompatCtx, CompatError};
 
 // ---------------------------------------------------------------------------
@@ -122,7 +123,11 @@ fn run(
     let a = unsafe { args(argv, argc) };
     match f(&resolved, &ctx, a) {
         Ok(region) => {
-            set_region_out(resolved.engine(), out, region);
+            set_region_out(
+                &ScriptScope::new(resolved.engine(), &ctx),
+                out,
+                region,
+            );
             0
         }
         Err(error) => report_error(out_error, &error),
@@ -149,7 +154,7 @@ fn set_retained_out(out: *mut Value, id: tjs::Tjs2ValueId) {
 
 /// Marshal an updated region into a fresh `Rect`, or TJS `void` when the
 /// operation touched nothing (the reference `result->Clear()`).
-fn set_region_out(host: &Tjs2Engine, out: *mut Value, region: Option<RectI>) {
+fn set_region_out(scripts: &ScriptScope<'_>, out: *mut Value, region: Option<RectI>) {
     if out.is_null() {
         return;
     }
@@ -157,7 +162,7 @@ fn set_region_out(host: &Tjs2Engine, out: *mut Value, region: Option<RectI>) {
         set_void(out);
         return;
     };
-    let object = match host.eval_retained("new Rect()", "ImageFunction.rect") {
+    let object = match scripts.eval("new Rect()", "ImageFunction.rect", ScriptOptions::default()) {
         Ok(RetainedValue::Object(object)) => object,
         Ok(RetainedValue::Value(_)) => {
             log::warn!("ImageFunction: `new Rect()` did not return an object");
@@ -176,9 +181,11 @@ fn set_region_out(host: &Tjs2Engine, out: *mut Value, region: Option<RectI>) {
         ("right", right),
         ("bottom", bottom),
     ] {
-        if let Err(error) =
-            host.set_member(object.raw_id(), name, &TjsValue::Integer(i64::from(value)))
-        {
+        if let Err(error) = scripts.engine().set_member(
+            object.raw_id(),
+            name,
+            &TjsValue::Integer(i64::from(value)),
+        ) {
             log::warn!("ImageFunction: cannot set the result Rect.{name}: {error}");
             set_void(out);
             return;

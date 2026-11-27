@@ -55,6 +55,7 @@ use crate::binding;
 use crate::native_util::{args, report_error, set_int, set_null, set_void};
 use crate::natives::event::event_dictionary;
 use crate::natives::system::{tjs_string_to_integer, try_value_as_i64, value_as_bool};
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 use state::{
@@ -206,6 +207,7 @@ fn object_to_string(engine: &Tjs2Engine, object: &DetachedValue) -> Result<Strin
 impl KagEnv {
     fn new(
         engine: &'static Tjs2Engine,
+        ctx: &CompatCtx,
         storage: Option<*mut Storage>,
         owner: *mut c_void,
         instance: *mut KagParserInstance,
@@ -213,13 +215,20 @@ impl KagEnv {
         // The expression is evaluated with the parser as its context: a free
         // name resolves on the parser first (`mp` is the macro parameters)
         // and on the global after it.
-        let context = Tjs2ValueId::from_raw(owner);
+        let scripts = ScriptScope::new(engine, ctx);
         let eval: EvalFn = Box::new(move |exp: &str| -> Result<EvalResult, String> {
             // Evaluate the expression exactly once; the object arm carries
             // everything later consumers need, so a side effect cannot run
             // twice.
-            let value = engine
-                .eval_retained_with_context(exp, "KAGParser", context, 0)
+            let value = scripts
+                .eval(
+                    exp,
+                    "KAGParser",
+                    ScriptOptions {
+                        context: owner,
+                        lineofs: 0,
+                    },
+                )
                 .map_err(|error| error.to_string())?;
             match value {
                 RetainedValue::Value(TjsValue::Void) => Ok(EvalResult::Void),
@@ -428,9 +437,11 @@ fn make_env(
     instance: *mut KagParserInstance,
     owner: *mut c_void,
 ) -> Result<KagEnv, String> {
-    let host = resolve_host(engine)?;
+    let resolved = binding::resolve(engine as *mut Engine)
+        .ok_or_else(|| "KAGParser: compat context is not bound".to_string())?;
+    let host = resolved.engine();
     let storage = resolve_storage(engine)?;
-    Ok(KagEnv::new(host, storage, owner, instance))
+    Ok(KagEnv::new(host, &resolved.ctx(), storage, owner, instance))
 }
 
 /// Synchronize the live `macros` dictionary with the parser's macro table.

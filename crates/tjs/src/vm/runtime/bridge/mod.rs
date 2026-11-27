@@ -13,8 +13,9 @@
 //! taken from the object itself — [`Dispatch::engine_id`] — never from its
 //! address, and a duplicate of it is made for the call because the engine
 //! consumes the retention it is handed. An object the Rust object model owns
-//! answers no engine id, so it cannot cross. A global handle keeps such a value
-//! in its [`GlobalMembers`] store instead; any other handle refuses it.
+//! answers no engine id, so a handle keeps such a value in its
+//! [`GlobalMembers`] store instead. Every handle has a store; a context handle
+//! has its own, keyed by the context's retained id in the scope's store.
 //!
 //! An answer crosses **out** of the engine as a [`Variant`]: an object the
 //! call retained becomes a [`CHandle`], so the next entry reaches the same
@@ -30,8 +31,8 @@
 //! so the call is refused rather than run on another object.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
-use std::rc::Rc;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::{Rc, Weak};
 
 use crate::vm::runtime::natives::registry::NativeRegistry;
 use crate::vm::runtime::number::Number;
@@ -41,33 +42,78 @@ use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
 use crate::{CallAnswer, DetachedValue, MemberShape, Tjs2Engine, Tjs2ValueId, TjsValue};
 
-/// The members a global handle keeps on the Rust side.
+/// The members a handle keeps on the Rust side.
 ///
-/// The engine cannot hold a value of the Rust object model, so a handle created
-/// for a global scope may carry those values here. Scalars and engine objects
-/// still cross to the engine; only an object the engine cannot address stays
-/// in this store. The store also owns the native class registry: a name the
+/// The engine cannot hold a value of the Rust object model, so a handle may
+/// carry those values here. Scalars and engine objects still cross to the
+/// engine; only an object the engine cannot address stays in this store. The
+/// global scope's store also owns the native class registry: a name the
 /// registry publishes is answered from the registry before the engine, and a
 /// write or a delete of that name is kept here so the two views do not
-/// disagree.
+/// disagree. A context and every other object have their own store in the same
+/// scope and never apply the global registry.
 pub struct GlobalMembers {
     members: RefCell<BTreeMap<TjsString, Variant>>,
     removed: RefCell<BTreeSet<TjsString>>,
-    natives: NativeRegistry,
+    natives: Option<NativeRegistry>,
     log: Option<LogSink>,
+    parent: Option<Weak<GlobalMembers>>,
+    children: RefCell<HashMap<Tjs2ValueId, SharedGlobals>>,
+    host: RefCell<Option<Rc<dyn Dispatch>>>,
+    hosts: RefCell<HashMap<i64, Rc<dyn Dispatch>>>,
+    next_host: Cell<i64>,
 }
 
 /// What a refused engine call reports to.
 pub type LogSink = Rc<dyn Fn(&str)>;
 
+/// The hidden member an engine anchor carries so a later handle for the same
+/// object finds the Rust object it stands for.
+const HOST_TOKEN: &str = "__krkr_rust_host";
+
 impl GlobalMembers {
-    /// An empty store with no log sink.
+    /// An empty root store with no log sink.
     pub fn new() -> Self {
         Self {
             members: RefCell::new(BTreeMap::new()),
             removed: RefCell::new(BTreeSet::new()),
-            natives: NativeRegistry::new(),
+            natives: Some(NativeRegistry::new()),
             log: None,
+            parent: None,
+            children: RefCell::new(HashMap::new()),
+            host: RefCell::new(None),
+            hosts: RefCell::new(HashMap::new()),
+            next_host: Cell::new(1),
+        }
+    }
+
+    /// An empty store with no native class registry.
+    fn plain() -> Self {
+        Self {
+            members: RefCell::new(BTreeMap::new()),
+            removed: RefCell::new(BTreeSet::new()),
+            natives: None,
+            log: None,
+            parent: None,
+            children: RefCell::new(HashMap::new()),
+            host: RefCell::new(None),
+            hosts: RefCell::new(HashMap::new()),
+            next_host: Cell::new(1),
+        }
+    }
+
+    /// A store for one object in `root`'s scope, published through the root.
+    fn detached_to(root: &SharedGlobals) -> Self {
+        Self {
+            members: RefCell::new(BTreeMap::new()),
+            removed: RefCell::new(BTreeSet::new()),
+            natives: None,
+            log: root.log.clone(),
+            parent: Some(Rc::downgrade(root)),
+            children: RefCell::new(HashMap::new()),
+            host: RefCell::new(None),
+            hosts: RefCell::new(HashMap::new()),
+            next_host: Cell::new(1),
         }
     }
 
@@ -79,7 +125,41 @@ impl GlobalMembers {
 
     /// The store's log sink.
     fn log(&self) -> Option<LogSink> {
-        self.log.clone()
+        self.log.clone().or_else(|| {
+            self.parent
+                .as_ref()
+                .and_then(Weak::upgrade)
+                .and_then(|p| p.log())
+        })
+    }
+
+    /// The object whose members this store stands in front of, when it is the
+    /// store for a Rust object that crossed into the engine.
+    fn host(&self) -> Option<Rc<dyn Dispatch>> {
+        self.host.borrow().clone()
+    }
+
+    /// Makes `object` the object this store stands in front of.
+    fn set_host(&self, object: Rc<dyn Dispatch>) {
+        *self.host.borrow_mut() = Some(object);
+    }
+
+    /// Gives `object` a stable token an engine anchor can carry.
+    fn register_host(&self, object: Rc<dyn Dispatch>) -> i64 {
+        let token = self.next_host.get();
+        self.next_host.set(token.wrapping_add(1));
+        self.hosts.borrow_mut().insert(token, object);
+        token
+    }
+
+    /// The object a token names, while it is live.
+    fn host_by_token(&self, token: i64) -> Option<Rc<dyn Dispatch>> {
+        self.hosts.borrow().get(&token).cloned()
+    }
+
+    /// Whether a Rust object has crossed into this scope.
+    fn has_hosts(&self) -> bool {
+        !self.hosts.borrow().is_empty()
     }
 
     /// The member the store holds, if any.
@@ -107,26 +187,28 @@ impl GlobalMembers {
             .collect()
     }
 
-    /// The class object the global name denotes, when the registry publishes
-    /// one and the name has not been deleted.
+    /// The class object the name denotes, when the registry publishes one and
+    /// the name has not been deleted.
     fn native(&self, name: &TjsString) -> Option<Variant> {
         if self.removed.borrow().contains(name) {
             return None;
         }
-        self.natives.get(name)
+        self.natives.as_ref()?.get(name)
     }
 
-    /// Whether the registry publishes the global name.
+    /// Whether the registry publishes the name.
     fn is_native(&self, name: &TjsString) -> bool {
-        self.natives.contains(name)
+        self.natives
+            .as_ref()
+            .is_some_and(|natives| natives.contains(name))
     }
 
-    /// Whether the global name was deleted from the registry's view.
+    /// Whether the name was deleted from this store's view.
     fn is_removed(&self, name: &TjsString) -> bool {
         self.removed.borrow().contains(name)
     }
 
-    /// Marks a registry name deleted, so the name reads as absent.
+    /// Marks a registry name deleted from this store's view.
     fn mark_removed(&self, name: &TjsString) {
         self.removed.borrow_mut().insert(name.clone());
     }
@@ -134,17 +216,22 @@ impl GlobalMembers {
     /// The registry's class objects, by name, excluding deleted names.
     fn native_entries(&self) -> Vec<(TjsString, Variant)> {
         let removed = self.removed.borrow();
-        let mut entries = Vec::new();
-        for name in self.natives.names() {
-            let name = TjsString::from(name);
-            if removed.contains(&name) {
-                continue;
+        match &self.natives {
+            Some(natives) => {
+                let mut entries = Vec::new();
+                for name in natives.names() {
+                    let name = TjsString::from(name);
+                    if removed.contains(&name) {
+                        continue;
+                    }
+                    if let Some(value) = natives.get(&name) {
+                        entries.push((name, value));
+                    }
+                }
+                entries
             }
-            if let Some(value) = self.natives.get(&name) {
-                entries.push((name, value));
-            }
+            None => Vec::new(),
         }
-        entries
     }
 }
 
@@ -160,6 +247,40 @@ pub type SharedGlobals = Rc<GlobalMembers>;
 /// A fresh global-member store.
 pub fn global_members() -> SharedGlobals {
     Rc::new(GlobalMembers::new())
+}
+
+/// The root of a store's scope.
+fn root_of(store: &SharedGlobals) -> SharedGlobals {
+    let mut current = Rc::clone(store);
+    loop {
+        let parent = current.parent.as_ref().and_then(Weak::upgrade);
+        match parent {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+}
+
+/// The store one object in `root`'s scope has, creating it when this is the
+/// first use.
+fn child_of(root: &SharedGlobals, id: Tjs2ValueId) -> SharedGlobals {
+    let root = root_of(root);
+    if let Some(store) = root.children.borrow().get(&id) {
+        return Rc::clone(store);
+    }
+    let store = Rc::new(GlobalMembers::detached_to(&root));
+    root.children.borrow_mut().insert(id, Rc::clone(&store));
+    store
+}
+
+/// The store one object already has, when it has one.
+fn store_for(root: &SharedGlobals, id: Tjs2ValueId) -> Option<SharedGlobals> {
+    root_of(root).children.borrow().get(&id).cloned()
+}
+
+/// The store a context object keeps within `globals`'s scope.
+pub fn context_members(globals: &SharedGlobals, id: Tjs2ValueId) -> SharedGlobals {
+    child_of(globals, id)
 }
 
 /// An engine object, reached through its retained id.
@@ -179,8 +300,16 @@ pub struct CHandle {
     class_names: Rc<RefCell<Vec<TjsString>>>,
     /// Whether the object was usable, from the last interface answer.
     valid: Rc<Cell<bool>>,
-    /// The members the engine cannot hold, when this handle is a global scope.
-    globals: Option<SharedGlobals>,
+    /// The members the engine cannot hold for this object.
+    globals: RefCell<SharedGlobals>,
+    /// The store the object's scope shares; child stores are keyed here.
+    root: SharedGlobals,
+    /// The Rust object this handle stands in front of, when it is a proxy for
+    /// one that crossed into the engine.
+    host: Option<Rc<dyn Dispatch>>,
+    /// Whether this handle is the global scope's own handle. Only that handle
+    /// applies the Rust class registry over the engine's global object.
+    global: bool,
     /// The sink a refused engine call reports to.
     log: Option<LogSink>,
 }
@@ -202,26 +331,15 @@ impl CHandle {
     /// The id is not an object the engine can answer for: the class-name read
     /// or the validity question failed.
     pub fn new(engine: Rc<Tjs2Engine>, value: DetachedValue) -> Result<Self, ObjectError> {
-        let id = value.raw_id();
-        let names = engine
-            .class_names(id)
-            .map_err(|_| ObjectError::InvalidObject)?;
-        let class_names = names_of(&engine, names)?;
-        let valid = engine
-            .is_valid(id)
-            .map_err(|_| ObjectError::InvalidObject)?;
-        Ok(Self {
-            retained: Rc::new(value),
-            engine,
-            class_names: Rc::new(RefCell::new(class_names)),
-            valid: Rc::new(Cell::new(valid)),
-            globals: None,
-            log: None,
-        })
+        let globals = Rc::new(GlobalMembers::plain());
+        let root = Rc::clone(&globals);
+        Self::with_store(engine, value, globals, root, false)
     }
 
-    /// The adapter over `value`, carrying the global members the engine cannot
-    /// hold.
+    /// The adapter over `value` for the global scope.
+    ///
+    /// This is the one handle that applies the global store's class registry
+    /// over the engine's global object.
     ///
     /// # Errors
     ///
@@ -232,22 +350,130 @@ impl CHandle {
         value: DetachedValue,
         globals: SharedGlobals,
     ) -> Result<Self, ObjectError> {
-        let log = globals.log();
-        let mut handle = Self::new(engine, value)?;
-        handle.globals = Some(globals);
-        handle.log = log;
-        Ok(handle)
+        let root = root_of(&globals);
+        Self::with_store(engine, value, globals, root, true)
     }
 
-    /// The adapter over `value`, reporting refused calls to `log`.
-    fn with_log(
+    /// The adapter over `value`, carrying a non-global object's own members.
+    ///
+    /// The handle consults its store and the engine, never the global scope's
+    /// class registry.
+    ///
+    /// # Errors
+    ///
+    /// The id is not an object the engine can answer for: the class-name read
+    /// or the validity question failed.
+    pub fn with_context(
         engine: Rc<Tjs2Engine>,
         value: DetachedValue,
-        log: Option<LogSink>,
+        globals: SharedGlobals,
     ) -> Result<Self, ObjectError> {
-        let mut handle = Self::new(engine, value)?;
-        handle.log = log;
-        Ok(handle)
+        let root = root_of(&globals);
+        Self::with_store(engine, value, globals, root, false)
+    }
+
+    /// The adapter over `value`, taking the store its object already has in
+    /// `root`'s scope.
+    fn with_root(
+        engine: Rc<Tjs2Engine>,
+        value: DetachedValue,
+        root: SharedGlobals,
+    ) -> Result<Self, ObjectError> {
+        let id = value.raw_id();
+        let globals =
+            store_for(&root, id).unwrap_or_else(|| Rc::new(GlobalMembers::detached_to(&root)));
+        Self::with_store(engine, value, globals, root, false)
+    }
+
+    /// The adapter over `value` with an explicit store.
+    fn with_store(
+        engine: Rc<Tjs2Engine>,
+        value: DetachedValue,
+        mut globals: SharedGlobals,
+        root: SharedGlobals,
+        global: bool,
+    ) -> Result<Self, ObjectError> {
+        let id = value.raw_id();
+        let names = engine
+            .class_names(id)
+            .map_err(|_| ObjectError::InvalidObject)?;
+        let class_names = names_of(&engine, names)?;
+        let valid = engine
+            .is_valid(id)
+            .map_err(|_| ObjectError::InvalidObject)?;
+        let mut host = globals.host();
+        // A retained id names one value, and the same engine object can be
+        // retained under a different id. An anchor carries its Rust object's
+        // token, so the later handle finds the same object instead of an
+        // empty dictionary.
+        let token = if host.is_none()
+            && !global
+            && root.has_hosts()
+            && class_names
+                .iter()
+                .any(|name| name.to_string() == "Dictionary")
+        {
+            host_token(&engine, id)?
+        } else {
+            None
+        };
+        if let Some(token) = token
+            && let Some(object) = root.host_by_token(token)
+        {
+            if store_for(&root, id).is_none() {
+                globals = child_of(&root, id);
+            }
+            globals.set_host(Rc::clone(&object));
+            host = Some(object);
+        }
+        let log = globals.log().or_else(|| root.log());
+        Ok(Self {
+            retained: Rc::new(value),
+            engine,
+            class_names: Rc::new(RefCell::new(class_names)),
+            valid: Rc::new(Cell::new(valid)),
+            globals: RefCell::new(globals),
+            root,
+            host,
+            global,
+            log,
+        })
+    }
+
+    /// This object's store.
+    fn store(&self) -> SharedGlobals {
+        self.globals.borrow().clone()
+    }
+
+    /// This object's store, preferring the one its scope already published.
+    fn entry_store(&self) -> SharedGlobals {
+        let current = self.store();
+        if Rc::ptr_eq(&current, &self.root) {
+            return current;
+        }
+        store_for(&self.root, self.id()).unwrap_or(current)
+    }
+
+    /// This object's store, publishing a store that was only local to this
+    /// handle before its first Rust-owned member.
+    fn member_store(&self) -> SharedGlobals {
+        let current = self.store();
+        if Rc::ptr_eq(&current, &self.root) {
+            return current;
+        }
+        let id = self.id();
+        if let Some(existing) = store_for(&self.root, id) {
+            if !Rc::ptr_eq(&existing, &current) {
+                *self.globals.borrow_mut() = Rc::clone(&existing);
+                return existing;
+            }
+            return current;
+        }
+        self.root
+            .children
+            .borrow_mut()
+            .insert(id, Rc::clone(&current));
+        current
     }
 
     /// The engine the object belongs to.
@@ -413,14 +639,14 @@ fn receiver_id(objthis: Option<&dyn Dispatch>) -> Result<Option<Tjs2ValueId>, Ob
 fn call_answer(
     engine: &Rc<Tjs2Engine>,
     answer: CallAnswer,
-    log: Option<LogSink>,
+    root: &SharedGlobals,
 ) -> Result<Variant, ObjectError> {
     match answer {
         CallAnswer::Null => Ok(Variant::Object(Closure::null())),
-        CallAnswer::Object(object) => Ok(object_value(CHandle::with_log(
+        CallAnswer::Object(object) => Ok(object_value(CHandle::with_root(
             engine.clone(),
             object,
-            log,
+            Rc::clone(root),
         )?)),
         CallAnswer::Scalar(value) => to_variant(value),
     }
@@ -441,14 +667,14 @@ fn read_member(
     id: Tjs2ValueId,
     name: &str,
     flags: MemberFlags,
-    log: Option<&LogSink>,
+    root: &SharedGlobals,
 ) -> Result<Variant, ObjectError> {
     match engine.member_read_exact(id, name, flags.bits()) {
         Ok(MemberShape::Absent) => Err(ObjectError::MemberNotFound),
         Ok(MemberShape::Void) => Ok(Variant::Void),
         Ok(MemberShape::Null) => Ok(Variant::Object(Closure::null())),
         Ok(MemberShape::Object(object)) => {
-            let handle = CHandle::with_log(engine.clone(), object, log.cloned())?;
+            let handle = CHandle::with_root(engine.clone(), object, Rc::clone(root))?;
             Ok(object_value(handle))
         }
         Ok(MemberShape::Octet(bytes)) => Ok(Variant::Octet(Octet::from_vec(bytes))),
@@ -457,31 +683,167 @@ fn read_member(
     }
 }
 
+/// Retain `object` as a value the engine can hold.
+///
+/// The object is Rust-owned, so it is given an engine dictionary as its anchor
+/// and the object itself becomes the dictionary's store host. The dictionary's
+/// members are a mirror for the engine; code that reaches the anchor through
+/// the Rust bridge sees the object itself, so a class, a function or a
+/// dictionary keeps its identity after the call that produced it.
+pub fn retain_host_object(
+    engine: &Tjs2Engine,
+    object: &Rc<dyn Dispatch>,
+    globals: &SharedGlobals,
+) -> Result<DetachedValue, ObjectError> {
+    let anchor = engine
+        .new_dictionary()
+        .map_err(|_| ObjectError::CallNotServed)?;
+    let id = anchor.raw_id();
+    child_of(globals, id).set_host(Rc::clone(object));
+    mirror_object(engine, id, object, globals, &mut Vec::new())?;
+    let token = root_of(globals).register_host(Rc::clone(object));
+    engine
+        .set_member_with_flags(
+            id,
+            HOST_TOKEN,
+            (MemberFlags::HIDDEN | MemberFlags::ENSURE).bits(),
+            &TjsValue::Integer(token),
+        )
+        .map_err(|_| ObjectError::CallNotServed)?;
+    Ok(anchor)
+}
+
+/// The Rust object token an engine anchor carries, when it carries one.
+fn host_token(engine: &Tjs2Engine, id: Tjs2ValueId) -> Result<Option<i64>, ObjectError> {
+    match engine
+        .member_ignore_prop(id, HOST_TOKEN)
+        .map_err(|_refused| ObjectError::InvalidObject)?
+    {
+        TjsValue::Integer(token) => Ok(Some(token)),
+        TjsValue::Void
+        | TjsValue::Real(_)
+        | TjsValue::String(_)
+        | TjsValue::Octet(_)
+        | TjsValue::Object
+        | TjsValue::Retained(_) => Ok(None),
+    }
+}
+
+/// Copies a Rust object's members onto its engine anchor.
+fn mirror_object(
+    engine: &Tjs2Engine,
+    anchor: Tjs2ValueId,
+    object: &Rc<dyn Dispatch>,
+    globals: &SharedGlobals,
+    stack: &mut Vec<*const ()>,
+) -> Result<(), ObjectError> {
+    let pointer = Rc::as_ptr(object) as *const ();
+    if stack.contains(&pointer) {
+        return Ok(());
+    }
+    stack.push(pointer);
+    let mut members = Vec::new();
+    object
+        .enum_members(MemberFlags::NONE, &mut |name, _flags, value| {
+            members.push((name.clone(), value.clone()));
+            true
+        })
+        .map_err(|_| ObjectError::CallNotServed)?;
+    for (name, value) in members {
+        mirror_member(engine, anchor, &name, &value, globals, stack)?;
+    }
+    stack.pop();
+    Ok(())
+}
+
+/// Copies one Rust member's value onto an engine anchor.
+fn mirror_member(
+    engine: &Tjs2Engine,
+    anchor: Tjs2ValueId,
+    name: &TjsString,
+    value: &Variant,
+    globals: &SharedGlobals,
+    stack: &mut Vec<*const ()>,
+) -> Result<(), ObjectError> {
+    let member = name.to_string();
+    match value {
+        Variant::Object(closure) => match &closure.object {
+            None => {
+                let null = engine
+                    .retain_null()
+                    .map_err(|_| ObjectError::CallNotServed)?;
+                set_retained_member(engine, anchor, &member, null)
+            }
+            Some(object) => {
+                if let Some(id) = object.engine_id() {
+                    let duplicate = engine
+                        .duplicate_retained(id)
+                        .map_err(|_| ObjectError::CallNotServed)?;
+                    set_retained_member(engine, anchor, &member, duplicate)
+                } else {
+                    let nested = engine
+                        .new_dictionary()
+                        .map_err(|_| ObjectError::CallNotServed)?;
+                    let nested_id = nested.raw_id();
+                    child_of(globals, nested_id).set_host(Rc::clone(object));
+                    mirror_object(engine, nested_id, object, globals, stack)?;
+                    set_retained_member(engine, anchor, &member, nested)
+                }
+            }
+        },
+        _ => {
+            let mut keep = Vec::new();
+            let crossing = to_value(engine, value, &mut keep)?;
+            let answer = engine.set_member(anchor, &member, &crossing);
+            drop(keep);
+            answer.map_err(|_| ObjectError::CallNotServed)
+        }
+    }
+}
+
+/// Sets an engine member from a retention, consuming the retention.
+fn set_retained_member(
+    engine: &Tjs2Engine,
+    anchor: Tjs2ValueId,
+    name: &str,
+    value: DetachedValue,
+) -> Result<(), ObjectError> {
+    let id = value.raw_id();
+    let crossing = TjsValue::Retained(id.as_ptr() as u64);
+    let answer = engine.set_member(anchor, name, &crossing);
+    drop(value);
+    answer.map_err(|_| ObjectError::CallNotServed)
+}
+
 impl Dispatch for CHandle {
     fn prop_get(
         &self,
         name: &TjsString,
         flags: MemberFlags,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
-        if let Some(globals) = &self.globals {
-            if let Some(value) = globals.get(name) {
-                return Ok(value);
-            }
-            if globals.is_removed(name) {
-                return Err(ObjectError::MemberNotFound);
-            }
-            if let Some(value) = globals.native(name) {
-                return Ok(value);
-            }
+        if let Some(host) = &self.host {
+            return host.prop_get(name, flags, objthis);
+        }
+        let globals = self.entry_store();
+        if let Some(value) = globals.get(name) {
+            return Ok(value);
+        }
+        if globals.is_removed(name) {
+            return Err(ObjectError::MemberNotFound);
+        }
+        if self.global
+            && let Some(value) = globals.native(name)
+        {
+            return Ok(value);
         }
         read_member(
             &self.engine,
             self.id(),
             &name.to_string(),
             flags,
-            self.log.as_ref(),
+            &self.root,
         )
     }
 
@@ -490,24 +852,35 @@ impl Dispatch for CHandle {
         name: &TjsString,
         flags: MemberFlags,
         value: &Variant,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
         self.live()?;
+        if let Some(host) = &self.host {
+            host.prop_set(name, flags, value, objthis)?;
+            mirror_member(
+                &self.engine,
+                self.id(),
+                name,
+                value,
+                &self.root,
+                &mut Vec::new(),
+            )?;
+            return Ok(());
+        }
+        let globals = self.entry_store();
         // A value the engine cannot address lives in the handle's own store,
         // and so does any write to a name the class registry owns: the store
         // is then the one view of that name.
-        if let Some(globals) = &self.globals {
-            let unaddressable = match value {
-                Variant::Object(closure) => matches!(
-                    &closure.object,
-                    Some(object) if object.engine_id().is_none()
-                ),
-                _ => false,
-            };
-            if globals.is_native(name) || unaddressable {
-                globals.insert(name.clone(), value.clone());
-                return Ok(());
-            }
+        let unaddressable = match value {
+            Variant::Object(closure) => matches!(
+                &closure.object,
+                Some(object) if object.engine_id().is_none() || object.is_host_proxy()
+            ),
+            _ => false,
+        };
+        if (self.global && globals.is_native(name)) || unaddressable {
+            self.member_store().insert(name.clone(), value.clone());
+            return Ok(());
         }
         let mut keep = Vec::new();
         let crossing = to_value(&self.engine, value, &mut keep)?;
@@ -524,9 +897,7 @@ impl Dispatch for CHandle {
         drop(keep);
         match answer {
             Ok(()) => {
-                if let Some(globals) = &self.globals {
-                    globals.remove(name);
-                }
+                self.store().remove(name);
                 Ok(())
             }
             Err(error) if crate::is_missing_member(&error) => Err(ObjectError::MemberMustExist),
@@ -541,20 +912,29 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
         self.live()?;
-        if let Some(globals) = &self.globals {
-            let stored = globals.remove(name).is_some();
-            if globals.is_native(name) {
-                // The class object is this store's value, so deleting the name
-                // is this store's answer; the engine's copy is not the view.
-                globals.mark_removed(name);
-                return Ok(());
+        if let Some(host) = &self.host {
+            let answer = host.delete_member(name, _flags, _objthis);
+            match self.engine.delete_member(self.id(), &name.to_string()) {
+                Ok(()) => {}
+                Err(error) if crate::is_missing_member(&error) => {}
+                Err(_) => return Err(ObjectError::CallNotServed),
             }
-            if stored {
-                match self.engine.delete_member(self.id(), &name.to_string()) {
-                    Ok(()) => return Ok(()),
-                    Err(error) if crate::is_missing_member(&error) => return Ok(()),
-                    Err(_) => return Err(ObjectError::CallNotServed),
-                }
+            return answer;
+        }
+        let globals = self.entry_store();
+        let store = self.member_store();
+        let stored = store.remove(name).is_some();
+        if self.global && globals.is_native(name) {
+            // The class object is this store's value, so deleting the name is
+            // this store's answer; the engine's copy is not the view.
+            store.mark_removed(name);
+            return Ok(());
+        }
+        if stored {
+            match self.engine.delete_member(self.id(), &name.to_string()) {
+                Ok(()) => return Ok(()),
+                Err(error) if crate::is_missing_member(&error) => return Ok(()),
+                Err(_) => return Err(ObjectError::CallNotServed),
             }
         }
         match self.engine.delete_member(self.id(), &name.to_string()) {
@@ -570,6 +950,9 @@ impl Dispatch for CHandle {
         callback: &mut dyn FnMut(&TjsString, u32, &Variant) -> bool,
     ) -> Result<(), ObjectError> {
         self.live()?;
+        if let Some(host) = &self.host {
+            return host.enum_members(flags, callback);
+        }
         // The safe wrapper sorts and de-duplicates the names, so this walk is
         // not the object's own order, and the interface publishes no member
         // flags: the callback receives zero for every member.
@@ -583,23 +966,16 @@ impl Dispatch for CHandle {
             MemberFlags::NONE
         };
         let values = !flags.contains(MemberFlags::ENUM_NO_VALUE);
-        let mut extra: BTreeMap<TjsString, Variant> = self
-            .globals
-            .as_ref()
-            .map(|globals| globals.entries().into_iter().collect())
-            .unwrap_or_default();
-        if let Some(globals) = &self.globals {
+        let globals = self.entry_store();
+        let mut extra: BTreeMap<TjsString, Variant> = globals.entries().into_iter().collect();
+        if self.global {
             for (name, value) in globals.native_entries() {
                 extra.entry(name).or_insert(value);
             }
         }
         for name in names {
             let name = TjsString::from(name);
-            if self
-                .globals
-                .as_ref()
-                .is_some_and(|globals| globals.is_removed(&name))
-            {
+            if globals.is_removed(&name) {
                 continue;
             }
             let value = if let Some(value) = extra.remove(&name) {
@@ -610,7 +986,7 @@ impl Dispatch for CHandle {
                     self.id(),
                     &name.to_string(),
                     read_flags,
-                    self.log.as_ref(),
+                    &self.root,
                 )?
             } else {
                 Variant::Void
@@ -630,19 +1006,28 @@ impl Dispatch for CHandle {
     fn is_instance_of(
         &self,
         class: &TjsString,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
+        if let Some(host) = &self.host {
+            return host.is_instance_of(class, objthis);
+        }
         self.engine
             .is_instance_of(self.id(), &class.to_string())
             .map_err(|_| ObjectError::CallNotServed)
     }
 
     fn class_names(&self) -> Vec<TjsString> {
-        self.class_names.borrow().clone()
+        match &self.host {
+            Some(host) => host.class_names(),
+            None => self.class_names.borrow().clone(),
+        }
     }
 
     fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
         self.live()?;
+        if let Some(host) = &self.host {
+            return host.add_class_name(name);
+        }
         self.engine
             .add_class_name(self.id(), &name.to_string())
             .map_err(|_| ObjectError::CallNotServed)?;
@@ -654,12 +1039,24 @@ impl Dispatch for CHandle {
         Some(self.id())
     }
 
+    fn is_host_proxy(&self) -> bool {
+        self.host.is_some()
+    }
+
     fn rust_member(&self, name: &TjsString) -> Option<Variant> {
-        let globals = self.globals.as_ref()?;
-        globals.get(name).or_else(|| globals.native(name))
+        if let Some(host) = &self.host {
+            return host.rust_member(name);
+        }
+        let globals = self.entry_store();
+        globals
+            .get(name)
+            .or_else(|| self.global.then(|| globals.native(name)).flatten())
     }
 
     fn is_valid(&self) -> bool {
+        if let Some(host) = &self.host {
+            return host.is_valid() && self.valid.get();
+        }
         let Ok(valid) = self.engine.is_valid(self.id()) else {
             // The question could not be asked; the last answer the interface
             // gave is the one the handle keeps.
@@ -677,7 +1074,13 @@ impl Dispatch for CHandle {
         // invalidation whose `finalize` raised leaves nothing this adapter
         // can call.
         self.valid.set(false);
-        self.engine.invalidate_retained(self.id()).is_ok()
+        let host_changed = self.host.as_ref().is_some_and(|host| host.invalidate());
+        let engine_changed = self.engine.invalidate_retained(self.id()).is_ok();
+        host_changed || engine_changed
+    }
+
+    fn context(&self) -> Option<&crate::vm::runtime::exec::ContextObject> {
+        self.host.as_ref().and_then(|host| host.context())
     }
 
     fn func_call(
@@ -687,6 +1090,9 @@ impl Dispatch for CHandle {
         objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
+        if let Some(host) = &self.host {
+            return host.func_call(name, argv, objthis);
+        }
         let receiver = receiver_id(objthis)?;
         let mut keep = Vec::new();
         let args = arguments(&self.engine, argv, &mut keep)?;
@@ -709,7 +1115,7 @@ impl Dispatch for CHandle {
                 return Err(ObjectError::CallNotServed);
             }
         };
-        call_answer(&self.engine, answer, self.log.clone())
+        call_answer(&self.engine, answer, &self.root)
     }
 
     fn create_new(
@@ -719,6 +1125,9 @@ impl Dispatch for CHandle {
         objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
+        if let Some(host) = &self.host {
+            return host.create_new(name, argv, objthis);
+        }
         let receiver = receiver_id(objthis)?;
         let mut keep = Vec::new();
         let args = arguments(&self.engine, argv, &mut keep)?;
@@ -727,10 +1136,10 @@ impl Dispatch for CHandle {
             .create_new_answer(self.id(), &name.to_string(), &args, receiver);
         drop(keep);
         match answer.map_err(|_| ObjectError::CallNotServed)? {
-            CallAnswer::Object(object) => Ok(object_value(CHandle::with_log(
+            CallAnswer::Object(object) => Ok(object_value(CHandle::with_root(
                 self.engine.clone(),
                 object,
-                self.log.clone(),
+                Rc::clone(&self.root),
             )?)),
             CallAnswer::Null | CallAnswer::Scalar(_) => Err(ObjectError::CallNotServed),
         }
@@ -738,10 +1147,13 @@ impl Dispatch for CHandle {
 
     fn operation(
         &self,
-        _op: &TjsString,
-        _value: &Variant,
-        _objthis: Option<&dyn Dispatch>,
+        op: &TjsString,
+        value: &Variant,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
+        if let Some(host) = &self.host {
+            return host.operation(op, value, objthis);
+        }
         // The interface has no operator entry: not served, so the executor
         // applies the read-modify-write, which is the engine's own base rule.
         Ok(false)
@@ -753,6 +1165,9 @@ impl Dispatch for CHandle {
         flags: MemberFlags,
         objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
+        if let Some(host) = &self.host {
+            return host.prop_get_by_num(index, flags, objthis);
+        }
         let name = TjsString::from(&Number::Integer(index));
         self.prop_get(&name, flags, objthis)
     }
@@ -764,6 +1179,9 @@ impl Dispatch for CHandle {
         value: &Variant,
         objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
+        if let Some(host) = &self.host {
+            return host.prop_set_by_num(index, flags, value, objthis);
+        }
         let name = TjsString::from(&Number::Integer(index));
         self.prop_set(&name, flags, value, objthis)
     }

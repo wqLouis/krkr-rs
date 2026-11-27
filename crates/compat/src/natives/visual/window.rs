@@ -20,6 +20,7 @@ use crate::native_util::{
 };
 use crate::natives::event::{event_dictionary, event_object};
 use crate::natives::system::{set_string_out, value_as_bool, value_as_i64};
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::{CompatCtx, CompatError};
 use tjs::{VAL_OBJECT, VAL_VOID};
 
@@ -335,7 +336,7 @@ extern "C" fn window_ctor(
             id
         }
     };
-    // The scene borrow ends here, before `eval_retained` below: that call runs
+    // The scene borrow ends here, before the script below: that call runs
     // script, which could otherwise re-enter a `Window` member and mint a
     // second `&mut` to the same payload.
     register_window(&ctx, id, objthis);
@@ -346,14 +347,15 @@ extern "C" fn window_ctor(
     // reached when that member's `new` raises (e.g. a host removed the
     // member). A failed constructor destroys the half-built instance, so
     // `window_destroy` still removes the scene window and its registry entry.
-    match resolved
-        .engine()
-        .eval_retained("new Window.BasicDrawDevice()", "Window")
-    {
+    match ScriptScope::new(resolved.engine(), &ctx).eval(
+        "new Window.BasicDrawDevice()",
+        "Window",
+        ScriptOptions::default(),
+    ) {
         Ok(RetainedValue::Object(object)) => {
             // SAFETY: `instance` is the `WindowInst` boxed by `window_create`;
-            // this write runs after `eval_retained` returned, so the borrow
-            // never spans a call that could re-enter the VM.
+            // this write runs after the script returned, so the borrow never
+            // spans a call that could re-enter the VM.
             unsafe { &mut *(instance as *mut WindowInst) }.draw_device = Some(object);
         }
         Ok(RetainedValue::Value(_)) | Err(_) => {
@@ -361,7 +363,7 @@ extern "C" fn window_ctor(
         }
     }
     // SAFETY: `instance` is the `WindowInst` boxed by `window_create`; this
-    // write runs after `eval_retained` returned, so no borrow spans the call.
+    // write runs after the script returned, so no borrow spans the call.
     unsafe { &mut *(instance as *mut WindowInst) }.attached = true;
     set_int(out, i64::from(id));
     0
@@ -2217,7 +2219,7 @@ extern "C" fn window_menu_get(
     out_error: *mut *mut c_char,
     objthis: *mut c_void,
 ) -> c_int {
-    let Ok((resolved, _ctx)) = bound(engine) else {
+    let Ok((resolved, ctx)) = bound(engine) else {
         return report_error(out_error, "Window.menu: compat context is not bound");
     };
     // The reference reads `objthis->HWND` and reports `TJS_E_INVALIDOBJECT`
@@ -2233,11 +2235,13 @@ extern "C" fn window_menu_get(
         // `TVPCreateMenuItemObject(objthis)`: the first argument is the action
         // owner and the second is the window (reference
         // `reference/cpp/core/visual/MenuItemIntf.cpp:559-573`).
-        let object = match host.eval_retained_with_context(
+        let object = match ScriptScope::new(host, &ctx).eval(
             "new MenuItem(this, this)",
             "Window.menu",
-            objthis,
-            0,
+            ScriptOptions {
+                context: objthis,
+                lineofs: 0,
+            },
         ) {
             Ok(RetainedValue::Object(object)) => object,
             Ok(_) => {
@@ -2245,7 +2249,7 @@ extern "C" fn window_menu_get(
             }
             Err(error) => return report_error(out_error, &format!("Window.menu: {error}")),
         };
-        // SAFETY: as above; the eval above runs no code that reads or writes
+        // SAFETY: as above; the script above runs no code that reads or writes
         // this `WindowInst`, and no borrow is held across it.
         let inst = unsafe { &mut *(instance as *mut WindowInst) };
         if inst.menu_root.is_none() {

@@ -155,6 +155,7 @@ use crate::native_util::{
 use crate::natives::construct;
 use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out, value_as_bool, value_as_i64};
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError, CompatServices};
 
@@ -715,8 +716,8 @@ fn set_retained_out(out: *mut Value, id: Tjs2ValueId) {
 
 /// Evaluate `expr` and return the resulting object, retained; `None` when the
 /// expression did not yield an object.
-fn eval_object(host: &Tjs2Engine, expr: &str, what: &str) -> Option<DetachedValue> {
-    match host.eval_retained(expr, what) {
+fn eval_object(scripts: &ScriptScope<'_>, expr: &str, what: &str) -> Option<DetachedValue> {
+    match scripts.eval(expr, what, ScriptOptions::default()) {
         Ok(RetainedValue::Object(object)) => Some(object),
         Ok(_) => None,
         Err(error) => {
@@ -2511,6 +2512,7 @@ extern "C" fn sound_flags_get(
     with_sound!(engine, instance, "flags", out_error, |ctx, services, id| {
         // SAFETY: the caller resolved `ctx` from the installed binding.
         let host = unsafe { ctx.engine() };
+        let scripts = ScriptScope::new(host, &ctx);
         // Reference `GetWaveFlagsObjectNoAddRef`: one proxy per buffer,
         // built from the owning buffer and cached.
         let cached = with_object(services, id, |object, _mixer| {
@@ -2521,7 +2523,7 @@ extern "C" fn sound_flags_get(
             Some(raw) => raw,
             None => {
                 let object = match eval_object(
-                    host,
+                    &scripts,
                     &format!("new WaveFlags({id})"),
                     "WaveSoundBuffer.flags",
                 ) {
@@ -3407,12 +3409,13 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // name and alias it onto the class, keeping the global namespace clean.
     phase_vocoder::register(ctx)?;
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
-    unsafe { ctx.engine() }
-        .exec_script(
+    ScriptScope::new(unsafe { ctx.engine() }, ctx)
+        .run(
             "if(typeof WaveSoundBuffer.PhaseVocoder == \"undefined\"){\
                  WaveSoundBuffer.PhaseVocoder = __TvpPhaseVocoder;\
              }",
             "WaveSoundBuffer_PhaseVocoder",
+            ScriptOptions::default(),
         )
         .map_err(|error| {
             CompatError::Register(format!("register WaveSoundBuffer.PhaseVocoder: {error}"))

@@ -608,8 +608,7 @@ loader allocates the source positions with `new[]`
 `TJS_free` (`reference/…/tjsInterCodeGen.cpp:403-404`) — a mismatched
 allocator pair that the reference only survives because the bytecode path
 rarely carries source positions. The adapter must allocate them with
-`TJS_malloc`, so that the pair matches. (The vendored tree already made
-this correction in its loader: `crates/tjs/cpp/tjs2/tjsByteCodeLoader.cpp:317`.)
+`TJS_malloc`, so that the pair matches.
 
 **Why the C++ may not borrow.** The context frees its buffers in `Finalize`
 (`reference/…/tjsInterCodeGen.cpp:373-413`), which runs when the block is
@@ -974,7 +973,6 @@ The differences that bear on this design (the reference wins):
 | `parser::error` now raises instead of only logging | `crates/tjs/cpp/tjs2/tjsInterCodeGen.cpp:46-56` | the vendored tree aborts the parse on a grammar error; the reference recovers and counts the errors (§5.1, P-list / §1.3's `tjs2_script_error_count`). The Rust entry must reproduce the **reference's** behaviour, and the vendored patch's behaviour is a divergence to reconcile. |
 | the block grew `SetSourceText` and the bytecode format grew a `SRCS` section | `crates/tjs/cpp/tjs2/tjsScriptBlock.h:96`, `crates/tjs/cpp/tjs2/tjsScriptBlock.cpp:201-233`, `:551-553` | the vendored bytecode format is **not** the reference's. It does not change the live path's shape, but the adapter must not assume the reference's file format. |
 | the context grew `GetSourcePosArray`, `GetSourcePosArraySize` and `SetSourcePosArray` | `crates/tjs/cpp/tjs2/tjsInterCodeGen.h:762-779` | these exist for the vendored bytecode writer; the adapter does not need them (it writes the table straight into the constructor). |
-| the bytecode loader allocates the source positions with `TJS_malloc` instead of `new[]` | `crates/tjs/cpp/tjs2/tjsByteCodeLoader.cpp:317` (the reference uses `new[]` at `reference/…/tjsByteCodeLoader.cpp:218`, which `Finalize` frees with `TJS_free` — a mismatched pair) | the vendored tree is right; the adapter must use `TJS_malloc` for the source positions (§4.3) |
 | the null-safe string-length helper | `crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:55-70` | an unrelated hardening; no effect. |
 | `TJSVariantStringChars` instead of `*str` at the property calls | `crates/tjs/cpp/tjs2/tjsInterCodeExec.cpp:1517`, `:1577`, `:1653` | unrelated; no effect. |
 

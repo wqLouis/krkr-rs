@@ -63,6 +63,7 @@ use crate::native_util::{
 use crate::natives::construct;
 use crate::natives::event::event_object;
 use crate::natives::system::{resolve, set_string_out, try_value_as_i64, value_as_bool};
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -372,12 +373,15 @@ fn window_can_deliver(host: &Tjs2Engine, window: Tjs2ValueId) -> bool {
 /// after a delivered click, call the script global `kag`'s
 /// `saveSystemVariables()` when present. Every failure is swallowed, like
 /// the reference's `catch(...)`.
-fn do_save_system_variables(host: &Tjs2Engine) {
-    let kag = match host.eval_retained("kag", "MenuItem.saveSystemVariables") {
+fn do_save_system_variables(scripts: &ScriptScope<'_>) {
+    let kag = match scripts.eval("kag", "MenuItem.saveSystemVariables", ScriptOptions::default()) {
         Ok(RetainedValue::Object(kag)) => kag,
         _ => return,
     };
-    if let Err(error) = host.call_member(kag.raw_id(), "saveSystemVariables", &[]) {
+    if let Err(error) = scripts
+        .engine()
+        .call_member(kag.raw_id(), "saveSystemVariables", &[])
+    {
         log::debug!("MenuItem: kag.saveSystemVariables: {error}");
     }
 }
@@ -920,7 +924,7 @@ extern "C" fn menu_item_fire_click(
     }
     if object.is_some() {
         // Reference `TVPDoSaveSystemVariables()` (`MenuItemIntf.cpp:215`).
-        do_save_system_variables(host);
+        do_save_system_variables(&ScriptScope::new(host, &ctx));
     }
     set_void(out);
     0

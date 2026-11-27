@@ -13,6 +13,7 @@
 //! dictionary (the script's only non-scalar member, `ScriptMgnIntf.cpp:331`)
 #![allow(unsafe_code)]
 
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::{CompatCtx, CompatError};
 
 /// The TVP global-constants script, evaluated once at engine setup.
@@ -25,8 +26,12 @@ const CONSTANTS_SCRIPT: &str = r#"const bsNone=0, bsSingle=1, bsSizeable=2, bsDi
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine, and the
     // host calls `register_all` once during install.
-    unsafe { ctx.engine() }
-        .exec_script(CONSTANTS_SCRIPT, "TVP_global_constants")
+    ScriptScope::new(unsafe { ctx.engine() }, ctx)
+        .run(
+            CONSTANTS_SCRIPT,
+            "TVP_global_constants",
+            ScriptOptions::default(),
+        )
         .map_err(|e| CompatError::Engine(format!("TVP global constants: {e}")))?;
     Ok(())
 }

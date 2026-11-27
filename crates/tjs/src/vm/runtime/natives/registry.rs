@@ -211,7 +211,21 @@ impl Dispatch for ClassObject {
                 self.class.get(&name).unwrap_or(Variant::Void)
             };
             if !callback(&name, 0, &value) {
-                break;
+                return Ok(());
+            }
+        }
+        // The class-name constructor is a member of the class object, so a
+        // member walk publishes it even though the module's table does not
+        // list it.
+        let class_name = TjsString::from(self.class.name());
+        if !seen.contains(&class_name) {
+            let value = if flags.contains(MemberFlags::ENUM_NO_VALUE) {
+                Variant::Void
+            } else {
+                refused_method()
+            };
+            if !callback(&class_name, 0, &value) {
+                return Ok(());
             }
         }
         Ok(())

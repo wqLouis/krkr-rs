@@ -426,67 +426,6 @@ public:
 // Binary stream (in-memory, read-only)
 // ---------------------------------------------------------------------------
 
-// Wraps a caller-owned byte range so the VM's stream-based
-// `tTJS::LoadByteCode` can run on bytes that are already in memory. The
-// range is borrowed, not copied: the stream must not outlive it.
-class MemoryBinaryStream : public TJS::tTJSBinaryStream {
-    const tjs_uint8 *data;
-    tjs_uint64 len;
-    tjs_int64 pos;
-
-public:
-    MemoryBinaryStream(const void *buffer, size_t length)
-        : data(static_cast<const tjs_uint8 *>(buffer)), len((tjs_uint64)length),
-          pos(0) {}
-
-    // The base class implements GetPosition() as Seek(0, SEEK_CUR), so Seek
-    // returns the new position itself instead of calling GetPosition().
-    tjs_uint64 Seek(tjs_int64 offset, tjs_int whence) override {
-        tjs_int64 base;
-        switch(whence) {
-            case SEEK_SET:
-                base = 0;
-                break;
-            case SEEK_CUR:
-                base = pos;
-                break;
-            case SEEK_END:
-                base = (tjs_int64)len;
-                break;
-            default:
-                return (tjs_uint64)pos;
-        }
-        tjs_int64 next = base + offset;
-        if(next < 0)
-            next = 0;
-        if(next > (tjs_int64)len)
-            next = (tjs_int64)len;
-        pos = next;
-        return (tjs_uint64)pos;
-    }
-
-    tjs_uint Read(void *buffer, tjs_uint read_size) override {
-        if(!buffer || pos >= (tjs_int64)len)
-            return 0;
-        tjs_uint64 available = len - (tjs_uint64)pos;
-        tjs_uint count =
-            read_size < available ? read_size : (tjs_uint)available;
-        std::memcpy(buffer, data + pos, count);
-        pos += count;
-        return count;
-    }
-
-    tjs_uint Write(const void * /*buffer*/, tjs_uint /*write_size*/) override {
-        return 0;
-    }
-
-    tjs_uint64 GetSize() override { return len; }
-};
-
-TJS::tTJSBinaryStream *tjs2_create_memory_stream(const void *data, size_t len) {
-    return new MemoryBinaryStream(data, len);
-}
-
 // A read-only binary stream owning the bytes it serves: a storage entry the
 // compat read callback returned. The reference hands out a seekable
 // archive-member stream; reading the whole entry into memory is the port's

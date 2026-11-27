@@ -19,6 +19,8 @@
 //! | the interpreter | [`exec`] | the frame and the instructions a compiled block runs |
 //! | the engine adapter | [`bridge`] | an object the engine owns, seen as a dispatch object |
 //! | the script entry | [`engine`] | script text in, the top-level call out |
+//! | the held values | [`retained`] | the ids that name the values an engine keeps |
+//! | the engine object | [`engine_core`] | the global scope, the held values and the compiled scripts |
 //!
 //! Every part of the runtime is safe Rust: a value owns its storage and is
 //! borrowed or cloned, never passed as a handle a caller must free. The two
@@ -55,6 +57,7 @@ pub mod array;
 pub mod bridge;
 pub mod dictionary;
 pub mod engine;
+pub mod engine_core;
 pub mod exec;
 pub mod hash;
 pub mod member;
@@ -63,6 +66,7 @@ pub mod number;
 pub mod object;
 pub mod octet;
 pub mod octet_pack;
+pub mod retained;
 pub mod string;
 pub mod variant;
 

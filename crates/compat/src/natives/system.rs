@@ -84,6 +84,7 @@ use crate::natives::visual::{
     COLOR_KEY_NONE, PendingLoad, load_cached_storage_image, resolve_pending_load,
     submit_pending_load,
 };
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::{CompatCtx, CompatError, CompatServices};
 
 // ---------------------------------------------------------------------------
@@ -2682,7 +2683,11 @@ fn read_register_value(ctx: &CompatCtx, key: &str) -> Result<Option<RetainedValu
     );
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
-    match engine.eval_retained(&script, "System.readRegValue") {
+    match ScriptScope::new(engine, ctx).eval(
+        &script,
+        "System.readRegValue",
+        ScriptOptions::default(),
+    ) {
         Ok(value) => Ok(Some(value)),
         Err(e) => {
             log::debug!("System.readRegValue({key:?}): {e}");
@@ -2932,8 +2937,9 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // `MEMBERMUSTEXIST` lookups succeed.
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let host = unsafe { ctx.engine() };
+    let scripts = ScriptScope::new(host, ctx);
     if let (Ok(RetainedValue::Object(class)), Ok(null)) = (
-        host.eval_retained("System", "System.defaults"),
+        scripts.eval("System", "System.defaults", ScriptOptions::default()),
         host.retain_null(),
     ) {
         for name in ["exceptionHandler", "onActivate", "onDeactivate"] {

@@ -224,14 +224,6 @@ truncated, or shorter than the reference's fixed header.
 5. **Debug-only diagnostics** (not script-observable): the `script read …`
    line and the failure excerpt, which shows the failing line's source window
    capped at 8192 bytes.
-6. **A Rust-owned object answer cannot cross the native result.** An
-   `evalStorage` of a dictionary literal, or a script that returns a class or
-   function object, raises the typed "object with no engine handle" refusal.
-   A class or function a storage declares is visible to later Rust script
-   entries through the shared global store, but not to a script still running
-   in the vendored executor. Closing this needs a bridge that lets a
-   non-global engine object carry Rust-owned members.
-
 ---
 
 ## 9. Related documents

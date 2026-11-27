@@ -582,7 +582,7 @@ fn script_globals(services: Option<&CompatServices>) -> SharedGlobals {
 }
 
 /// The failure a text script entry can raise.
-enum TextScriptError {
+pub(crate) enum TextScriptError {
     /// The executor refused the script.
     Run(runtime_engine::ScriptFailure),
     /// The executor's answer cannot cross back into the engine.
@@ -600,7 +600,7 @@ impl std::fmt::Display for TextScriptError {
 
 /// The options a script entry runs with: its `this`, line offset and result
 /// need.
-fn script_options(
+pub(crate) fn script_options(
     context: *mut c_void,
     lineofs: i32,
     result_needed: bool,
@@ -617,7 +617,7 @@ fn script_options(
 /// `expression` selects the expression entry. The options carry the script's
 /// `this` and its reported line offset; a non-null context keeps the object
 /// alive for the call and hands it to the top-level context as its receiver.
-fn run_text(
+pub(crate) fn run_text(
     engine: &Tjs2Engine,
     source: &str,
     block_name: &str,
@@ -644,9 +644,8 @@ fn run_text(
         )
     };
     match answer {
-        Ok(answer) => {
-            runtime_engine::retained_value(engine, answer).map_err(TextScriptError::Answer)
-        }
+        Ok(answer) => runtime_engine::retained_value_with_members(engine, answer, globals)
+            .map_err(TextScriptError::Answer),
         Err(failure) => Err(TextScriptError::Run(failure)),
     }
 }

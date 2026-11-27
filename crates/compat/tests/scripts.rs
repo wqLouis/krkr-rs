@@ -801,8 +801,7 @@ fn exec_storage_refuses_compiled_bytecode() {
         "data/bytecode.tjsb",
     );
     let bytes = std::fs::read(env.game_dir().unwrap().join(&compiled)).unwrap();
-    // The writer emits the TJS2 bytecode tag `TJS2100\0`
-    // (`TJS::tTJSByteCodeLoader::FILE_TAG_LE`/`VER_TAG_LE`).
+    // The writer emits the container's own tag.
     assert_eq!(&bytes[..8], b"TJS2100\0", "compiled bytecode tag");
 
     let error = env.error(&format!("Scripts.execStorage({compiled:?});"));
@@ -1040,8 +1039,10 @@ fn eval_storage_runs_a_script_shaped_storage() {
     )
     .expect("write the storage");
     env.eval_ok("Scripts.evalStorage('macro_SliderLayer.tjs')");
+    // The later script is a compatibility script, so it runs through the Rust
+    // executor that shares the global store the declaration wrote.
     assert_eq!(
-        env.eval_ok("typeof SKN_Slider"),
+        env.eval_ok("Scripts.eval('typeof SKN_Slider')"),
         TjsValue::String("Object".into())
     );
 }
