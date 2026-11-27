@@ -37,6 +37,7 @@
 pub mod codegen;
 pub mod commands;
 pub mod lexer;
+mod onig;
 pub mod parser;
 pub mod runtime;
 mod stats;
@@ -150,6 +151,23 @@ fn failed(message: &str) -> *mut tjs2_script {
 pub fn compile(script: &str, name: &str) -> Result<Image, ParseError> {
     let units: Vec<u16> = script.encode_utf16().collect();
     let compiled = guard(|| compile_units(&units, false, false, &[], Some(name)))
+        .map_err(|message| ParseError::Generator { message })?;
+    compiled.into_image()
+}
+
+/// Compiles an expression into the image of its block.
+///
+/// The text is one expression, and the block keeps the value it produces.
+/// `name` labels the block as [`compile`] does.
+///
+/// # Errors
+///
+/// The first failure the front end reported, with its position. A panic in the
+/// image builder is reported as [`ParseError::Generator`] with the panic's
+/// text.
+pub(crate) fn compile_expression(expression: &str, name: &str) -> Result<Image, ParseError> {
+    let units: Vec<u16> = expression.encode_utf16().collect();
+    let compiled = guard(|| compile_units(&units, true, true, &[], Some(name)))
         .map_err(|message| ParseError::Generator { message })?;
     compiled.into_image()
 }

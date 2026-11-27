@@ -81,7 +81,7 @@ pub enum Raise {
     Convert {
         /// The value the conversion was asked of.
         value: Box<Variant>,
-        /// The kind the conversion asked for, in the variant's own label.
+        /// The kind the conversion asked for, in the target word.
         to: &'static str,
     },
     /// A divisor of zero.
@@ -110,6 +110,14 @@ pub enum Raise {
         /// The member the call named, or nothing when it named none.
         name: TjsString,
     },
+    /// A member's call gives a number of parameters it does not accept.
+    ParameterCount,
+    /// A member's call gives a parameter the rule cannot use.
+    InvalidParameter,
+    /// A member's format string is not one it can read.
+    FormatString,
+    /// A call expands a value that is not an array.
+    NotAnArray,
     /// The text a compile instruction holds does not compile.
     ///
     /// The message is the front end's own, so a handler that reads it reads what
@@ -146,6 +154,10 @@ impl PartialEq for Raise {
             (Self::AccessDenied, Self::AccessDenied) => true,
             (Self::RangeError, Self::RangeError) => true,
             (Self::NotCallable { name: left }, Self::NotCallable { name: right }) => left == right,
+            (Self::ParameterCount, Self::ParameterCount) => true,
+            (Self::InvalidParameter, Self::InvalidParameter) => true,
+            (Self::FormatString, Self::FormatString) => true,
+            (Self::NotAnArray, Self::NotAnArray) => true,
             (Self::ScriptError { message: left }, Self::ScriptError { message: right }) => {
                 left == right
             }
@@ -331,6 +343,7 @@ impl Machine {
         argv: &[Variant],
     ) -> Result<Variant, Fault> {
         self.run_frame(code, None, receiver, argv)
+            .map_err(throw::Unwind::fault)
     }
 
     /// Runs one call of a context object's own code.
@@ -349,6 +362,20 @@ impl Machine {
         self.call_context(context, receiver, argv)
     }
 
+    /// Runs one call of a context object's own code, keeping the trace.
+    ///
+    /// The caller that reports an uncaught failure needs the frames it passed;
+    /// [`Self::run_context`] answers only the fault, which is what a caller that
+    /// catches or reports the failure without a trace needs.
+    pub fn run_context_traced(
+        &mut self,
+        context: &ContextObject,
+        receiver: Option<Rc<dyn Dispatch>>,
+        argv: &[Variant],
+    ) -> Result<Variant, throw::Unwind> {
+        self.run_frame(context.code(), Some(context), receiver, argv)
+    }
+
     /// Runs one call of a context object's code from inside this machine.
     ///
     /// A call instruction runs the code of the value it calls while it is itself
@@ -361,6 +388,7 @@ impl Machine {
         argv: &[Variant],
     ) -> Result<Variant, Fault> {
         self.run_frame(context.code(), Some(context), receiver, argv)
+            .map_err(throw::Unwind::fault)
     }
 
     /// Runs one call of `code` in a frame of its own.
@@ -375,7 +403,7 @@ impl Machine {
         context: Option<&ContextObject>,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
-    ) -> Result<Variant, Fault> {
+    ) -> Result<Variant, throw::Unwind> {
         // the scope a context's own code runs in: the receiver the call hands it,
         // and the global object when a top-level context is handed none
         let top_level = context.is_some_and(|context| context.kind() == ContextType::TopLevel);
@@ -387,7 +415,7 @@ impl Machine {
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
         let answer = self.execute(code, &mut frame, argv, context, 0);
         self.blocks.borrow_mut().release(frame.into_block());
-        answer.map_err(throw::Unwind::fault)
+        answer
     }
 
     /// Executes the code stream from `start` to its return.
@@ -663,12 +691,14 @@ impl Machine {
             .ok_or(Fault::Broken("an evaluated script has no top level"))?;
         // the scope the text runs in is this frame's receiver, which the frame
         // entry turns into the global object when the frame has none
-        let answer = self.run_frame(
-            top.object().code(),
-            Some(top.object()),
-            frame.receiver(),
-            &[],
-        )?;
+        let answer = self
+            .run_frame(
+                top.object().code(),
+                Some(top.object()),
+                frame.receiver(),
+                &[],
+            )
+            .map_err(throw::Unwind::fault)?;
         Ok(result_needed.then_some(answer))
     }
 
@@ -1422,7 +1452,7 @@ mod tests {
         let answer = machine.run(&code, None, &[]);
         assert!(matches!(
             answer,
-            Err(Fault::Raised(Raise::Convert { to: "String", .. }))
+            Err(Fault::Raised(Raise::Convert { to: "string", .. }))
         ));
     }
 

@@ -29,12 +29,18 @@ pub enum VmError {
     /// The message names the engine's own reason; no script has run yet.
     #[error("vm: {0}")]
     Vm(String),
-    /// A script failed to compile or to run.
+    /// A script answer could not cross the VM boundary.
     ///
-    /// The message is the engine's own: it carries the block name and the
-    /// line the failure happened on.
+    /// The message names the shape the host refused, so the failure is not
+    /// reported as an empty value.
     #[error("script: {0}")]
     Script(String),
+    /// The Rust executor refused the script or its answer.
+    ///
+    /// The error is the executor's own typed failure: a compile, a block
+    /// build, a code fault, or an object entry.
+    #[error("engine: {0}")]
+    Engine(#[from] tjs::vm::runtime::engine::EngineError),
     /// The compatibility surface failed.
     ///
     /// The message names the native registration, the engine operation or

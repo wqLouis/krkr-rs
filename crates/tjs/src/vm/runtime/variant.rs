@@ -166,6 +166,28 @@ impl Variant {
         }
     }
 
+    /// The value in the engine's readable form, as a message quotes it.
+    ///
+    /// The kind is written in parentheses and the value after it, and an
+    /// object is written as its form. The text is cut to 512 code units; a cut
+    /// text ends in `...`.
+    pub fn readable(&self) -> TjsString {
+        let form = match self {
+            Self::Void => TjsString::from("()"),
+            Self::Integer(value) => TjsString::from(format!("(int){value}")),
+            Self::Real(value) => TjsString::from(format!("(real){}", Number::Real(*value))),
+            Self::String(text) => {
+                let mut form: Vec<u16> = "(string)\"".encode_utf16().collect();
+                form.extend_from_slice(text.escape_c().as_utf16());
+                form.push(u16::from(b'"'));
+                TjsString::from(form)
+            }
+            Self::Octet(octet) => TjsString::from(format!("(octet)<% {octet} %>")),
+            Self::Object(closure) => TjsString::from(format!("(object){}", closure.form())),
+        };
+        trim_readable(form)
+    }
+
     /// The value as a text.
     ///
     /// The empty variant is the empty text, a number is its text, a text is
@@ -177,7 +199,9 @@ impl Variant {
             Self::Integer(value) => Ok(TjsString::from(&Number::Integer(*value))),
             Self::Real(value) => Ok(TjsString::from(&Number::Real(*value))),
             Self::String(text) => Ok(text.clone()),
-            Self::Octet(_) => Err(VariantError::Convert { to: "String" }),
+            Self::Octet(_) => Err(VariantError::Convert {
+                to: Target::Text.name(),
+            }),
             Self::Object(closure) => Ok(closure.form()),
         }
     }
@@ -196,27 +220,35 @@ impl Variant {
             Self::String(text) => match text.to_number() {
                 Ok(number) => Ok(number),
                 Err(NumberError::NotANumber) => Ok(Number::Integer(0)),
-                Err(NumberError::RealOutOfRange) => Err(VariantError::Convert { to: "number" }),
+                Err(NumberError::RealOutOfRange) => Err(VariantError::Convert {
+                    to: Target::Number.name(),
+                }),
             },
-            Self::Octet(_) => Err(VariantError::Convert { to: "number" }),
+            Self::Octet(_) => Err(VariantError::Convert {
+                to: Target::Number.name(),
+            }),
             Self::Object(_) => Err(VariantError::Convert {
-                to: "Integer or Real",
+                to: Target::Number.name(),
             }),
         }
     }
 
     /// The value as an integer, with a real truncated toward zero.
     pub fn to_integer(&self) -> Result<i64, VariantError> {
-        if matches!(self, Self::Object(_)) {
-            return Err(VariantError::Convert { to: "Integer" });
+        if matches!(self, Self::Object(_) | Self::Octet(_)) {
+            return Err(VariantError::Convert {
+                to: Target::Integer.name(),
+            });
         }
         integer_of(self.to_number()?)
     }
 
     /// The value as a real.
     pub fn to_real(&self) -> Result<f64, VariantError> {
-        if matches!(self, Self::Object(_)) {
-            return Err(VariantError::Convert { to: "Real" });
+        if matches!(self, Self::Object(_) | Self::Octet(_)) {
+            return Err(VariantError::Convert {
+                to: Target::Real.name(),
+            });
         }
         Ok(self.to_number()?.to_real())
     }
@@ -230,7 +262,9 @@ impl Variant {
             Self::Void => Ok(Octet::new()),
             Self::Octet(octet) => Ok(octet.clone()),
             Self::Integer(_) | Self::Real(_) | Self::String(_) | Self::Object(_) => {
-                Err(VariantError::Convert { to: "Octet" })
+                Err(VariantError::Convert {
+                    to: Target::Octet.name(),
+                })
             }
         }
     }
@@ -379,7 +413,7 @@ impl Variant {
             Self::Real(value) => Ok(Self::Real(value + 1.0)),
             Self::String(_) => Self::from(self.to_number()?).increment(),
             Self::Octet(_) | Self::Object(_) => Err(VariantError::Convert {
-                to: "Integer or Real",
+                to: Target::Number.name(),
             }),
         }
     }
@@ -396,7 +430,7 @@ impl Variant {
             Self::Real(value) => Ok(Self::Real(value - 1.0)),
             Self::String(_) => Self::from(self.to_number()?).decrement(),
             Self::Octet(_) | Self::Object(_) => Err(VariantError::Convert {
-                to: "Integer or Real",
+                to: Target::Number.name(),
             }),
         }
     }
@@ -486,8 +520,74 @@ fn integer_of(number: Number) -> Result<i64, VariantError> {
     match number.to_integer() {
         Ok(integer) => Ok(integer),
         Err(NumberError::RealOutOfRange) => Err(VariantError::IntegerOutOfRange),
-        Err(NumberError::NotANumber) => Err(VariantError::Convert { to: "Integer" }),
+        Err(NumberError::NotANumber) => Err(VariantError::Convert {
+            to: Target::Integer.name(),
+        }),
     }
+}
+
+/// The kind a refused conversion names as its target.
+///
+/// The words are the engine's: `int`, `real`, `string`, `octet`, `int/real`
+/// and `Object`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Target {
+    /// An integer.
+    Integer,
+    /// A real number.
+    Real,
+    /// A text.
+    Text,
+    /// A byte string.
+    Octet,
+    /// A number: an integer or a real.
+    Number,
+    /// An object.
+    Object,
+}
+
+impl Target {
+    /// The word the engine's message names the kind with.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Integer => "int",
+            Self::Real => "real",
+            Self::Text => "string",
+            Self::Octet => "octet",
+            Self::Number => "int/real",
+            Self::Object => "Object",
+        }
+    }
+}
+
+impl fmt::Display for Target {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.name())
+    }
+}
+
+/// The message of a division by zero.
+pub(crate) const DIVISION_BY_ZERO_MESSAGE: &str = "Division by zero";
+
+/// The greatest number of code units the readable form of a value keeps.
+const READABLE_LENGTH: usize = 512;
+
+/// Cuts a readable form to the engine's length, with an ellipsis.
+pub(crate) fn trim_readable(text: TjsString) -> TjsString {
+    if text.len() <= READABLE_LENGTH {
+        return text;
+    }
+    let mut units: Vec<u16> = text.as_utf16()[..READABLE_LENGTH - 3].to_vec();
+    units.extend("...".encode_utf16());
+    TjsString::from(units)
+}
+
+/// The message a refused conversion raises.
+///
+/// The value is already in its readable form, and the target is the kind the
+/// conversion asked for.
+pub fn conversion_message(value: &str, target: &str) -> String {
+    format!("Cannot convert the variable type ({value} to {target})")
 }
 
 /// The shift count the hardware uses: the low six bits of the count.
@@ -502,7 +602,7 @@ pub enum VariantError {
     /// The value has no representation of the kind a conversion asked for.
     #[error("the value cannot be converted to {to}")]
     Convert {
-        /// The kind the conversion asked for.
+        /// The kind the conversion asked for, in the target word.
         to: &'static str,
     },
     /// A division or a remainder has a divisor of zero.
@@ -518,7 +618,7 @@ mod tests {
     use std::cmp::Ordering;
     use std::rc::Rc;
 
-    use super::{Closure, Dispatch, Variant, VariantError};
+    use super::{Closure, Dispatch, Target, Variant, VariantError, conversion_message};
     use crate::vm::runtime::number::Number;
     use crate::vm::runtime::object::{MemberFlags, ObjectError};
     use crate::vm::runtime::octet::Octet;
@@ -678,11 +778,80 @@ mod tests {
         assert!(Variant::from("a").to_octet().is_err());
         assert_eq!(
             value.to_string(),
-            Err(VariantError::Convert { to: "String" })
+            Err(VariantError::Convert {
+                to: Target::Text.name()
+            })
         );
         assert!(value.to_number().is_err());
-        assert!(value.to_integer().is_err());
-        assert!(value.to_real().is_err());
+        assert_eq!(
+            value.to_integer(),
+            Err(VariantError::Convert {
+                to: Target::Integer.name()
+            })
+        );
+        assert_eq!(
+            value.to_real(),
+            Err(VariantError::Convert {
+                to: Target::Real.name()
+            })
+        );
+    }
+
+    /// The readable form is the engine's: the kind in parentheses and the
+    /// value after it, trimmed to 512 units with an ellipsis, and the null
+    /// object's form is the deterministic `(object 0x0:0x0)`.
+    ///
+    /// reference/cpp/core/tjs2/tjsUtils.cpp:78-90
+    /// reference/cpp/core/tjs2/tjsUtils.cpp:111-173
+    #[test]
+    fn the_readable_form_is_the_engines() {
+        assert_eq!(Variant::Void.readable(), TjsString::from("()"));
+        assert_eq!(Variant::Integer(1).readable(), TjsString::from("(int)1"));
+        assert_eq!(Variant::Real(1.5).readable(), TjsString::from("(real)1.5"));
+        assert_eq!(
+            Variant::from("a\n").readable(),
+            TjsString::from("(string)\"a\\n\"")
+        );
+        assert_eq!(
+            Variant::from(Octet::from_slice(&[1])).readable(),
+            TjsString::from("(octet)<% 01 %>")
+        );
+        assert_eq!(
+            Variant::Object(Closure::null()).readable(),
+            TjsString::from("(object)(object 0x0:0x0)")
+        );
+
+        let long = Variant::from(Octet::from_slice(&[1; 174])).readable();
+        let expected = format!("(octet)<% {}0...", "01 ".repeat(166));
+        assert_eq!(long, TjsString::from(expected));
+        assert_eq!(long.len(), 512);
+    }
+
+    /// A refused conversion's message quotes the value and the target word,
+    /// and the target `Object` keeps its capital.
+    ///
+    /// reference/cpp/core/tjs2/tjsVariant.cpp:146-163
+    /// reference/cpp/core/tjs2/tjsError.h:250-253
+    #[test]
+    fn a_conversion_message_names_the_value_and_the_target() {
+        let null = Variant::Object(Closure::null());
+        assert_eq!(
+            conversion_message(&null.readable().to_string(), Target::Real.name()),
+            "Cannot convert the variable type ((object)(object 0x0:0x0) to real)"
+        );
+        assert_eq!(
+            conversion_message(&null.readable().to_string(), Target::Object.name()),
+            "Cannot convert the variable type ((object)(object 0x0:0x0) to Object)"
+        );
+        assert_eq!(
+            conversion_message(
+                &Variant::from(Octet::from_slice(&[1]))
+                    .readable()
+                    .to_string(),
+                Target::Text.name()
+            ),
+            "Cannot convert the variable type ((octet)<% 01 %> to string)"
+        );
     }
 
     /// An object's text is its form: the two handles it carries, and `0x0`
@@ -715,14 +884,21 @@ mod tests {
         assert_eq!(
             value.to_number(),
             Err(VariantError::Convert {
-                to: "Integer or Real"
+                to: Target::Number.name()
             })
         );
         assert_eq!(
             value.to_integer(),
-            Err(VariantError::Convert { to: "Integer" })
+            Err(VariantError::Convert {
+                to: Target::Integer.name()
+            })
         );
-        assert_eq!(value.to_real(), Err(VariantError::Convert { to: "Real" }));
+        assert_eq!(
+            value.to_real(),
+            Err(VariantError::Convert {
+                to: Target::Real.name()
+            })
+        );
         let null = Variant::Object(Closure::null());
         assert!(null.to_number().is_err());
         assert!(null.to_integer().is_err());
@@ -929,7 +1105,15 @@ mod tests {
         assert_eq!(answered(Variant::from("5").increment()), "Integer: 6");
         assert_eq!(answered(Variant::from("1.5").decrement()), "Real: 0.5");
         assert_eq!(answered(Variant::Real(1.5).increment()), "Real: 2.5");
-        assert!(Variant::from(Octet::new()).increment().is_err());
+        for answer in [
+            Variant::from(Octet::new()).increment(),
+            Variant::from(Octet::new()).decrement(),
+        ] {
+            assert!(matches!(
+                answer,
+                Err(VariantError::Convert { to }) if to == Target::Number.name()
+            ));
+        }
     }
 
     // reference/cpp/core/tjs2/tjsVariant.cpp:1057-1071

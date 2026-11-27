@@ -732,6 +732,7 @@ fn transition_options(
             TjsValue::Integer(number) => number != 0,
             TjsValue::Real(number) => number != 0.0,
             TjsValue::String(text) => tjs_string_to_integer(&text) != 0,
+            TjsValue::Octet(bytes) => !bytes.is_empty(),
             TjsValue::Object | TjsValue::Retained(_) => true,
             TjsValue::Void => false,
         },
@@ -771,6 +772,9 @@ fn transition_tick(host: &tjs::Tjs2Engine, callback: &DetachedValue) -> Result<f
         TjsValue::Integer(number) => Ok(number as f64),
         TjsValue::Real(number) => Ok(number),
         TjsValue::String(text) => Ok(tjs_string_to_integer(&text) as f64),
+        TjsValue::Octet(_) => {
+            Err("Layer.beginTransition: transition callback must return a numeric tick".to_string())
+        }
         TjsValue::Object | TjsValue::Retained(_) => {
             Err("Layer.beginTransition: transition callback must return a numeric tick".to_string())
         }
@@ -801,7 +805,7 @@ fn options_number(
                     return Ok(Some(number));
                 }
             }
-            Ok(TjsValue::Object | TjsValue::Retained(_)) => {
+            Ok(TjsValue::Octet(_) | TjsValue::Object | TjsValue::Retained(_)) => {
                 return Err(format!(
                     "Layer.beginTransition: invalid transition option {name}: value is not a number"
                 ));

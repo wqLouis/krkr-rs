@@ -13,24 +13,24 @@
 //! taken from the object itself — [`Dispatch::engine_id`] — never from its
 //! address, and a duplicate of it is made for the call because the engine
 //! consumes the retention it is handed. An object the Rust object model owns
-//! answers no engine id, so it cannot cross and the write or the call is
-//! refused.
+//! answers no engine id, so it cannot cross. A global handle keeps such a value
+//! in its [`GlobalMembers`] store instead; any other handle refuses it.
 //!
 //! An answer crosses **out** of the engine as a [`Variant`]: an object the
 //! call retained becomes a [`CHandle`], so the next entry reaches the same
-//! object; `null` is the null closure, and a byte string is refused because
-//! the safe value surface has no octet kind.
+//! object; `null` is the null closure, and a byte string becomes the
+//! variant's octet.
 //!
 //! # What remains limited
 //!
 //! An ordered member walk is not served: [`Dispatch::enum_members`] answers
 //! the safe wrapper's sorted, de-duplicated names and gives every member zero
-//! flags. A byte-string answer is refused because the safe value surface has
-//! no octet kind. A call carries the receiver the executor computed when it
-//! is an engine object; a receiver the Rust object model owns has no retained
-//! id, so the call is refused rather than run on another object.
+//! flags. A call carries the receiver the executor computed when it is an
+//! engine object; a receiver the Rust object model owns has no retained id,
+//! so the call is refused rather than run on another object.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::vm::runtime::number::Number;
@@ -39,6 +39,79 @@ use crate::vm::runtime::octet::Octet;
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
 use crate::{CallAnswer, DetachedValue, MemberShape, Tjs2Engine, Tjs2ValueId, TjsValue};
+
+/// The members a global handle keeps on the Rust side.
+///
+/// The engine cannot hold a value of the Rust object model, so a handle created
+/// for a global scope may carry those values here. Scalars and engine objects
+/// still cross to the engine; only an object the engine cannot address stays
+/// in this store.
+pub struct GlobalMembers {
+    members: RefCell<BTreeMap<TjsString, Variant>>,
+    log: Option<LogSink>,
+}
+
+/// What a refused engine call reports to.
+pub type LogSink = Rc<dyn Fn(&str)>;
+
+impl GlobalMembers {
+    /// An empty store with no log sink.
+    pub fn new() -> Self {
+        Self {
+            members: RefCell::new(BTreeMap::new()),
+            log: None,
+        }
+    }
+
+    /// The same store, reporting a refused engine call to `log`.
+    pub fn with_log(mut self, log: impl Fn(&str) + 'static) -> Self {
+        self.log = Some(Rc::new(log));
+        self
+    }
+
+    /// The store's log sink.
+    fn log(&self) -> Option<LogSink> {
+        self.log.clone()
+    }
+
+    /// The member the store holds, if any.
+    fn get(&self, name: &TjsString) -> Option<Variant> {
+        self.members.borrow().get(name).cloned()
+    }
+
+    /// Stores a member the engine cannot hold.
+    fn insert(&self, name: TjsString, value: Variant) {
+        self.members.borrow_mut().insert(name, value);
+    }
+
+    /// Removes a stored member.
+    fn remove(&self, name: &TjsString) -> Option<Variant> {
+        self.members.borrow_mut().remove(name)
+    }
+
+    /// The stored members, in name order.
+    fn entries(&self) -> Vec<(TjsString, Variant)> {
+        self.members
+            .borrow()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+}
+
+impl Default for GlobalMembers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// The shared store a global handle uses.
+pub type SharedGlobals = Rc<GlobalMembers>;
+
+/// A fresh global-member store.
+pub fn global_members() -> SharedGlobals {
+    Rc::new(GlobalMembers::new())
+}
 
 /// An engine object, reached through its retained id.
 ///
@@ -57,6 +130,10 @@ pub struct CHandle {
     class_names: Rc<RefCell<Vec<TjsString>>>,
     /// Whether the object was usable, from the last interface answer.
     valid: Rc<Cell<bool>>,
+    /// The members the engine cannot hold, when this handle is a global scope.
+    globals: Option<SharedGlobals>,
+    /// The sink a refused engine call reports to.
+    log: Option<LogSink>,
 }
 
 impl std::fmt::Debug for CHandle {
@@ -89,7 +166,39 @@ impl CHandle {
             engine,
             class_names: Rc::new(RefCell::new(class_names)),
             valid: Rc::new(Cell::new(valid)),
+            globals: None,
+            log: None,
         })
+    }
+
+    /// The adapter over `value`, carrying the global members the engine cannot
+    /// hold.
+    ///
+    /// # Errors
+    ///
+    /// The id is not an object the engine can answer for: the class-name read
+    /// or the validity question failed.
+    pub fn with_members(
+        engine: Rc<Tjs2Engine>,
+        value: DetachedValue,
+        globals: SharedGlobals,
+    ) -> Result<Self, ObjectError> {
+        let log = globals.log();
+        let mut handle = Self::new(engine, value)?;
+        handle.globals = Some(globals);
+        handle.log = log;
+        Ok(handle)
+    }
+
+    /// The adapter over `value`, reporting refused calls to `log`.
+    fn with_log(
+        engine: Rc<Tjs2Engine>,
+        value: DetachedValue,
+        log: Option<LogSink>,
+    ) -> Result<Self, ObjectError> {
+        let mut handle = Self::new(engine, value)?;
+        handle.log = log;
+        Ok(handle)
     }
 
     /// The engine the object belongs to.
@@ -124,6 +233,7 @@ fn names_of(engine: &Tjs2Engine, array: DetachedValue) -> Result<Vec<TjsString>,
         TjsValue::Void
         | TjsValue::Real(_)
         | TjsValue::String(_)
+        | TjsValue::Octet(_)
         | TjsValue::Object
         | TjsValue::Retained(_) => return Err(ObjectError::CallNotServed),
     };
@@ -137,6 +247,7 @@ fn names_of(engine: &Tjs2Engine, array: DetachedValue) -> Result<Vec<TjsString>,
             TjsValue::Void
             | TjsValue::Integer(_)
             | TjsValue::Real(_)
+            | TjsValue::Octet(_)
             | TjsValue::Object
             | TjsValue::Retained(_) => return Err(ObjectError::CallNotServed),
         }
@@ -146,10 +257,10 @@ fn names_of(engine: &Tjs2Engine, array: DetachedValue) -> Result<Vec<TjsString>,
 
 /// The engine value a variant marshals to.
 ///
-/// Scalar kinds cross as themselves. An object crosses as a duplicate of its
-/// retained id, because the engine consumes the retention it is handed; a
-/// `null` object crosses as a retained `null`. A byte string and an object
-/// with no engine id are refused.
+/// Scalar kinds cross as themselves; an octet's bytes are copied into the
+/// owned value. An object crosses as a duplicate of its retained id, because
+/// the engine consumes the retention it is handed; a `null` object crosses as
+/// a retained `null`. An object with no engine id is refused.
 ///
 /// The retentions the crossing takes are pushed onto `keep`: the engine
 /// consumes them when it copies the value, so they must outlive the call, not
@@ -164,9 +275,7 @@ fn to_value(
         Variant::Integer(value) => Ok(TjsValue::Integer(*value)),
         Variant::Real(value) => Ok(TjsValue::Real(*value)),
         Variant::String(text) => Ok(TjsValue::String(text.to_string())),
-        // The ABI carries the bytes, but the safe value surface has no octet
-        // kind; adding one is a change across the workspace, not here.
-        Variant::Octet(_) => Err(ObjectError::CallNotServed),
+        Variant::Octet(octet) => Ok(TjsValue::Octet(octet.as_slice().to_vec())),
         Variant::Object(closure) => object_to_value(engine, closure, keep),
     }
 }
@@ -208,14 +317,15 @@ fn retained_value(value: &DetachedValue) -> TjsValue {
 
 /// The variant a scalar engine answer marshals to.
 ///
-/// An object or a byte string never reaches here: the read and the call adopt
-/// an object through [`CHandle`] and refuse a byte string.
+/// An object never reaches here: the read and the call adopt it through
+/// [`CHandle`].
 fn to_variant(answer: TjsValue) -> Result<Variant, ObjectError> {
     match answer {
         TjsValue::Void => Ok(Variant::Void),
         TjsValue::Integer(value) => Ok(Variant::Integer(value)),
         TjsValue::Real(value) => Ok(Variant::Real(value)),
         TjsValue::String(text) => Ok(Variant::String(TjsString::from(text))),
+        TjsValue::Octet(bytes) => Ok(Variant::Octet(Octet::from_vec(bytes))),
         TjsValue::Object | TjsValue::Retained(_) => Err(ObjectError::CallNotServed),
     }
 }
@@ -251,10 +361,18 @@ fn receiver_id(objthis: Option<&dyn Dispatch>) -> Result<Option<Tjs2ValueId>, Ob
 }
 
 /// The variant an engine call answer becomes.
-fn call_answer(engine: &Rc<Tjs2Engine>, answer: CallAnswer) -> Result<Variant, ObjectError> {
+fn call_answer(
+    engine: &Rc<Tjs2Engine>,
+    answer: CallAnswer,
+    log: Option<LogSink>,
+) -> Result<Variant, ObjectError> {
     match answer {
         CallAnswer::Null => Ok(Variant::Object(Closure::null())),
-        CallAnswer::Object(object) => Ok(object_value(CHandle::new(engine.clone(), object)?)),
+        CallAnswer::Object(object) => Ok(object_value(CHandle::with_log(
+            engine.clone(),
+            object,
+            log,
+        )?)),
         CallAnswer::Scalar(value) => to_variant(value),
     }
 }
@@ -274,13 +392,14 @@ fn read_member(
     id: Tjs2ValueId,
     name: &str,
     flags: MemberFlags,
+    log: Option<&LogSink>,
 ) -> Result<Variant, ObjectError> {
     match engine.member_read_exact(id, name, flags.bits()) {
         Ok(MemberShape::Absent) => Err(ObjectError::MemberNotFound),
         Ok(MemberShape::Void) => Ok(Variant::Void),
         Ok(MemberShape::Null) => Ok(Variant::Object(Closure::null())),
         Ok(MemberShape::Object(object)) => {
-            let handle = CHandle::new(engine.clone(), object)?;
+            let handle = CHandle::with_log(engine.clone(), object, log.cloned())?;
             Ok(object_value(handle))
         }
         Ok(MemberShape::Octet(bytes)) => Ok(Variant::Octet(Octet::from_vec(bytes))),
@@ -297,7 +416,18 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
-        read_member(&self.engine, self.id(), &name.to_string(), flags)
+        if let Some(globals) = &self.globals
+            && let Some(value) = globals.get(name)
+        {
+            return Ok(value);
+        }
+        read_member(
+            &self.engine,
+            self.id(),
+            &name.to_string(),
+            flags,
+            self.log.as_ref(),
+        )
     }
 
     fn prop_set(
@@ -308,21 +438,34 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
         self.live()?;
+        // A value the engine cannot address lives in the handle's own store.
+        if let Some(globals) = &self.globals
+            && let Variant::Object(closure) = value
+            && matches!(&closure.object, Some(object) if object.engine_id().is_none())
+        {
+            globals.insert(name.clone(), value.clone());
+            return Ok(());
+        }
         let mut keep = Vec::new();
-        let value = to_value(&self.engine, value, &mut keep)?;
-        let name = name.to_string();
+        let crossing = to_value(&self.engine, value, &mut keep)?;
+        let member = name.to_string();
         // The wrapper's own default is plain assignment's flag: a write with
         // no flag asks for exactly that rule, and a write with a flag asks for
         // the flag's rule unchanged.
         let answer = if flags == MemberFlags::NONE {
-            self.engine.set_member(self.id(), &name, &value)
+            self.engine.set_member(self.id(), &member, &crossing)
         } else {
             self.engine
-                .set_member_with_flags(self.id(), &name, flags.bits(), &value)
+                .set_member_with_flags(self.id(), &member, flags.bits(), &crossing)
         };
         drop(keep);
         match answer {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                if let Some(globals) = &self.globals {
+                    globals.remove(name);
+                }
+                Ok(())
+            }
             Err(error) if crate::is_missing_member(&error) => Err(ObjectError::MemberMustExist),
             Err(_) => Err(ObjectError::CallNotServed),
         }
@@ -335,6 +478,15 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
         self.live()?;
+        if let Some(globals) = &self.globals
+            && globals.remove(name).is_some()
+        {
+            match self.engine.delete_member(self.id(), &name.to_string()) {
+                Ok(()) => return Ok(()),
+                Err(error) if crate::is_missing_member(&error) => return Ok(()),
+                Err(_) => return Err(ObjectError::CallNotServed),
+            }
+        }
         match self.engine.delete_member(self.id(), &name.to_string()) {
             Ok(()) => Ok(()),
             Err(error) if crate::is_missing_member(&error) => Err(ObjectError::MemberNotFound),
@@ -361,13 +513,31 @@ impl Dispatch for CHandle {
             MemberFlags::NONE
         };
         let values = !flags.contains(MemberFlags::ENUM_NO_VALUE);
+        let mut extra: BTreeMap<TjsString, Variant> = self
+            .globals
+            .as_ref()
+            .map(|globals| globals.entries().into_iter().collect())
+            .unwrap_or_default();
         for name in names {
             let name = TjsString::from(name);
-            let value = if values {
-                read_member(&self.engine, self.id(), &name.to_string(), read_flags)?
+            let value = if let Some(value) = extra.remove(&name) {
+                value
+            } else if values {
+                read_member(
+                    &self.engine,
+                    self.id(),
+                    &name.to_string(),
+                    read_flags,
+                    self.log.as_ref(),
+                )?
             } else {
                 Variant::Void
             };
+            if !callback(&name, 0, &value) {
+                return Ok(());
+            }
+        }
+        for (name, value) in extra {
             if !callback(&name, 0, &value) {
                 break;
             }
@@ -400,6 +570,10 @@ impl Dispatch for CHandle {
 
     fn engine_id(&self) -> Option<Tjs2ValueId> {
         Some(self.id())
+    }
+
+    fn rust_member(&self, name: &TjsString) -> Option<Variant> {
+        self.globals.as_ref()?.get(name)
     }
 
     fn is_valid(&self) -> bool {
@@ -443,10 +617,16 @@ impl Dispatch for CHandle {
                 .call_member_answer(self.id(), &name.to_string(), &args, receiver)
         };
         drop(keep);
-        call_answer(
-            &self.engine,
-            answer.map_err(|_| ObjectError::CallNotServed)?,
-        )
+        let answer = match answer {
+            Ok(answer) => answer,
+            Err(error) => {
+                if let Some(log) = &self.log {
+                    log(&error);
+                }
+                return Err(ObjectError::CallNotServed);
+            }
+        };
+        call_answer(&self.engine, answer, self.log.clone())
     }
 
     fn create_new(
@@ -464,9 +644,11 @@ impl Dispatch for CHandle {
             .create_new_answer(self.id(), &name.to_string(), &args, receiver);
         drop(keep);
         match answer.map_err(|_| ObjectError::CallNotServed)? {
-            CallAnswer::Object(object) => {
-                Ok(object_value(CHandle::new(self.engine.clone(), object)?))
-            }
+            CallAnswer::Object(object) => Ok(object_value(CHandle::with_log(
+                self.engine.clone(),
+                object,
+                self.log.clone(),
+            )?)),
             CallAnswer::Null | CallAnswer::Scalar(_) => Err(ObjectError::CallNotServed),
         }
     }

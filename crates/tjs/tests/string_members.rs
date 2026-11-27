@@ -12,8 +12,9 @@
 //!
 //! The probes that reach a rule this check cannot drive are recorded and stated
 //! rather than replayed: the member read diversion, the class the engine does not
-//! register, the pattern a `replace` asks, and the array a `split` asks, whose
-//! `split` member this tree has not built yet.
+//! register, and the array a `split` asks, whose `split` member this tree has not
+//! built yet. `replace_regex` is replayed through the regular-expression
+//! object's own `replace` member.
 //!
 //! A record that holds only the header is a failure, not a pass: the table must
 //! be recorded before the check means anything.
@@ -22,11 +23,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use tjs::vm::runtime::natives::regexp::RegExpObject;
 use tjs::vm::runtime::natives::string::{OctetMember, StringMember};
 use tjs::vm::runtime::object::{Dispatch, MemberFlags};
 use tjs::vm::runtime::octet::Octet;
 use tjs::vm::runtime::string::TjsString;
-use tjs::vm::runtime::variant::Variant;
+use tjs::vm::runtime::variant::{Closure, Variant};
 
 /// The kind a raised probe records.
 const RAISED: &str = "!raise";
@@ -130,7 +132,6 @@ const RECORDED: &[(&str, &str, &str)] = &[
     ("property_method_typeof", RAISED, ""),
     ("property_octet_unpack_read", RAISED, ""),
     ("property_octet_unpack_typeof", RAISED, ""),
-    ("replace_regex", "String", "aXb"),
     ("split_count", "Integer", "3"),
     ("split_first", "String", "a"),
     ("split_purge_count", "Integer", "2"),
@@ -335,6 +336,15 @@ fn replay(probe: &str) -> Result<Variant, Refused> {
             &[Variant::from(1i64), Variant::from(2i64)],
         ),
         "sprintf_real_as_integer" => call(StringMember::Sprintf, "%d", &[Variant::from(1.9f64)]),
+        "replace_regex" => {
+            let regexp = RegExpObject::new(&[Variant::from("1")]).map_err(|_refused| Refused)?;
+            let object: Rc<dyn Dispatch> = regexp;
+            let pattern = Variant::Object(Closure {
+                object: Some(object.clone()),
+                objthis: Some(object),
+            });
+            call(StringMember::Replace, "a1b", &[pattern, Variant::from("X")])
+        }
         "replace_text_pattern" => call(
             StringMember::Replace,
             "abc",

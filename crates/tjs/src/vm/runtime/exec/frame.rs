@@ -379,6 +379,20 @@ impl Dispatch for ObjThisContext {
         self.primary.context()
     }
 
+    /// The view crosses as the object it stands in front of.
+    fn engine_id(&self) -> Option<crate::Tjs2ValueId> {
+        self.primary
+            .engine_id()
+            .or_else(|| self.second().and_then(|second| second.engine_id()))
+    }
+
+    /// A member the engine cannot hold is the primary's, then the fallback's.
+    fn rust_member(&self, name: &TjsString) -> Option<Variant> {
+        self.primary
+            .rust_member(name)
+            .or_else(|| self.second().and_then(|second| second.rust_member(name)))
+    }
+
     fn func_call(
         &self,
         name: &TjsString,

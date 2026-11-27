@@ -1,0 +1,103 @@
+# the engine's answers, recorded by `crates/tjs/examples/regexp_oracle.rs`; regenerate with the command in the example's docs
+surface_class_typeof	String	Object
+surface_finalize	String	Object
+surface_compile	String	Object
+surface_compile_literal	String	Object
+surface_test	String	Object
+surface_match	String	Object
+surface_exec	String	Object
+surface_replace	String	Object
+surface_split	String	Object
+surface_matches	String	void
+surface_start	String	Integer
+surface_index	String	Integer
+surface_last_index	String	Integer
+surface_input	String	String
+surface_last_match	String	String
+surface_last_paren	String	String
+surface_left_context	String	String
+surface_right_context	String	String
+surface_last	String	undefined
+static_last_typeof	String	void
+static_last_after_test	String	Object
+static_last_after_match	Integer	1
+absent_to_string	String	undefined
+absent_flags	String	undefined
+absent_source	String	undefined
+absent_global	String	undefined
+absent_ignore_case	String	undefined
+absent_multiline	String	undefined
+value_initial_state	String	0|0|0|||||void
+value_constructor_pattern	Integer	1
+value_constructor_flags_ignorecase	Integer	1
+value_constructor_flags_global	Integer	1
+value_constructor_unknown_flag	Integer	1
+value_constructor_l_flag	Integer	1
+value_constructor_number_pattern	Integer	1
+value_constructor_number_target	Integer	1
+value_constructor_empty_test_text	Integer	0
+value_constructor_empty_test_empty	Integer	0
+value_constructor_empty_exec	String	0|0|0|||||Object
+value_compile_replaces	Integer	1
+value_compile_extra	Integer	1
+value_compile_empty	Integer	0
+value_compile_missing	!raise	
+value_literal_compile	Integer	1
+value_literal_compile_global	String	1:1:0|1|0|1|a|a||a|Object|2|1|2|a|a|a||Object|2|2|2|||aa||Object
+value_literal_format_double_slash	!raise	
+value_literal_format_no_close	!raise	
+value_literal_format_extra	!raise	
+value_literal_bad_pattern	!raise	end pattern with unmatched parenthesis
+value_invalid_pattern_constructor	!raise	end pattern with unmatched parenthesis
+value_invalid_pattern_compile	!raise	end pattern with unmatched parenthesis
+value_exec_match_array	String	2|ab|b|
+value_exec_match_state	String	0|0|2|ab|b|||Object
+value_exec_index_bug	String	0|2|2|b|b|a||Object
+value_exec_start_bug	String	1|1|2|a|a|a||Object
+value_exec_miss_state	String	0|0|0||||b|Object
+value_exec_global_advance	String	1:1:0|1|0|1|a|a||a|Object|2|1|2|a|a|a||Object|2|2|2|||aa||Object
+value_exec_global_group_end	String	3|0|3|a|bc|||Object
+value_exec_global_no_match	String	0|0|0|||||Object
+value_test_returns	String	1:0
+value_test_state	String	0|0|2|ab|b|||Object
+value_match_no_state	String	1|a|0|0|0|||||void
+value_match_failure	Integer	0
+value_matches_unmatched_group	String	3|String|a|String|
+value_lastparen_last_group	String	b
+value_lastparen_unmatched	String	
+value_exec_emoji	String	1|😀|0|2|😀|😀
+value_exec_emoji_global	String	1|😀|2|0|2|😀|😀||a|Object|1|a|3|2|3|�|�|😀||Object
+value_exec_ignorecase	Integer	1
+value_exec_dot_newline	String	0:1
+value_replace_literal	String	a$1c
+value_replace_global	String	xxx
+value_replace_first	String	xaa
+value_replace_callback	String	[a/a]b
+value_replace_callback_this	String	Object
+value_replace_callback_number	String	42
+value_replace_no_match	String	zzz
+value_replace_empty_pattern	String	abc
+value_replace_missing	!raise	
+value_replace_extra	String	xbc
+value_replace_no_state	String	xb|0|0|1|a|a||b|Object|0|0|1|a|a||b|Object
+value_split_basic	String	3|a|b|c
+value_split_keep_empty	String	3|a||b
+value_split_purge_empty	String	2|a|b
+value_split_leading_trailing_keep	String	3||a|
+value_split_leading_trailing_purge	String	1|a
+value_split_no_match	String	1|abc
+value_split_empty_target	String	1|
+value_split_captures_ignored	String	2|a|b
+value_split_global	String	3|a|b|c
+value_split_start_ignored	String	2|a|b
+value_split_missing	!raise	
+value_split_reserved	String	2|a|b
+value_split_empty_pattern	String	1|abc
+value_split_no_state	String	2|0|2|2|,|,|a|b|Object|0|2|2|,|,|a|b|Object
+value_start_set_text	Integer	2
+value_start_set_real	Integer	1
+value_start_set_void	Integer	0
+value_start_set_negative	Integer	4294967295
+value_readonly_index	!raise	
+value_readonly_matches	!raise	
+value_readonly_last	!raise	

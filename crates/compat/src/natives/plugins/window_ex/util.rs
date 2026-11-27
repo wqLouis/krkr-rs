@@ -90,14 +90,20 @@ pub(crate) fn set_retained_out(out: *mut Value, id: tjs::Tjs2ValueId) {
 
 /// Marshal a scalar [`TjsValue`] into the result slot (objects must use the
 /// retained path).
-pub(crate) fn set_scalar_out(out: *mut Value, services: &crate::CompatServices, value: TjsValue) {
+pub(crate) fn set_scalar_out(
+    out: *mut Value,
+    services: &crate::CompatServices,
+    value: TjsValue,
+) -> Result<(), String> {
     match value {
         TjsValue::Void => crate::native_util::set_void(out),
         TjsValue::Integer(integer) => crate::native_util::set_int(out, integer),
         TjsValue::Real(real) => set_real(out, real),
         TjsValue::String(string) => set_string_out(out, services, &string),
         TjsValue::Object | TjsValue::Retained(_) => crate::native_util::set_void(out),
+        TjsValue::Octet(bytes) => return crate::native_util::set_octet(out, services, &bytes),
     }
+    Ok(())
 }
 
 /// Marshal a [`RetainedValue`] (or an error) into the native result slots.
@@ -108,10 +114,10 @@ pub(crate) fn finish_retained(
     result: Result<RetainedValue, String>,
 ) -> c_int {
     match result {
-        Ok(RetainedValue::Value(value)) => {
-            set_scalar_out(out, services, value);
-            0
-        }
+        Ok(RetainedValue::Value(value)) => match set_scalar_out(out, services, value) {
+            Ok(()) => 0,
+            Err(error) => crate::native_util::report_error(out_error, &error),
+        },
         Ok(RetainedValue::Object(object)) => {
             set_retained_out(out, object.raw_id());
             // The C++ trampoline consumes the retention when it converts the

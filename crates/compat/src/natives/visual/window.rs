@@ -912,6 +912,7 @@ fn read_param_int(
         TjsValue::Real(value) => Ok(value as i64),
         TjsValue::String(text) => Ok(crate::natives::system::tjs_string_to_integer(&text)),
         TjsValue::Void => Ok(0),
+        TjsValue::Octet(_) => Err("value is an octet, not an integer".to_string()),
         TjsValue::Object | TjsValue::Retained(_) => {
             Err("value is an object, not an integer".to_string())
         }

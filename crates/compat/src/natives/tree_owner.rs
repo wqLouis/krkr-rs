@@ -184,6 +184,7 @@ fn is_truthy(value: &TjsValue) -> bool {
         TjsValue::Integer(v) => *v != 0,
         TjsValue::Real(v) => *v != 0.0,
         TjsValue::String(v) => !v.is_empty(),
+        TjsValue::Octet(bytes) => !bytes.is_empty(),
         TjsValue::Object | TjsValue::Retained(_) => true,
     }
 }

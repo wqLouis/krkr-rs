@@ -312,6 +312,15 @@ pub trait Dispatch {
         None
     }
 
+    /// The member this value keeps outside the engine, when it has one.
+    ///
+    /// An engine object cannot hold a value of the Rust object model. A handle
+    /// that carries such a member answers it here, so a call that names it can
+    /// reach the code the engine cannot store.
+    fn rust_member(&self, _name: &TjsString) -> Option<Variant> {
+        None
+    }
+
     /// Whether the object is still usable.
     fn is_valid(&self) -> bool;
 

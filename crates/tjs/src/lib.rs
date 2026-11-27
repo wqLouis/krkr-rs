@@ -1077,6 +1077,9 @@ pub enum TjsValue {
     Real(f64),
     /// A text value.
     String(String),
+    /// A byte string. The bytes are a copy of the engine's value: its
+    /// last-string buffer is not stable across a call.
+    Octet(Vec<u8>),
     /// An object value. No handle crosses the ABI, so the object itself is
     /// reached through a retained id.
     Object,
@@ -1092,10 +1095,9 @@ pub enum TjsValue {
 
 /// The result of reading a member through `PropGet`.
 ///
-/// The safe [`TjsValue`] surface has no octet variant, so it cannot tell a
-/// member that holds binary data from one that holds an object. A caller
-/// that has to tell them apart reads through
-/// [`Tjs2Engine::member_read`].
+/// [`TjsValue`] does not tell an absent member, `void` and `null` apart and
+/// does not keep an object's retention. This read tells those shapes apart,
+/// keeps the object's handle alive, and answers an octet's bytes directly.
 pub enum MemberRead {
     /// The member is absent, `void`, or `null`.
     Void,
@@ -1146,8 +1148,7 @@ pub(crate) enum MemberShape {
 /// The safe [`TjsValue`] surface folds an object and `null` into
 /// [`TjsValue::Object`]. A call result is read through this shape instead, so
 /// an object result keeps the retention the engine handed back and `null`
-/// stays distinct from it. A byte string is not a call answer this surface
-/// carries and is reported as a failure.
+/// stays distinct from it. A byte string answer is a scalar octet.
 pub(crate) enum CallAnswer {
     /// The answer is TJS `null`.
     Null,
@@ -1167,7 +1168,7 @@ pub(crate) enum CallAnswer {
 /// `VAL_RETAINED` (which consumes the retention), or drop it to release the
 /// retention.
 pub enum RetainedValue {
-    /// A void/integer/real/string result, usable directly.
+    /// A void/integer/real/string/octet result, usable directly.
     Value(TjsValue),
     /// An object/function result, retained on the engine.
     Object(DetachedValue),
@@ -1776,7 +1777,7 @@ impl Tjs2Engine {
     /// The VM records the most recent object-valued result when
     /// `tjs2_exec_script` returns, so [`Self::retain_value_detached`] can
     /// resolve an [`TjsValue::Object`] to the freshly produced object. Only
-    /// the object arm is retained; void/integer/real/string results are
+    /// the object arm is retained; void/integer/real/string/octet results are
     /// returned as [`RetainedValue::Value`] and never allocate a retention.
     #[cfg(test)]
     fn exec_script_retained(&self, script: &str, name: &str) -> Result<RetainedValue, TjsError> {
@@ -2343,7 +2344,7 @@ impl Tjs2Engine {
     /// A function object is obtained by evaluating its name:
     /// `let f = engine.eval("f", "test")?;` yields [`TjsValue::Object`],
     /// and the engine resolves it against the most recent object-valued
-    /// script result. Scalars (void/integer/real/string) can also be
+    /// script result. Scalars (void/integer/real/string/octet) can also be
     /// retained, but only object values are callable.
     pub fn retain_value(&self, v: &TjsValue) -> Result<ValueId<'_>, String> {
         let mut strings = Vec::new();
@@ -3188,7 +3189,8 @@ name), and none was available"
                     id,
                 }))
             }
-            VAL_OCTET => Err("an octet answer is not a value the bridge carries".into()),
+            // A byte string answer is an owned octet; every other scalar
+            // kind is taken as itself.
             _ => Ok(CallAnswer::Scalar(take_value(raw))),
         }
     }
@@ -3249,9 +3251,9 @@ name), and none was available"
     /// Write an octet member on a retained object value.
     ///
     /// An octet is the VM's byte-string variant: a script reads the member
-    /// as `Octet` (`typeof`), with `.length` and index access. The safe
-    /// [`TjsValue`] surface carries no octet variant, so the bytes travel
-    /// through this dedicated entry point.
+    /// as `Octet` (`typeof`), with `.length` and index access.
+    /// [`TjsValue::Octet`] carries the same bytes; this entry point takes a
+    /// byte slice directly.
     ///
     /// The VM copies the bytes into the variant while the call runs, so
     /// `bytes` only has to outlive it. A payload longer than the variant's
@@ -3358,9 +3360,9 @@ name), and none was available"
     /// octet item.
     ///
     /// An octet is the VM's byte-string variant: a script reads the item as
-    /// `Octet` (`typeof`), with `.length` and index access. The safe
-    /// [`TjsValue`] surface carries no octet variant, so the bytes travel
-    /// through this dedicated entry point.
+    /// `Octet` (`typeof`), with `.length` and index access.
+    /// [`TjsValue::Octet`] carries the same bytes; this entry point takes a
+    /// byte slice directly.
     ///
     /// The VM copies the bytes into the item while the call runs, so
     /// `bytes` only has to outlive it.
@@ -3747,8 +3749,8 @@ impl Drop for Tjs2Engine {
 
 extern "C" fn noop_log(_level: c_int, _msg: *const c_char, _user: *mut c_void) {}
 
-/// Convert a C value into an owned TjsValue. The string pointer is only valid
-/// until the next engine call, so it is copied immediately.
+/// Convert a C value into an owned TjsValue. The string and octet pointers are
+/// only valid until the next engine call, so they are copied immediately.
 ///
 /// The caller reaches this only after a zero return from the C entry point, so
 /// `v` holds the value that call produced.
@@ -3767,11 +3769,19 @@ fn take_value(v: &Value) -> TjsValue {
             TjsValue::String(s)
         }
         VAL_STRING => TjsValue::String(String::new()),
-        // The safe `TjsValue` surface has no octet variant (adding one would
-        // be a breaking API change for the whole workspace). Raw native
-        // callbacks read octet arguments through `Value::octet_bytes`; an
-        // octet returned by eval/exec is surfaced as an opaque Object.
-        VAL_OCTET => TjsValue::Object,
+        VAL_OCTET => {
+            // `octet_bytes` answers `None` for a zero-length octet, which is
+            // the empty octet rather than an absent value. The bytes live in
+            // the engine's last-string buffer and are not stable across a
+            // call, so they are copied now.
+            // SAFETY: `v` came from a call on this engine and its payload is
+            // valid until the next engine call; the copy happens before then.
+            let bytes = match unsafe { v.octet_bytes() } {
+                Some(bytes) => bytes.to_vec(),
+                None => Vec::new(),
+            };
+            TjsValue::Octet(bytes)
+        }
         // TJS `null` is still an object to the safe wrapper (its `object_handle`
         // is null).
         VAL_NULL => TjsValue::Object,
@@ -3813,8 +3823,9 @@ fn take_error_string(e: *mut c_char) -> String {
 
 /// Convert a [`TjsValue`] into the C-side `tjs2_value` struct. Strings are
 /// NUL-terminated copies kept alive in `strings` for the duration of the
-/// call. Object values cannot be reconstructed on the Rust side (no object
-/// handle crosses the ABI) and are rejected.
+/// call; octet bytes are borrowed from the value for the same duration.
+/// Object values cannot be reconstructed on the Rust side (no object handle
+/// crosses the ABI) and are rejected.
 fn ffi_arguments(args: &[TjsValue]) -> Result<(Vec<CString>, Vec<Value>), String> {
     let mut strings = Vec::new();
     let values = args
@@ -3850,6 +3861,13 @@ fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, Strin
             out.ty = VAL_STRING;
             out.string = c.as_ptr();
             strings.push(c);
+        }
+        TjsValue::Octet(bytes) => {
+            let length = c_int::try_from(bytes.len())
+                .map_err(|_| format!("octet value is too long: {} bytes", bytes.len()))?;
+            out.ty = VAL_OCTET;
+            out.string = bytes.as_ptr() as *const c_char;
+            out.array_count = length;
         }
         TjsValue::Object => {
             return Err(
@@ -6469,6 +6487,12 @@ var ra = a.get(); var rb = b.get();",
         assert_eq!(
             e.eval("typeof OctetNatives.make()", "test").unwrap(),
             TjsValue::String("Octet".into())
+        );
+        // The answer crosses as an octet of the same bytes; the engine's
+        // buffer is copied before it can be overwritten by the next call.
+        assert_eq!(
+            e.eval("OctetNatives.make()", "test").unwrap(),
+            TjsValue::Octet(vec![0x00, 0x01, 0x02, 0xFF])
         );
         // Passing it back to a native exposes the exact bytes — the embedded
         // NUL and 0xFF included: sum(0,1,2,255)=258, length 4 => 258004.

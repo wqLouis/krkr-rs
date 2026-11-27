@@ -12,7 +12,9 @@ use std::ptr;
 
 use tjs::{RetainedValue, TjsValue, VAL_INTEGER, VAL_REAL, VAL_RETAINED, VAL_STRING, Value};
 
-use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
+use crate::native_util::{
+    args, report_error, set_bool, set_int, set_octet, set_void, value_as_string,
+};
 use crate::natives::construct;
 use crate::natives::system::{resolve, value_as_bool, value_as_i64};
 
@@ -155,12 +157,33 @@ pub(crate) fn set_retained(out: *mut Value, value: tjs::DetachedValue) {
 }
 
 /// Write a scalar [`TjsValue`] into an out slot (object values are void).
-pub(crate) fn set_scalar(ctx: &crate::CompatCtx, out: *mut Value, value: TjsValue) {
+pub(crate) fn set_scalar(
+    ctx: &crate::CompatCtx,
+    out: *mut Value,
+    value: TjsValue,
+) -> Result<(), String> {
     match value {
-        TjsValue::Void | TjsValue::Object | TjsValue::Retained(_) => set_void(out),
-        TjsValue::Integer(i) => set_int(out, i),
-        TjsValue::Real(r) => set_real(out, r),
-        TjsValue::String(s) => set_string(ctx, out, &s),
+        TjsValue::Void | TjsValue::Object | TjsValue::Retained(_) => {
+            set_void(out);
+            Ok(())
+        }
+        TjsValue::Integer(i) => {
+            set_int(out, i);
+            Ok(())
+        }
+        TjsValue::Real(r) => {
+            set_real(out, r);
+            Ok(())
+        }
+        TjsValue::String(s) => {
+            set_string(ctx, out, &s);
+            Ok(())
+        }
+        TjsValue::Octet(bytes) => {
+            // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+            let services = unsafe { ctx.services() };
+            set_octet(out, services, &bytes)
+        }
     }
 }
 
@@ -418,10 +441,10 @@ pub(crate) fn get_variant<T>(
         return report_error(out_error, "motionplayer: null instance");
     };
     match f(inst, &res.ctx()) {
-        Ok(RetainedValue::Value(v)) => {
-            set_scalar(&res.ctx(), out, v);
-            0
-        }
+        Ok(RetainedValue::Value(v)) => match set_scalar(&res.ctx(), out, v) {
+            Ok(()) => 0,
+            Err(error) => report_error(out_error, &error),
+        },
         Ok(RetainedValue::Object(dv)) => {
             set_retained(out, dv);
             0
@@ -615,10 +638,10 @@ pub(crate) fn method_variant<T>(
     // SAFETY: the trampoline guarantees `argc` valid entries for the call.
     let arguments = unsafe { args(argv, argc) };
     match f(inst, arguments, &res.ctx()) {
-        Ok(RetainedValue::Value(v)) => {
-            set_scalar(&res.ctx(), out, v);
-            0
-        }
+        Ok(RetainedValue::Value(v)) => match set_scalar(&res.ctx(), out, v) {
+            Ok(()) => 0,
+            Err(error) => report_error(out_error, &error),
+        },
         Ok(RetainedValue::Object(dv)) => {
             set_retained(out, dv);
             0

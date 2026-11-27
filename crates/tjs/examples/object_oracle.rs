@@ -150,6 +150,7 @@ fn kind_of(engine: &Tjs2Engine, expression: &str, probe: &str) -> String {
         Ok(TjsValue::Integer(_)) => "Integer".to_string(),
         Ok(TjsValue::Real(_)) => "Real".to_string(),
         Ok(TjsValue::String(_)) => "String".to_string(),
+        Ok(TjsValue::Octet(_)) => "Octet".to_string(),
         Ok(TjsValue::Object) => "Object".to_string(),
         Ok(TjsValue::Retained(id)) => fail(format_args!(
             "probe {probe}: a retained value {id} is not an answer"

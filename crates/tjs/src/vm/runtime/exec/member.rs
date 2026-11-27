@@ -45,7 +45,7 @@ use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::object::{MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
 use crate::vm::runtime::string::TjsString;
-use crate::vm::runtime::variant::{Closure, Variant};
+use crate::vm::runtime::variant::{Closure, Target, Variant};
 
 use super::frame::{Code, Frame};
 use super::op;
@@ -481,7 +481,7 @@ fn as_closure(value: &Variant) -> Result<&Closure, Fault> {
         Variant::Object(closure) => Ok(closure),
         _ => Err(Fault::Raised(Raise::Convert {
             value: Box::new(value.clone()),
-            to: "Object",
+            to: Target::Object.name(),
         })),
     }
 }
@@ -494,7 +494,7 @@ fn as_closure(value: &Variant) -> Result<&Closure, Fault> {
 fn null_object() -> Fault {
     Fault::Raised(Raise::Convert {
         value: Box::new(Variant::Object(Closure::null())),
-        to: "Object",
+        to: Target::Object.name(),
     })
 }
 

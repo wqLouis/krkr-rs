@@ -507,6 +507,9 @@ fn owned_from_tjs(
         TjsValue::Integer(value) => TjsOwned::Integer(value),
         TjsValue::Real(value) => TjsOwned::Real(value),
         TjsValue::String(value) => TjsOwned::String(value),
+        // The string getter's default writes `null`; octets are not part of
+        // the JSON value model.
+        TjsValue::Octet(_) => TjsOwned::Void,
         TjsValue::Object => {
             let object = engine.retain_value_detached(&TjsValue::Object)?;
             if is_null(engine, services, &object)? {

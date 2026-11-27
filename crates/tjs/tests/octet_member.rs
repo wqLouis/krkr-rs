@@ -7,8 +7,8 @@
 //! `Octet`, `.length` is the byte count and an index yields the raw byte
 //! (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:124-162`).
 //!
-//! The safe value surface carries no octet variant, so the bytes travel
-//! through this dedicated entry point.
+//! The safe value surface carries the bytes as `TjsValue::Octet`; this entry
+//! point installs an octet member directly from a byte slice.
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -103,6 +103,11 @@ fn an_empty_octet_member_has_no_bytes() {
     assert_eq!(
         eval(&engine, "typeof AbiEmptyOctet"),
         TjsValue::String("Octet".into())
+    );
+    assert_eq!(
+        eval(&engine, "AbiEmptyOctet"),
+        TjsValue::Octet(Vec::new()),
+        "a zero-length octet is the empty octet, not a missing value"
     );
     assert_eq!(eval(&engine, "AbiEmptyOctet.length"), TjsValue::Integer(0));
 }

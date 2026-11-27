@@ -7,12 +7,17 @@
 //! [`VmHost::with_default_services`] before the surface is installed.
 #![allow(unsafe_code)]
 
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
+use std::rc::Rc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use compat::{CompatHost, EventAdapter, FrameBody, PluginRegistry, run_frame_body};
 use platform::PlatformEvent;
+use tjs::vm::runtime::bridge::{GlobalMembers, SharedGlobals};
+use tjs::vm::runtime::engine as runtime_engine;
+use tjs::vm::runtime::variant::Variant;
 use tjs::{LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARN, Tjs2Engine, TjsValue};
 
 use crate::VmError;
@@ -34,21 +39,24 @@ pub struct FrameCtx<'a> {
 
 /// The TJS VM host (L4).
 ///
-/// Owns the script engine (boxed so its address is stable for the L3 binding)
-/// and the L3 [`CompatHost`] that holds the native surface state. The fields
-/// are ordered so the engine is dropped last: the dispatch state retains
-/// values whose `Drop` releases an id on the engine.
+/// Owns the script engine (held in an `Rc`, whose pointee keeps a stable
+/// address for the L3 binding) and the L3 [`CompatHost`] that holds the native
+/// surface state. The fields are ordered so the engine is dropped last: the
+/// dispatch state retains values whose `Drop` releases an id on the engine.
 pub struct VmHost {
     /// The L3 dispatch state. Declared before `engine` so its retained values
     /// are released first (fields drop in declaration order).
     compat: CompatHost,
     adapter: EventAdapter,
     /// The per-host VM log deduplicator. The engine's log callback points at
-    /// this boxed value, so its address stays stable while the host moves.
-    log_dedup: Box<LogDedup>,
+    /// this shared value, so its address stays stable while the host moves.
+    log_dedup: Rc<RefCell<LogDedup>>,
+    /// The members the engine cannot hold on its global object. Declared
+    /// before the engine so they are released while it is still alive.
+    globals: SharedGlobals,
     /// The script engine. Declared last so it outlives every value the native
     /// state retains.
-    engine: Box<Tjs2Engine>,
+    engine: Rc<Tjs2Engine>,
 }
 
 /// Full exception dumps emitted before repeats are collapsed.
@@ -313,12 +321,36 @@ extern "C" fn vm_log(level: c_int, msg: *const c_char, user: *mut c_void) {
         emit_record(level, &msg);
         return;
     }
-    // SAFETY: `user` points at the `LogDedup` owned by the live `VmHost`; the
-    // box outlives the engine and the callback is cleared before that field is
-    // freed.
-    let dedup = unsafe { &mut *(user as *mut LogDedup) };
-    for action in dedup.record(level, msg) {
+    // SAFETY: `user` points at the `RefCell<LogDedup>` owned by the live
+    // `VmHost`; the shared value outlives the engine and the callback is
+    // cleared before that field is freed.
+    let dedup = unsafe { &*(user as *const RefCell<LogDedup>) };
+    for action in dedup.borrow_mut().record(level, msg) {
         emit_action(action);
+    }
+}
+
+/// The host value a runtime answer crosses as.
+///
+/// Scalars cross as themselves. An object crosses as the engine's object
+/// marker when it stands for an engine object (or is `null`); an object the
+/// Rust object model owns has no engine handle, so the answer is refused
+/// rather than reported as an empty value.
+fn host_value(answer: Variant) -> Result<TjsValue, VmError> {
+    match answer {
+        Variant::Void => Ok(TjsValue::Void),
+        Variant::Integer(value) => Ok(TjsValue::Integer(value)),
+        Variant::Real(value) => Ok(TjsValue::Real(value)),
+        Variant::String(text) => Ok(TjsValue::String(text.to_string())),
+        Variant::Octet(octet) => Ok(TjsValue::Octet(octet.as_slice().to_vec())),
+        Variant::Object(closure) => match &closure.object {
+            None => Ok(TjsValue::Object),
+            Some(object) if object.engine_id().is_some() => Ok(TjsValue::Object),
+            Some(_) => Err(VmError::Script(
+                "the script result is an object with no engine handle; it cannot cross the VM boundary"
+                    .to_string(),
+            )),
+        },
     }
 }
 
@@ -334,7 +366,7 @@ impl VmHost {
 
     /// Create a host with the given plugin registry.
     ///
-    /// The host boxes the engine and installs the L3 binding and classes
+    /// The host keeps the engine alive and installs the L3 binding and classes
     /// before returning, so it is ready to [`exec`](Self::exec) and
     /// [`tick`](Self::tick).
     pub fn new(registry: PluginRegistry) -> Result<Self, VmError> {
@@ -363,18 +395,24 @@ impl VmHost {
         registry: PluginRegistry,
         attach: impl FnOnce(&mut compat::CompatServices),
     ) -> Result<Self, VmError> {
-        // The dedup state is boxed first so its address is stable for the log
+        // The dedup state is shared first so its address is stable for the log
         // callback and it outlives the engine on every exit path.
-        let mut log_dedup = Box::new(LogDedup::default());
-        let engine = Box::new(Tjs2Engine::new().map_err(|err| VmError::Vm(err.to_string()))?);
-        // SAFETY: `log_dedup` is a live box that outlives the engine; the
-        // callback is cleared in `Drop` before the box is freed.
+        let log_dedup = Rc::new(RefCell::new(LogDedup::default()));
+        let engine = Rc::new(Tjs2Engine::new().map_err(|err| VmError::Vm(err.to_string()))?);
+        // SAFETY: `log_dedup` is a live shared value that outlives the engine;
+        // the callback is cleared in `Drop` before the value is freed.
         unsafe {
             engine.set_log_cb(
                 Some(vm_log),
-                (&mut *log_dedup) as *mut LogDedup as *mut c_void,
+                Rc::as_ptr(&log_dedup) as *mut RefCell<LogDedup> as *mut c_void,
             )
         };
+        let log_sink = Rc::clone(&log_dedup);
+        let globals = Rc::new(GlobalMembers::new().with_log(move |message| {
+            for action in log_sink.borrow_mut().record(LOG_DEBUG, message.to_string()) {
+                emit_action(action);
+            }
+        }));
         let mut compat = CompatHost::with_registry(registry);
         attach(compat.services_mut());
         compat.install(&engine)?;
@@ -382,15 +420,16 @@ impl VmHost {
             compat,
             adapter: EventAdapter::new(),
             log_dedup,
+            globals,
             engine,
         })
     }
 
     /// The underlying TJS engine.
     ///
-    /// The engine is boxed, so the address the L3 binding recorded stays
-    /// valid for the whole life of the host. The engine is single-threaded:
-    /// it is used from the one thread that owns the host.
+    /// The engine is behind an `Rc`, so the address the L3 binding recorded
+    /// stays valid for the whole life of the host. The engine is
+    /// single-threaded: it is used from the one thread that owns the host.
     pub fn engine(&self) -> &Tjs2Engine {
         &self.engine
     }
@@ -406,22 +445,81 @@ impl VmHost {
     /// Execute a TJS script.
     ///
     /// `name` labels the block in a failure message. A compile or runtime
-    /// failure is reported as [`VmError::Script`], whose message carries
-    /// the block name and the line.
+    /// failure is reported as [`VmError::Engine`], whose error carries the
+    /// block name and the line.
     pub fn exec(&self, source: &str, name: &str) -> Result<TjsValue, VmError> {
-        self.engine
-            .exec_script(source, name)
-            .map_err(|err| VmError::Script(err.to_string()))
+        match runtime_engine::run_with_members(
+            Rc::clone(&self.engine),
+            source,
+            name,
+            Rc::clone(&self.globals),
+        ) {
+            Ok(answer) => host_value(answer),
+            Err(failure) => {
+                self.log_script_failure(name, &failure);
+                Err(VmError::Engine(failure.error))
+            }
+        }
     }
 
     /// Evaluate a TJS expression.
     ///
     /// `name` labels the block in a failure message; a compile or runtime
-    /// failure is reported as [`VmError::Script`].
+    /// failure is reported as [`VmError::Engine`].
     pub fn eval(&self, expression: &str, name: &str) -> Result<TjsValue, VmError> {
-        self.engine
-            .eval(expression, name)
-            .map_err(|err| VmError::Script(err.to_string()))
+        match runtime_engine::eval_with_members(
+            Rc::clone(&self.engine),
+            expression,
+            name,
+            Rc::clone(&self.globals),
+        ) {
+            Ok(answer) => host_value(answer),
+            Err(failure) => {
+                self.log_script_failure(name, &failure);
+                Err(VmError::Engine(failure.error))
+            }
+        }
+    }
+
+    /// Emits an uncaught Rust-executor failure as the diagnostic dump the VM
+    /// log deduplicator expects.
+    fn log_script_failure(&self, name: &str, failure: &runtime_engine::ScriptFailure) {
+        if !matches!(&failure.error, runtime_engine::EngineError::Run(_)) {
+            return;
+        }
+        let (location, position) = match failure.trace.first() {
+            Some(frame) if !frame.name.is_empty() => (
+                format!("{} at code position {}", frame.name, frame.position),
+                frame.position,
+            ),
+            Some(frame) => (
+                format!("{name} at code position {}", frame.position),
+                frame.position,
+            ),
+            None => (name.to_string(), 0),
+        };
+        let mut lines = vec![
+            format!("==== An exception occurred at {location}, VM ip = {position} ==== "),
+            "-- Disassembled VM code --".to_string(),
+            format!("{:?}", failure.error),
+        ];
+        for frame in &failure.trace {
+            let label = if frame.name.is_empty() {
+                name
+            } else {
+                &frame.name
+            };
+            lines.push(format!("{label} at code position {}", frame.position));
+        }
+        lines.push(REGISTER_DUMP_MARKER.to_string());
+        lines.push("%0=(void)".to_string());
+        lines.push("------------------------------".to_string());
+        let mut dedup = self.log_dedup.borrow_mut();
+        for line in lines {
+            for action in dedup.record(LOG_DEBUG, line) {
+                emit_action(action);
+            }
+        }
     }
 
     /// Run one frame body: adapt and deliver the platform events, then run
@@ -459,7 +557,7 @@ impl Drop for VmHost {
         // Emit the final suppression summary, capturing any log the shutdown
         // produced, then detach the callback so a late engine log cannot
         // reach the state that drops with this host.
-        for action in self.log_dedup.flush() {
+        for action in self.log_dedup.borrow_mut().flush() {
             emit_action(action);
         }
         // SAFETY: the engine is alive and the callback slot accepts a null

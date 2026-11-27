@@ -11,7 +11,7 @@ use std::slice;
 
 use tjs::{
     NativeObjThisMethod, NativeObjThisMethodDef, NativeObjThisProperty, NativeObjThisPropertyDef,
-    Tjs2Engine, VAL_INTEGER, VAL_NULL, VAL_VOID, Value, tjs2_malloc,
+    Tjs2Engine, VAL_INTEGER, VAL_NULL, VAL_OCTET, VAL_VOID, Value, tjs2_malloc,
 };
 
 use crate::{CompatCtx, CompatServices};
@@ -154,6 +154,41 @@ pub(crate) fn set_int(out: *mut Value, value: i64) {
         (*out).array_count = 0;
         (*out).retained = 0;
     }
+}
+
+/// Scratch buffer for an octet result. The trampoline copies the bytes after
+/// the callback returns, so the buffer lives in the per-engine services.
+#[derive(Default)]
+pub(crate) struct OctetScratch(Vec<u8>);
+
+/// Write raw bytes into a native callback's out slot as a TJS octet.
+pub(crate) fn set_octet(
+    out: *mut Value,
+    services: &CompatServices,
+    bytes: &[u8],
+) -> Result<(), String> {
+    let length = c_int::try_from(bytes.len())
+        .map_err(|_| format!("octet result is too long: {} bytes", bytes.len()))?;
+    if out.is_null() {
+        return Ok(());
+    }
+    let mut scratch = services.state::<OctetScratch>();
+    scratch.0.clear();
+    scratch.0.extend_from_slice(bytes);
+    let pointer = scratch.0.as_ptr() as *const c_char;
+    drop(scratch);
+    // SAFETY: `out` is a valid result slot and the scratch buffer outlives
+    // the callback (the trampoline copies the octet before it returns).
+    unsafe {
+        (*out).ty = VAL_OCTET;
+        (*out).integer = 0;
+        (*out).real = 0.0;
+        (*out).string = pointer;
+        (*out).array = ptr::null();
+        (*out).array_count = length;
+        (*out).retained = 0;
+    }
+    Ok(())
 }
 
 /// Write a boolean result as a TJS integer (`true` = 1, `false` = 0).

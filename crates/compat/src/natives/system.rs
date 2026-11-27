@@ -67,9 +67,9 @@ use std::path::Path;
 
 use api::config::CacheLimit;
 use tjs::{
-    DetachedValue, Engine, MemberRead, NativeClassBuilder, NativeMethodDef, NativePropertyDef,
-    RetainedValue, Tjs2Engine, TjsValue, VAL_ARRAY, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET,
-    VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
+    DetachedValue, Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue,
+    Tjs2Engine, TjsValue, VAL_ARRAY, VAL_INTEGER, VAL_NULL, VAL_OBJECT, VAL_OCTET, VAL_REAL,
+    VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
 };
 
 use crate::binding;
@@ -624,13 +624,22 @@ pub(crate) fn set_string_out(ctx: &CompatCtx, out: *mut Value, s: &str) {
 
 /// Hand a retained evaluation result to the C++ side. Scalars are copied;
 /// object results keep their retention (consumed by the return slot).
-fn set_retained_value_out(ctx: &CompatCtx, out: *mut Value, value: RetainedValue) {
+fn set_retained_value_out(
+    ctx: &CompatCtx,
+    out: *mut Value,
+    value: RetainedValue,
+) -> Result<(), String> {
     match value {
         RetainedValue::Value(TjsValue::Void) => set_void(out),
         RetainedValue::Value(TjsValue::Integer(i)) => set_int(out, i),
         RetainedValue::Value(TjsValue::Real(r)) => set_real(out, r),
         RetainedValue::Value(TjsValue::String(s)) => set_string_out(ctx, out, &s),
         RetainedValue::Value(TjsValue::Object | TjsValue::Retained(_)) => set_void(out),
+        RetainedValue::Value(TjsValue::Octet(bytes)) => {
+            // SAFETY: a `CompatCtx` is only created for a bound, live engine.
+            let services = unsafe { ctx.services() };
+            return crate::native_util::set_octet(out, services, &bytes);
+        }
         RetainedValue::Object(dv) => {
             if !out.is_null() {
                 // SAFETY: the trampoline passes a valid out slot for the call.
@@ -648,6 +657,7 @@ fn set_retained_value_out(ctx: &CompatCtx, out: *mut Value, value: RetainedValue
             std::mem::forget(dv);
         }
     }
+    Ok(())
 }
 
 /// The script's tick count in milliseconds: the clock source, read now.
@@ -1275,18 +1285,12 @@ fn collect_storage_names(host: &Tjs2Engine, list: &Value) -> Result<Vec<String>,
             TjsValue::String(text) => names.push(text),
             TjsValue::Integer(number) => names.push(number.to_string()),
             TjsValue::Real(number) => names.push(number.to_string()),
+            TjsValue::Octet(_) => {
+                return Err(format!("the storage name at index {index} is an octet"));
+            }
             TjsValue::Object | TjsValue::Retained(_) => {
-                // An octet element raises the conversion error; an object
-                // element becomes a name that names no storage.
-                match host.member_read(retained.raw_id(), &member) {
-                    Ok(MemberRead::Octet(_)) => {
-                        return Err(format!("the storage name at index {index} is an octet"));
-                    }
-                    Ok(_) => names.push(OBJECT_ELEMENT_NAME.to_string()),
-                    Err(error) => {
-                        return Err(format!("the storage name at index {index}: {error}"));
-                    }
-                }
+                // An object element becomes a name that names no storage.
+                names.push(OBJECT_ELEMENT_NAME.to_string());
             }
         }
         index += 1;
@@ -1495,10 +1499,10 @@ extern "C" fn native_read_reg_value(
     };
     let ctx = resolved.ctx();
     match read_register_value(&ctx, &key) {
-        Ok(Some(value)) => {
-            set_retained_value_out(&ctx, out, value);
-            0
-        }
+        Ok(Some(value)) => match set_retained_value_out(&ctx, out, value) {
+            Ok(()) => 0,
+            Err(error) => report_error(out_error, &format!("System.readRegValue: {error}")),
+        },
         Ok(None) => {
             set_void(out);
             0

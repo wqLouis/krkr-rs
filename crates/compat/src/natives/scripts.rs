@@ -193,10 +193,10 @@ fn finish_retained(
     result: Result<RetainedValue, String>,
 ) -> c_int {
     match result {
-        Ok(RetainedValue::Value(value)) => {
-            set_scalar_out(out, services, value);
-            0
-        }
+        Ok(RetainedValue::Value(value)) => match set_scalar_out(out, services, value) {
+            Ok(()) => 0,
+            Err(error) => report_error(out_error, &error),
+        },
         Ok(RetainedValue::Object(object)) => {
             set_retained_out(out, object.raw_id().as_ptr() as usize);
             // The C++ trampoline consumes the retention when it converts the
@@ -209,16 +209,21 @@ fn finish_retained(
 }
 
 /// Marshal a scalar [`TjsValue`] into the result slot.
-fn set_scalar_out(out: *mut Value, services: &CompatServices, value: TjsValue) {
+fn set_scalar_out(
+    out: *mut Value,
+    services: &CompatServices,
+    value: TjsValue,
+) -> Result<(), String> {
     match value {
         TjsValue::Void => set_void(out),
         TjsValue::Integer(integer) => set_int(out, integer),
         TjsValue::Real(real) => set_real(out, real),
         TjsValue::String(string) => set_string_out(out, services, &string),
-        // Object results must go through the retained path; anything else
-        // reaching here has no usable representation, so return void.
+        // Object results must go through the retained path.
         TjsValue::Object | TjsValue::Retained(_) => set_void(out),
+        TjsValue::Octet(bytes) => return crate::native_util::set_octet(out, services, &bytes),
     }
+    Ok(())
 }
 
 /// The attached storage pointer, if the host attached one.

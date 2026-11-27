@@ -305,6 +305,7 @@ fn render_scalar(value: &TjsValue, out: &mut String) {
         }
         TjsValue::Real(number) => push_real(*number, out),
         TjsValue::String(text) => push_string(text, out),
+        TjsValue::Octet(bytes) => push_octet(bytes, out),
         TjsValue::Retained(_) => out.push_str("void"),
     }
 }

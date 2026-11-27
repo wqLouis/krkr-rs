@@ -293,6 +293,7 @@ fn owned_from_tjs(engine: &Tjs2Engine, value: TjsValue) -> Result<Owned, String>
         TjsValue::Integer(value) => Ok(Owned::Integer(value)),
         TjsValue::Real(value) => Ok(Owned::Real(value)),
         TjsValue::String(value) => Ok(Owned::String(value)),
+        TjsValue::Octet(bytes) => Ok(Owned::Octet(bytes)),
         // Resolves against the engine's most recent object result, so this
         // must be called immediately after the producing engine call.
         TjsValue::Object => Ok(Owned::Object(

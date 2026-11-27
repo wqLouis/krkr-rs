@@ -19,10 +19,11 @@ and the L2/L1 engine. The layer model is in
 
 ```rust
 pub struct VmHost {
-    compat: CompatHost,        // the L3 dispatch state — declared first
-    adapter: EventAdapter,     // the L3 event adapter
-    log_dedup: Box<LogDedup>,  // the per-host log deduplicator
-    engine: Box<Tjs2Engine>,   // the C++ engine — declared last
+    compat: CompatHost,                // the L3 dispatch state — declared first
+    adapter: EventAdapter,             // the L3 event adapter
+    log_dedup: Rc<RefCell<LogDedup>>,  // the per-host log deduplicator
+    globals: SharedGlobals,            // Rust-side members of the global object
+    engine: Rc<Tjs2Engine>,            // the shared TJS engine — declared last
 }
 ```
 
@@ -30,8 +31,9 @@ pub struct VmHost {
 |---|---|
 | `compat` | the L3 host: the native surface state and the registry |
 | `adapter` | the L3 adapter that turns platform events into script events |
-| `log_dedup` | the state the engine's log callback points at; it is boxed so the address stays stable while the host moves |
-| `engine` | the C++ engine, boxed so its address is stable for the L3 binding |
+| `log_dedup` | the state the engine's log callback and the Rust failure reporter point at; it is shared so the address stays stable while the host moves |
+| `globals` | the members the engine cannot hold on its global object, shared by every `exec`/`eval` call |
+| `engine` | the TJS engine, held in an `Rc` so its address is stable for the L3 binding |
 
 ### The drop order matters
 
@@ -84,9 +86,15 @@ impl VmHost {
 }
 ```
 
-`exec` runs a script, `eval` evaluates an expression. Both report a
-failure as `VmError::Script`, whose message carries the block name and the
-line.
+`exec` runs a script, `eval` evaluates an expression. Both compile and run
+the text in the Rust executor (`tjs::vm::runtime::engine`), with the engine's
+global object as the machine global. A top-level `var` lands on the engine's
+global and a top-level `function` stays in the shared Rust-side global store,
+so both outlive the call. A failure is the executor's typed `EngineError`
+carried by `VmError::Engine`; an uncaught code failure also emits the
+diagnostic dump through the host's log deduplicator. An answer the host
+cannot carry across the boundary (an object with no engine handle) is
+`VmError::Script` and names the shape it refused.
 
 The host exposes no mutable accessor to the compatibility host: the
 dispatch state is owned by the host and is configured through the service
@@ -98,7 +106,8 @@ host's back.
 | variant | meaning |
 |---|---|
 | `VmError::Vm` | the script engine could not be created |
-| `VmError::Script` | compilation or execution failed |
+| `VmError::Script` | a script answer could not cross the boundary |
+| `VmError::Engine` | the Rust executor failed to compile or run the script |
 | `VmError::Compat` | the compatibility surface failed |
 
 ---
@@ -168,10 +177,11 @@ addresses still collapses.
 
 * The host owns no L2 state. Every L2 value it touches is borrowed through
   the services the composition root attached.
-* The engine is boxed so the L3 binding's engine→context mapping keeps a
-  valid address for the whole life of the host.
-* The log deduplicator is boxed for the same reason: the engine's callback
-  points at it, and it outlives the engine on every exit path.
+* The engine is held in an `Rc` so the L3 binding's engine→context mapping
+  keeps a valid address for the whole life of the host.
+* The log deduplicator is shared for the same reason: the engine's callback
+  and the Rust failure reporter point at it, and it outlives the engine on
+  every exit path.
 * The crate denies `unsafe` at the root; the file that contains the FFI
   allows it locally, and every unsafe block carries a `SAFETY:` note.
 

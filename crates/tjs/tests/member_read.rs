@@ -1,13 +1,13 @@
 //! Integration tests for `Tjs2Engine::member_read` — the member read that
 //! keeps the shapes apart.
 //!
-//! The safe value surface has no octet variant, so a member that holds
-//! binary data reads as an opaque object there
-//! (`reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1415-1418` builds the
-//! octet variant). A storage-media provider has to tell a file (an octet)
-//! from a directory (an object) and from an absent member
-//! (`reference/cpp/plugins/varfile.cpp:10-15`), so this entry point keeps
-//! the three apart.
+//! [`TjsValue`] carries an octet's bytes, but it folds an absent member,
+//! `void` and `null` together and does not keep an object's retention. A
+//! storage-media provider has to tell a file (an octet) from a directory (an
+//! object) and from an absent member
+//! (`reference/cpp/plugins/varfile.cpp:10-15`; the octet is built at
+//! `reference/cpp/core/tjs2/tjsInterCodeExec.cpp:1415-1418`), so this entry
+//! point keeps the three apart.
 
 use std::sync::{Mutex, MutexGuard};
 

@@ -48,7 +48,7 @@ use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::natives::exception::Exception;
 use crate::vm::runtime::object::ObjectError;
 use crate::vm::runtime::string::TjsString;
-use crate::vm::runtime::variant::Variant;
+use crate::vm::runtime::variant::{DIVISION_BY_ZERO_MESSAGE, Variant, conversion_message};
 
 use super::decode;
 use super::frame::{Code, Frame};
@@ -241,15 +241,21 @@ fn exception_object(message: &str, trace: &[FrameTrace]) -> Result<Variant, Faul
 ///
 /// The engine's own text where this tree knows it, and a plain statement of the
 /// reason where it does not. A handler that prints `message` sees these.
-fn message_of(raise: &Raise) -> String {
+pub fn message_of(raise: &Raise) -> String {
     match raise {
-        Raise::Convert { to, .. } => format!("Cannot convert the variable type to {to}"),
-        Raise::DivideByZero => String::from("Division by zero"),
+        Raise::Convert { value, to } => conversion_message(&value.readable().to_string(), to),
+        Raise::DivideByZero => DIVISION_BY_ZERO_MESSAGE.to_string(),
         Raise::IntegerOutOfRange => String::from("The integer result is out of range"),
         Raise::MemberNotFound { name } => format!("Member \"{name}\" does not exist"),
-        Raise::AccessDenied => String::from("Access denied"),
-        Raise::RangeError => String::from("RangeError"),
+        Raise::AccessDenied => {
+            String::from("Invalid operation for Read-only or Write-only property")
+        }
+        Raise::RangeError => String::from("The value is out of the range"),
         Raise::NotCallable { .. } => String::from("Not a function or invalid method/property type"),
+        Raise::ParameterCount => String::from("Invalid argument count"),
+        Raise::InvalidParameter => String::from("Invalid argument"),
+        Raise::FormatString => String::from("Invalid format string"),
+        Raise::NotAnArray => String::from("Specify an Array object"),
         Raise::ScriptError { message } => message.to_string(),
     }
 }
@@ -290,7 +296,8 @@ mod tests {
     use std::rc::Rc;
 
     use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags};
-    use crate::vm::runtime::variant::Closure;
+    use crate::vm::runtime::octet::Octet;
+    use crate::vm::runtime::variant::{Closure, Target};
 
     fn text(value: &str) -> TjsString {
         TjsString::from(value)
@@ -549,5 +556,52 @@ mod tests {
         }
         assert!(!handles(vm::CALL));
         assert!(!handles(vm::RET));
+    }
+
+    /// The message a handler reads is the engine's own text.
+    ///
+    /// reference/cpp/core/tjs2/tjsError.h:250-253 (the conversion message),
+    /// :294 (the range), :295-296 (the access), :307 (the format),
+    /// reference/cpp/core/tjs2/tjsError.h:267-268 (the parameter messages),
+    /// :276 (the array), :308 (the division).
+    #[test]
+    fn the_message_table_is_the_engines() {
+        let null = Variant::Object(Closure::null());
+        let octet = Variant::from(Octet::from_slice(&[1]));
+        for (raise, message) in [
+            (
+                Raise::Convert {
+                    value: Box::new(null),
+                    to: Target::Real.name(),
+                },
+                "Cannot convert the variable type ((object)(object 0x0:0x0) to real)",
+            ),
+            (
+                Raise::Convert {
+                    value: Box::new(octet),
+                    to: Target::Text.name(),
+                },
+                "Cannot convert the variable type ((octet)<% 01 %> to string)",
+            ),
+            (
+                Raise::Convert {
+                    value: Box::new(Variant::Integer(1)),
+                    to: Target::Octet.name(),
+                },
+                "Cannot convert the variable type ((int)1 to octet)",
+            ),
+            (
+                Raise::AccessDenied,
+                "Invalid operation for Read-only or Write-only property",
+            ),
+            (Raise::RangeError, "The value is out of the range"),
+            (Raise::FormatString, "Invalid format string"),
+            (Raise::ParameterCount, "Invalid argument count"),
+            (Raise::InvalidParameter, "Invalid argument"),
+            (Raise::NotAnArray, "Specify an Array object"),
+            (Raise::DivideByZero, "Division by zero"),
+        ] {
+            assert_eq!(message_of(&raise), message);
+        }
     }
 }

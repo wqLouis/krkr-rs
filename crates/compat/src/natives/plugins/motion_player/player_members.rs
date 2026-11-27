@@ -256,10 +256,10 @@ extern "C" fn player_get_variable_keys(
             super::helpers::set_retained(out, value);
             0
         }
-        Ok(RetainedValue::Value(value)) => {
-            super::helpers::set_scalar(&ctx, out, value);
-            0
-        }
+        Ok(RetainedValue::Value(value)) => match super::helpers::set_scalar(&ctx, out, value) {
+            Ok(()) => 0,
+            Err(error) => report_error(out_error, &error),
+        },
         Err(error) => report_error(out_error, &error),
     }
 }

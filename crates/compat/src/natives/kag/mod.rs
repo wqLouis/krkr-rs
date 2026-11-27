@@ -226,6 +226,9 @@ impl KagEnv {
                 RetainedValue::Value(TjsValue::Integer(i)) => Ok(EvalResult::Integer(i)),
                 RetainedValue::Value(TjsValue::Real(r)) => Ok(EvalResult::Real(r)),
                 RetainedValue::Value(TjsValue::String(s)) => Ok(EvalResult::Str(s)),
+                RetainedValue::Value(TjsValue::Octet(_)) => {
+                    Err("KAGParser: eval produced an octet".to_string())
+                }
                 RetainedValue::Value(TjsValue::Object | TjsValue::Retained(_)) => {
                     Err("KAGParser: eval produced an unretained object".to_string())
                 }
@@ -414,6 +417,7 @@ fn tjs_value_truthy(value: &TjsValue) -> bool {
         TjsValue::Integer(i) => *i != 0,
         TjsValue::Real(r) => *r != 0.0,
         TjsValue::String(s) => tjs_string_to_integer(s) != 0,
+        TjsValue::Octet(bytes) => !bytes.is_empty(),
         TjsValue::Object | TjsValue::Retained(_) => true,
     }
 }

@@ -267,6 +267,7 @@ fn tjs_bool(v: &TjsValue) -> bool {
         TjsValue::Integer(i) => *i != 0,
         TjsValue::Real(r) => *r != 0.0,
         TjsValue::String(s) => !s.is_empty(),
+        TjsValue::Octet(bytes) => !bytes.is_empty(),
         TjsValue::Object | TjsValue::Retained(_) => true,
     }
 }

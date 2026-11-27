@@ -1,0 +1,19 @@
+# the engine's answers, recorded by `crates/tjs/examples/raise_oracle.rs`; regenerate with the command in the example's docs
+convert_int_null	Cannot convert the variable type ((object)(object 0x0:0x0) to int)
+convert_real_null	Cannot convert the variable type ((object)(object 0x0:0x0) to real)
+convert_string_octet	Cannot convert the variable type ((octet)<% 01 %> to string)
+convert_int_octet	Cannot convert the variable type ((octet)<% 01 %> to int)
+convert_real_octet	Cannot convert the variable type ((octet)<% 01 %> to real)
+convert_number_null	Cannot convert the variable type ((object)(object 0x0:0x0) to int/real)
+convert_object_integer	Cannot convert the variable type ((int)1 to Object)
+convert_increment_octet	Cannot convert the variable type ((octet)<% 01 %> to int/real)
+convert_increment_octet_long	Cannot convert the variable type ((octet)<% 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 0... to int/real)
+convert_string_octet_long	Cannot convert the variable type ((octet)<% 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 01 0... to string)
+access_denied_text_length	Invalid operation for Read-only or Write-only property
+range_error_text_index	The value is out of the range
+range_error_octet_index	The value is out of the range
+format_string_sprintf	Invalid format string
+parameter_count_sprintf	Invalid argument count
+parameter_count_char_at	Invalid argument count
+parameter_count_unpack	Invalid argument count
+invalid_parameter_unpack	Invalid argument

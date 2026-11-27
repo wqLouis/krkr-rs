@@ -186,6 +186,14 @@ fn call_value(
         Some(holder) => holder.clone(),
         None => return Err(not_callable(Some(named))),
     };
+    // a member the engine cannot hold lives on the handle itself, and a named
+    // call reaches it before the engine's own member surface
+    if !named.is_empty()
+        && let Some(member) = holder.rust_member(named)
+    {
+        let none = TjsString::new();
+        return call_value(machine, &member, &none, arguments, receiver, construct);
+    }
     // a value whose call is code is run by the machine, which is the only part
     // that has a frame to run it in
     if let Some(context) = holder.context() {

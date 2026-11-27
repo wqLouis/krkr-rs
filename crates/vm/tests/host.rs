@@ -39,6 +39,19 @@ impl FrameBody for Recorder {
 }
 
 #[test]
+fn a_top_level_function_stays_callable() {
+    let _lock = vm_lock();
+    let vm = VmHost::with_default().expect("create vm host");
+
+    vm.exec("function addOne(x) { return x + 1; }", "boot")
+        .expect("a top-level function declaration");
+    assert_eq!(
+        vm.eval("addOne(41)", "boot").expect("call the function"),
+        TjsValue::Integer(42)
+    );
+}
+
+#[test]
 fn exec_eval_and_tick() {
     let _lock = vm_lock();
     // The frame body the host runs reads the L2 frame clock, so the harness
