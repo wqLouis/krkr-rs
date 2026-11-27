@@ -150,10 +150,10 @@ argument: the entry is a small repoint, the objects are the wall.
 | execute | `runtime::engine::{run,eval,run_with_members_options,eval_with_members_options}` (`runtime/engine.rs:288`, `:302`, `:317`, and `:389` for the block runner) over `Block::build` (`runtime/exec/build.rs`) and `Machine::with_global` (`runtime/exec/mod.rs:322`) | `crates/tjs/tests/rust_engine.rs:276` replays `value_layer.txt` + `object_members.txt` (89 probes) through the Rust executor against the engine's answers | the entry is reached by `crates/vm` (`host.rs:428`, `:448`), by `compat`'s `ScriptScope` (`compat/src/script.rs:102`, `:124`) and by `Scripts.execStorage` (`natives/scripts.rs:620`), not by `Tjs2Engine` |
 | value | `runtime/variant.rs::Variant` | `tests/fixtures/value_layer.txt` (69 rows) replayed by `tests/value_layer.rs` | — |
 | object | `runtime/object.rs::Dispatch` (`:232`), `CustomObject` | `tests/fixtures/object_members.txt` (19 rows) replayed by `tests/object_members.rs` and by `rust_engine.rs` | `new Array()`/`new Dictionary()` still resolve to the **engine's** class, so a constructed container is a C object; a Rust container is what a literal and a Rust native make (`exec/build.rs:622`) |
-| containers | `runtime/array.rs`, `runtime/dictionary.rs`, `runtime/octet_pack.rs` | `array_members.txt` (156), `dictionary_members.txt` (25), `octet_pack.txt` (294) | `Array` publishes 24 member names (`array.rs:103`) and serves one call, `split` (`array.rs:869`); `Dictionary` publishes no member table. `save`/`load`/`saveStruct` have no rule at all |
+| containers | `runtime/array.rs`, `runtime/dictionary.rs`, `runtime/octet_pack.rs`, `runtime/stream.rs` | `array_members.txt` (166), `dictionary_members.txt` (30), `octet_pack.txt` (293), `binary_form.txt` (27), `stream_members.txt` (37) | `Array` serves its 23 member names through `Dispatch` (`array.rs`), and `Dictionary` its 7 static rules; the class objects are still the engine's, so `new Array()` constructs a C container. The stream members (`save`, `load`, `saveStruct`, `loadStruct`, `assignStruct`) now have rules over `StreamHost`, and `stream_members.txt` records the two rules where the model still differs: the reference answers the receiver and clears before it validates |
 | member map | `runtime/member.rs::MemberMap` | `tests/fixtures/member_order.txt`; `tests/rehash_growth.rs` | — |
 | builtin classes | `runtime/natives/{math,date,date_parse,exception,random,regexp,string,config}.rs` | `math_members.txt` (140), `date_members.txt` (157), `exception_members.txt` (38), `random_members.txt` (84), `regexp_members.txt` (102), `string_members.txt` (81), `config_members.txt` (7) | the class **objects** exist for four names only (`natives/registry.rs:56`: `Math`, `Exception`, `RegExp`, `Date`); the registry has no registration entry |
-| the global object | `runtime/bridge/mod.rs::GlobalMembers` (`:55`) and `CHandle` (`:291`), the handle `runtime/engine.rs:389` builds for the engine's global | `tests/rust_engine.rs`; `crates/compat/tests/runtime_surface.rs:203` | the object the handle is built over is the **engine's** global (`Tjs2Engine::global_object`); the Rust store is a side table, not the object |
+| the global object | `runtime/global.rs::GlobalObject` owns the scope's members (`CustomObject`), its class objects (`NativeRegistry`) and the names a script deleted, and asks the engine's global object as one fallback source; `runtime/engine.rs:395` runs a block against the scope's object (`bridge::scope_global`) | `crates/tjs/tests/global_object.rs`; `crates/tjs/tests/engine_core.rs`; `tests/rust_engine.rs` | one resolution order, written in `runtime/global.rs`: own members, then the registry, then the engine's global. `bridge::GlobalMembers` is now only the store of the values an object cannot give the engine (a context's members, an anchor's host), and `bridge::unaddressable` is the one write rule both objects use |
 | a Rust-owned object as a script value | `runtime/bridge/mod.rs::retain_host_object` (`:688`) anchors the object on an engine dictionary and mirrors its members; the store keeps the object itself | `crates/tjs/tests/native_classes.rs:39` runs the four Rust classes through the Rust entry | the anchor is an engine object, and the value's identity lives in a store keyed by the anchor's id |
 | retained values | `Tjs2Engine::retained` (`lib.rs:971`) is bookkeeping: it remembers ids to release at drop | `tests/retained_teardown.rs`, `tests/invalidate_retained.rs` | the ids, the values and the lifetime are the C++ map's (`abi.cpp:117`); `DetachedValue` holds a C engine pointer (`lib.rs:1038`) |
 | native class registration | `natives/registry.rs::NativeRegistry` with a fixed table and a private `Class` trait (`:121`) | `tests/native_classes.rs` | no entry point: a class cannot be registered by name with a fn table, and a class instance has no payload slot |
@@ -224,16 +224,43 @@ uv run --project scripts krkr-gate surface-lock --no-regen
 
 ### Step 3 — the global scope is a Rust object
 
-`runtime/engine.rs:389` asks the engine for its global and wraps it in a
-`CHandle`. The change is the inversion: a `GlobalObject` implementing `Dispatch`
-owns the root `GlobalMembers` and the `NativeRegistry`, and asks the engine's
-global as **one source** for a name it does not hold. The side table becomes the
-object and the engine's global becomes the fallback. `CHandle` keeps its store
-for context handles (`runtime/engine.rs:445`), which is what a context receiver
-needs.
+`runtime/engine.rs:395` built the machine's global by asking the engine for its
+global object and wrapping that in a `CHandle`. The change is the inversion: a
+`GlobalObject` implementing `Dispatch` owns the root members and the
+`NativeRegistry`, and asks the engine's global as **one source** for a name it
+does not hold. The side table becomes the object and the engine's global becomes
+the fallback. `CHandle` keeps its store for context handles
+(`runtime/engine.rs:447`), which is what a context receiver needs.
+
+**Landed.** `runtime/global.rs` is the one place the order is written: own
+members, then the registry's class objects, then the engine's global object; a
+deletion tombstones a class name so the registry does not answer it again. The
+scope owns one object (`bridge::scope_global`), so a `var` or a `function` a
+call declares is there for the next. A write stays on the object only when the
+engine cannot address the value (`bridge::unaddressable`, the crossing rule the
+bridge already had) or when it shadows a published class name; every other value
+the engine holds, because the engine's own code reads its global object
+directly. `bridge::CHandle` no longer carries the registry or the global's
+store: `bridge::GlobalMembers` is the store of the values an *object* cannot
+give the engine, and a handle's root is a weak reference to its scope (the scope
+owns the global object, which owns the handle over the engine's global).
+
+What that does **not** yet move is construction: `new Array()` and
+`new Dictionary()` still resolve to the engine's class object, because the Rust
+`Array` and `Dictionary` class objects publish a member set that is not the one
+the engine's class carries. `crates/compat/tests/save_struct.rs:171` runs
+`var a = ['a"b\\c']; var s = a.toStructString();` through the Rust entry, and
+`save2`/`saveStruct2`/`toStructString` are registered by the `save_struct`
+plugin on the **engine's** `Array` class object
+(`tjs2_register_native_instance_members`), so a Rust `ArrayObject` would raise
+where the plugin answers, and the surface lock would lose the three names. The
+class object is the unit (§6, “A class cannot be deleted by porting its rules”):
+its table, its construction and its instance members move together, and that is
+the class migration, not this step.
 
 ```sh
 cargo test -p tjs --test rust_engine
+cargo test -p tjs --test global_object
 cargo test -p compat --test runtime_surface
 uv run --project scripts krkr-gate surface-lock --no-regen
 cargo test -p compat --test kag
@@ -349,7 +376,7 @@ touches after Step 6.
 | **`Scripts.compileStorage` has no home for the writer.** The loader is gone, so the writer cannot be checked against the C++ reader; `compileStorage` is its only caller | `natives/scripts.rs:1087`; `tjsScriptBlock.cpp:1030`, `:922` | a `.tjsb` committed as the oracle, or a reference recording; `Scripts.compileStorage` must not become a silent no-op |
 | **`Array.save`/`load`/`saveStruct` are `std::fopen` behind a process-global data directory.** The stream is the one IO path the storage namespace cannot reach, and the save path itself is a script (`save_struct` installs a serializer through a script entry and keeps its namespace retained on the global) | `cpp/streams.cpp:75`, `:319`; `crates/compat/src/host.rs:246`; `natives/plugins/save_struct/mod.rs:534` | a write seam symmetric with `StorageReadFn`, and the `FE FE <mode>` container plus its zlib payload. `flate2` with `zlib-rs` is already a workspace dependency (`Cargo.toml:59`), so no C zlib has to stay |
 | **The log callback's user pointer must outlive every log, including one emitted from a destructor.** The ABI keeps the most recently installed callback in a process-wide atomic and clears it before the engine is freed | `abi.cpp:135`, `:1931`, `:1900`; `crates/vm/src/host.rs:380`, `:545` | a per-engine sink, cleared before the state it points at dies, with the same order the C++ has |
-| **`onig_end`'s ownership.** The C++ calls it on shutdown; the Rust binding never does, because another expression may still be live | `cpp/tjs2/tjs.cpp:214` → `cpp/tjs2/tjsRegExp.cpp:179`; `crates/tjs/src/vm/onig.rs:15` | one owner for the library's process-wide state; deleting `tjsRegExp.cpp` must not leave a shutdown that frees expressions still in use |
+| **`tjsRegExp.cpp` still owns the class registration and `onig_end`.** The Rust `RegExp` is complete and passes its 102 recorded answers over `fancy-regex`, but the class object a script resolves is still the C++ one, and that file is what calls `onig_end` on shutdown | `cpp/tjs2/tjs.cpp:180`, `:214` → `cpp/tjs2/tjsRegExp.cpp:179` | the class registers from the Rust side; then the file, the library link and the `onig_end` question go together |
 | **`Date`'s zone offset belongs to a host service.** The class reads `TZ`, `/usr/share/zoneinfo` and `/etc/localtime` from inside the registry | `runtime/natives/registry.rs:1153`; `tests/fixtures/date_members.txt` is pinned to `JST-9` | the offset arrives from the composition root; a platform with neither path must not raise where the reference answers |
 | **The message table is two tables today.** `System.assignMessage` rewrites the text of later raises in C++, while the Rust raise paths hardcode theirs | `tjs2/tjsError.h:238-243`, `tjs2/tjsMessage.cpp:116`; `runtime/exec/throw.rs:251`, `runtime/variant.rs:590`; `tests/fixtures/raise_messages.txt` (19 rows) | one table, read by the raise sites; `assignMessage` answers `1` for exactly the registered names |
 | **A class cannot be deleted by porting its rules.** `new Array()` resolves to the engine's class object, so the instance is a C object; the Rust `Array` publishes 24 names and serves one call | `runtime/array.rs:103`, `:869`; `runtime/dictionary.rs` (no member table) | the class object is the unit: its statics, its construction, its instance members and the `save`/`load` rules together |
@@ -361,19 +388,23 @@ touches after Step 6.
 
 ## 7. What keeps a C dependency
 
-**Oniguruma.** The C library stays; the wrapper is already Rust
-(`crates/tjs/src/vm/onig.rs`, a hand-written declaration of the calls the class
-uses against the `libonig.a` the build already links). A pattern is compiled with
-`ONIG_ENCODING_UTF16_LE` and `ONIG_SYNTAX_PERL`, and a Rust engine would have to
-reproduce a dialect, an encoding and an index mapping over a text that is UTF-16
-by definition. `cpp/tjs2/tjsRegExp.cpp` is the last C++ user of the surface, and
-it is deletable once the `RegExp` class object is registered from the Rust side —
-the class's members are already Rust (`runtime/natives/regexp.rs`,
-`tests/fixtures/regexp_members.txt`).
+**Nothing on the Rust path.** The regular expression engine is `fancy-regex`
+— pure Rust, `oniguruma_mode` for the Perl constructs the reference's syntax
+enables, and the UTF-16 to UTF-8 index mapping done in
+`crates/tjs/src/vm/regexp_engine.rs` — and it reproduces all 102 recorded answers
+(`tests/fixtures/regexp_members.txt`), including a capture inside a lookahead and
+the astral-plane probes. Two approximations are recorded in `TODO.md` §12.1: a
+search that exhausts the engine's step budget raises where the reference searches
+until the pattern settles, and only the unmatched-parenthesis refusal keeps the
+reference's text.
 
-**A C compiler, and for now zig.** Oniguruma is compiled C, so the toolchain
-keeps a C compiler. What fetches and builds it today is `zig build` in `deps/`,
-which also stages the header-only `fmt`/`spdlog`/`boost` for the C++
+The C library is still *linked* because `cpp/tjs2/tjsRegExp.cpp` is still
+compiled: that file owns the class registration and `onig_end`. It dies when the
+class registers from the Rust side, and the library, the `libonig.a` link and
+zig's oniguruma target die with it.
+
+**A C++ compiler, and for now zig.** What fetches and stages the header-only
+`fmt`/`spdlog`/`boost` for the vendored tree is `zig build` in `deps/`
 (`crates/tjs/build.rs:8`; `deps/build.zig:1-20`). Deleting `crates/tjs/cpp/`
 removes those three but not Oniguruma: **zig leaves when the Oniguruma fetch and
 build move off it**, a small `deps` build of that one library or a vendored

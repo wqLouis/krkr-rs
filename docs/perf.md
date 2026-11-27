@@ -1225,6 +1225,102 @@ measurement taken while the vendored rule still existed.
 
 ---
 
+### 6.6 The interpreter (C4) — whole scripts on both executors, the harness in the tree
+
+**Status: landed, not yet measured.** `crates/tjs/examples/vm_bench.rs`.
+
+**Method.** §6.1–§6.4 measured the front end and §6.5 the value layer, both
+primitive by primitive. This harness measures the interpreter on whole scripts,
+run by both executors: the frame, the instruction decode, the opcodes, the
+calls, the contexts and the exceptions. Nothing outside the interpreter is in
+its numbers — no storage, no image decode, no class registration, no engine
+service and no game's data — and the one native call in the corpus
+(`Math.floor`) sits in the arithmetic row, which is therefore labelled
+`arith+native` and is never read beside the pure-interpreter rows.
+
+The corpus is eight `const` scripts, each a function whose body is a loop of ten
+thousand iterations, so one call runs for milliseconds and the clock, the frame
+the call lays out and the host call around it are not what a row reports:
+
+| script | what it exercises |
+|---|---|
+| `arith+native` | an integer accumulator, a real one, and `Math.floor` |
+| `compare` | the flag rules: `if`, short-circuit `&&` and `\|\|`, `<`, `<=`, `>`, `>=` |
+| `text` | one text built from a number per iteration, and two comparisons |
+| `array` | an index written 10 000 times, then read 10 000 times |
+| `dictionary` | a key written and read per iteration, over 256 keys |
+| `call` | a small function called in the loop |
+| `property` | a class instance's member written and read |
+| `exception` | a `try`/`catch` entered and left by one throw per iteration |
+
+Three rows per script, and both sides are driven identically:
+
+| row | what it times |
+|---|---|
+| `compile` | the front end alone (`tjs::vm::compile`) |
+| `cold` | one call of the script entry on a fresh engine: compile, build, run the script, then call its body once |
+| `hot` | one call of the already-compiled body, on the engine that ran the script |
+
+**The `compile` row is the control, and it is the strongest one here.** Both
+executors compile with the same Rust front end, so that row is the *same call*
+on both sides: it must come out at 1.0. A run whose `compile` rows are not near
+1.0 is a harness fault — the timer, the median, or a host that moved between
+the two sides — and its other rows are not read.
+
+**The hot row calls the compiled body on both sides, and the reason is the
+cache.** `EngineCore::run` keeps the block it compiled, filed under the block's
+name and the text it was compiled from:
+`crates/tjs/src/vm/runtime/engine_core.rs:212-217` builds the answer from the
+stored block and `:219` returns it, before the `compile` at `:222`, so a second
+`run` of the same text compiles nothing. The vendored script entry keeps no
+such block: `crates/tjs/cpp/tjs2/tjsScriptCache.cpp:36-71` binds a
+`new tTJSScriptBlock` on every call (`:41`, `:59`) and compiles through
+`SetText` (`:46`, `:64`), and the comment at `:40` says it — only
+`EvalExpression` consults the block cache, through `Cache.FindAndTouchWithHash`
+(`:103`, `:166`), and only when it is given no name. A repeated `exec_script`
+therefore recompiles the text, so timing it would put a compile in one column
+and not the other. The entry that re-executes a compiled block without
+compiling — the only one either side has — is a call of the compiled value, so
+both sides compile once and the row then calls the retained `vmTarget`: a call
+of `Tjs2Engine::call_detached` and of `EngineCore::call_value`, the function
+read off the global object once on each side. The harness measures the
+difference as well as stating it: a run ends with the compile counts of two runs
+of the same text — one then none on the Rust side, one then one on the vendored
+side.
+
+The two sides are timed in turn inside every repetition, one warm-up pass per
+side is discarded, and a row reports the median of seven repetitions. A hot
+repetition is five calls of the body and the row reports their mean. Each row
+also compares the number the two sides answered: a row whose sides did
+different work is marked `DIFFER`, and its ratio measures two different
+scripts. The harness prints the machine-readable table
+(`name<TAB>cpp_ns<TAB>rust_ns<TAB>ratio`, with `#` comment lines) and a
+formatted summary.
+
+**The command.**
+
+```sh
+cargo run --release -p tjs --example vm_bench
+```
+
+A release build is part of the measurement: the vendored tree's optimisation
+level follows the profile (`TJS2_OPT` overrides it), and a debug build measures
+two things nobody runs. The harness opens no window and needs no display and no
+GPU. It prints the host's load average beside every table, because a load above
+about four makes a number a report of the machine; a run is kept only from an
+idle host, and the load is reported with the numbers.
+
+**What the rows will not say.** The corpus is synthetic and small, and it is
+strictly the interpreter: a row says what one executor pays to run a script of
+that shape, not what a title's frame costs (§2, §3 and §11 measure that), and
+not what storage, decode or the natives cost apart from the one call in
+`arith+native`. It also does not separate the parts inside a call — the frame
+layout, the instruction decode, the member table — the way §6.5 does for the
+value layer; a row that moves says a script of that shape got faster or slower,
+and the primitive-level harness is where the cause is looked for.
+
+---
+
 ## 7. The render path
 
 ### 7.1 The dirty region: a pixel write must not re-upload the whole image

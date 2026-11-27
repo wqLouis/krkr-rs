@@ -109,6 +109,31 @@ declares the same table once and derives its decoder from it, so a stream the
 loader accepts is a stream the interpreter can execute, or refuses with a typed
 error — never one it mis-reads.
 
+#### The decoded stream
+
+The table is applied **once per code area**, not once per instruction. When a
+context is built, its words are decoded into a `Stream` of `Instruction` values
+(`runtime/exec/instruction.rs`), and each instruction carries exactly what its
+arm needs:
+
+| operand in the stream | in the instruction |
+|---|---|
+| a register address — a byte offset, scaled by 20 | a **slot** of the frame's block: `base + address / 20`, resolved once |
+| a constant-area address | an index into the constant area |
+| a code address — a distance in words | an index into the instruction stream |
+| a register tail — a count, `-1`, or `-2` and pairs | a range of one argument table |
+
+The run loop then walks that slice with a position: no address is scaled, no
+alignment is checked and no operand is proved in range per instruction, which is
+where the interpreter's time went (`docs/perf.md`). A register outside the
+frame's window, a constant outside the constant area, a jump that lands between
+two instructions, an argument flag that is not one, and a stream that ends inside
+an instruction are all refused **when the block is built**, with the typed
+failure the encoding names for each; nothing of such a stream runs, so the loop
+carries no panic path and no fallback. The word stream itself stays on the
+`Code` for the disassembler (`decode::mnemonic`, `decode::length`) and for the
+trace positions a failure reports.
+
 ### 2.2 The table
 
 Notation: `%d` is the destination register, `%s`/`%a`/`%b`/`%o`/`%p`/`%n`
@@ -496,13 +521,22 @@ branches on the context's kind (`tjsInterCodeExec.cpp:2772-2807`):
 |---|---|
 | `ctTopLevel` | run with the global object as the receiver, no arguments |
 | `ctFunction`, `ctExprFunction`, `ctPropertyGetter`, `ctPropertySetter` | run with the caller's receiver and arguments |
-| `ctClass` | run — this is how `new C()` builds an instance |
+| `ctClass` | run with the caller's receiver, which is how a super class is initialized |
 | `ctProperty` | refuse: a property declaration is not callable |
 | `ctSuperClassGetter` | succeed and do nothing (`:2802-2803`) |
 
 When a member name was given instead, the context's own members answer first and
 a name it does not hold falls through to the super-class proxy — which is how an
 inherited method is reached (`:2809-2820`).
+
+A **construction** is not a call of the code. `new` asks the value to construct, and
+a class answers by making an object (`:2920`), running the class's own code in it
+(`:2923` — `ADDCI`, `REGMEMBER`, the class body, and the super-class call at the
+class's head) and then calling the member the class is named after in that object
+as its `this` (`:2924`). The answer is the object it made whatever the constructor
+answered, the constructor call's own failure is not the construction's
+(`:2922-2931`), and a context that is not a class refuses the construction as the
+invalid type (`:2916-2918`).
 
 ---
 
@@ -561,10 +595,9 @@ Three consequences follow, and each one is load-bearing:
 3. **An already-script-level error is re-thrown, not re-wrapped.** The inner
    `ExecuteCode` catches `eTJSSilent` and `eTJSScriptError`, adds this context to
    the trace, and re-throws (`:1304-1308`), so the trace accumulates the call
-   chain as the exception passes through each protected block. Only the outer
-   handler converts it to an object. `eTJSSilent` passes through everything
-   untouched and is never reported (`:1304-1305`, `:1359-1360`) — it is the
-   cancel signal.
+   chain as the exception leaves each executing context. Only the outer handler
+   converts it to an object. `eTJSSilent` passes through everything untouched
+   and is never reported (`:1304-1305`, `:1359-1360`) — it is the cancel signal.
 
 ### 4.3 A `throw` across a native call
 
@@ -609,9 +642,10 @@ place in the plan that touches the seam.
 * An uncatchable `eTJSSilent` is never turned into an object and never logged.
 * A thrown non-object value is still catchable and still reproducible as
   `throw` sent it; only an *error* becomes an `Exception` object.
-* The `trace` accumulates one entry per protected block the exception passed
-  through, so the message a script reads names the call chain in the order it
-  unwound.
+* The `trace` accumulates one entry per context the exception unwinds through:
+  the throw's own context at the throw instruction, then each caller at its call
+  instruction, innermost first. An engine-shaped failure adds no entry for the
+  context that raised it, so its trace starts with the first caller it crosses.
 * A `catch` with **no** name binds nothing, and its frame clear reaches all the
   way down to `FrameBase`, so the object it received is discarded before the
   handler runs (`tjsInterCodeGen.cpp:3536-3539`). The object is created either
@@ -682,7 +716,7 @@ everything, and the frame gates every opcode.
 | **P0** | **the dispatch surface** — `func_call`, `create_new`, `operation`, by-number access, and the real `Closure` surface | `runtime/object.rs`, `runtime/variant.rs` (G1–G3, G5) | ~600 lines | a script-shaped value can be invoked, compound-assigned and subscripted through the trait; the object-model oracle (`crates/tjs/examples/object_oracle.rs`) still reproduces its record, and new probes cover the three added entries |
 | **P0b** | **the throw value on the native boundary** (G6) | `crates/tjs/cpp/tjs2_abi.cpp`, `crates/tjs/cpp/tjs2_abi.h`, `crates/tjs/src/lib.rs` | ~250 lines | a script `throw` that crosses a native call leaves a `catch` with the object it threw; the probe drives a native that calls back into a script that throws, and asserts the object's members on the far side |
 | **P1** | **the frame** — the register window, the argument copy, the collapse array, the discard register, the `this` triple, the block allocator, and the objthis-context proxy (a thirteen-entry dispatch of its own) | `runtime/exec/frame.rs` | ~930 lines | a hand-built code stream answers what the frame put there: `[CONST %1 #3][SRV %1][RET]` answers 3; a call with more, fewer and exactly the declared arguments leaves the registers the reference leaves; a collapse parameter answers an array of the surplus |
-| **P2** | **the decoder and the flag** — the layout table, the dispatch, the 18 control/comparison opcodes, the 17 single-operand ones, and the 56 arithmetic and property forms | `runtime/exec/decode.rs`, `runtime/exec/op.rs` | ~1 100 lines | every arithmetic and comparison opcode answers what the reference answers, including the `GreaterThan`/`LittlerThan` inversion and the `<=`-as-`CGT`+`SETNF` pair; the flag survives an intervening `TT`; the two unreachable opcodes are decoded and executed |
+| **P2** | **the decoder and the flag** — the layout table, the decoded instruction stream, the 18 control/comparison opcodes, the 17 single-operand ones, and the 56 arithmetic and property forms | `runtime/exec/decode.rs`, `runtime/exec/instruction.rs`, `runtime/exec/op.rs` | ~1 100 lines | every arithmetic and comparison opcode answers what the reference answers, including the `GreaterThan`/`LittlerThan` inversion and the `<=`-as-`CGT`+`SETNF` pair; the flag survives an intervening `TT`; the two unreachable opcodes are decoded and executed |
 | **P3** | **member access** — the 15 access opcodes, the string and octet diversions, the property flags | `runtime/exec/member.rs` | ~700 lines | the six source shapes of §3.4 answer what the reference answers on a plain object, a dictionary, a string, an octet and a property; `delete` answers a boolean and a missing member is not an error; `typeof` distinguishes `"void"` from `"undefined"` |
 | **P4** | **calls and returns** — the four call opcodes, the three argument-list shapes, `SRV`/`RET`, the context as a dispatch object | `runtime/exec/call.rs` | ~500 lines | recursion terminates with the right answer; `...` passes the caller's arguments through with no copy and no `arguments` object; the collapse parameter and `fatExpand` splice the right elements; a call with no result slot discards nothing |
 | **P5** | **the context objects** — `GLOBAL`, `CHGTHIS`, `ADDCI`, `REGMEMBER`, the class and super-class chain | `runtime/exec/context.rs` | ~450 lines | a top-level function is a method of the object it was declared on; `incontextof` rebinds; `new C()` registers the class's functions on the instance; `super` reaches the parent's member |

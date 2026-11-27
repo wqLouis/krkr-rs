@@ -1725,6 +1725,10 @@ review sees; the column is the unit the design names.
 
 **The extendable objects owe nothing.** `tjsObjectExtendable.{h,cpp}` (285) is the base of a native class *instance* whose class has a superclass, and nothing in the tree assigns one: `SetSuper`'s only callers are `ExtendsClass` (no callers anywhere) and a `TJS_CII_SET_SUPRECLASS` branch guarded by `SuperClass != nullptr`, and `GetSuper` has no issuers at all. So `CreateBaseTJSObject` always builds a `tTJSCustomObject`, every forwarder is `inherited::` plus a dead check, and there is no class, no member, no name — the surface dump (74 classes) mentions nothing like it. Its one script-reachable path, `invalidate` on a native class object, dereferences that null superclass (`tjsObjectExtendable.cpp:143-145`) and is an **approximation, not a rule**: this repository answers through `Dispatch::invalidate` where the reference crashes.
 
+**`RegExp` is a pure-Rust class now, with two approximations recorded rather than hidden.** The 102 recorded answers replay through `fancy-regex`, the capture inside a lookahead (`value_exec_global_group_end`) and the surrogate-pair offsets (`value_exec_emoji`, `value_exec_emoji_global`) included, so the dialect, the encoding and the index mapping are proven by the fixture, not asserted. Two gaps are approximations, not unobservable facts: (1) a search that exhausts the backtracking VM's 1 000 000-step budget raises where the reference searches until the pattern settles — the budget is the Rust engine's, the reference sets none, and no recorded probe reaches it, so a pathological pattern a game ships is the case that would show it; (2) a pattern the engine refuses carries this engine's own message, except the unmatched-parenthesis text the probes pin (`value_literal_bad_pattern`, `value_invalid_pattern_constructor`, `value_invalid_pattern_compile`), so `e.message` differs for a malformed pattern the fixture does not record.
+
+**The binary structure is the reference's byte for byte, with one width the vendored oracle cannot write.** `binary_form.txt` pins 27 rows — the signature, the one-item-array frame and the value, with the bytes written and the value read back — so the fixnum, the width tags, the text and octet forms and the container tags are proven instead of described. The eight-byte negative integer form (`tjsBinarySerializer.h:145-158`) is an approximation with its reference gap (D36): the same header's `:136` compares the value against `LONG_MIN`, which is 64-bit on this host, so the vendored engine truncates anything below −2³¹ into the four-byte form and reads its own file back as `2147483647`, while the shipped engine (`long` being 32 bits there) writes the eight-byte form. The Rust writer keeps the shipped form, because the truncation would corrupt a save; no recorded row covers that width, and the reader still answers a foreign tag by the tag's own bytes, which is a unit test.
+
 **A landed part does not always delete its body in the same change.** R2 and
 R3 are in Rust and proven, but the vendored variant and object are still
 compiled into the binary, because their types cross the C interface by value
@@ -1760,28 +1764,23 @@ through the cut-over engine and getting the committed bytes back. Two of those n
 deleted, and each needs its own oracle first:
 
 * **the regular expression engine** (`tjsRegExp.cpp`, 763 lines of C++, over
-  Oniguruma). The scope is set: the **C library stays** and the *C++* goes.
-  The engine is created with `ONIG_ENCODING_UTF16_LE` and `ONIG_SYNTAX_PERL`
-  (`tjsRegExp.cpp:307`, `:650`) — not UTF-8 and not the default syntax — so a
-  Rust engine would have to reproduce a dialect, an encoding and an index
-  mapping over strings that are UTF-16 by definition. Keeping Oniguruma through
-  a Rust binding (`onig` 6.5 / `onig_sys` 69.9, or the raw `onig_sys` for the
-  six calls that are used: `onig_new`, `onig_search`, `onig_region_new`/
-  `free`/`clear`, `onig_error_code_to_str`, `onig_free`, `onig_end`) makes the
-  behaviour **identical by construction** and removes the last C++ user of the
-  regex surface while leaving the C dependency in place, like FFmpeg, libopus
-  and ALSA. The binding is now `crates/tjs/src/vm/onig.rs`: a hand-written
-  declaration of those calls against the `libonig.a` the crate's build already
-  fetches and links, so no registry crate is fetched. `tjsRegExp.cpp` is the
-  last C++ user of that surface and is deletable once the class object is
-  registered from the Rust side. The pure-Rust engines stay recorded as the fallback if a C
-  dependency ever has to go: `regex` (1.45e9 downloads, rust-lang, linear time)
-  and `fancy-regex` (3.3e8, backreferences and lookaround), while the two
-  Oniguruma clones are rejected on the usage bar — `ferroni` 60 000 downloads
-  and `rusty_expressions` 1 300, both first published this year. Either way the
-  proof is the number rule's: inventory the patterns the games ship (needs the
-  game directory), record the engine's own match results, compare, then delete
-  `tjsRegExp.cpp`.
+  Oniguruma) — **the Rust side is landed on a pure-Rust engine, and proved.**
+  The class runs on `fancy-regex` in its Oniguruma mode
+  (`crates/tjs/src/vm/regexp_engine.rs`): the pattern is compiled in the Perl
+  syntax the reference passes to its engine (`tjsRegExp.cpp:307`, `:650`), the
+  UTF-16 text is transcoded against a code-unit boundary table so a match's
+  offsets come back in code units, and `ONIG_OPTION_FIND_NOT_EMPTY` is
+  reproduced because the class's default flags carry it. The proof is the one
+  this list asked for and it is committed: the 102 answers in
+  `tests/fixtures/regexp_members.txt` replay through the Rust class
+  (`crates/tjs/tests/regexp_members.rs`), the capture inside a lookahead and
+  the surrogate-pair offsets included. `build.rs` still fetches and links
+  `libonig`, because `cpp/tjs2/tjsRegExp.cpp` is still compiled into
+  `libtjs2_core`; the C library and the oniguruma half of `deps/build.zig` go
+  in the change that deletes that file, which keeps zig and the rest of the
+  C++ until then. The two Oniguruma clones stay rejected on the usage bar —
+  `ferroni` 60 000 downloads and `rusty_expressions` 1 300, both first
+  published this year.
 * **the date grammar and its word map** (`bison/tjsdate.y` and
   `script/create_world_map.py`). The whole unit is 800 lines plus a 99-line
   generator; a ported parser retires bison, a Rust build step retires python3,
@@ -1792,9 +1791,11 @@ repository**: `crates/tjs/cpp/` deleted, `build.rs` and `links = "tjs2"` with
 it, and **zig gone** — the C++ compiler, and the package manager that fetches
 fmt, spdlog, boost and oniguruma, exists only to build those files. Bison and
 python3 go the same way, with the date grammar they serve. **C libraries stay**:
-FFmpeg, libopus, ALSA and Oniguruma are dependencies of the binary, accepted as
-such (`docs/arch/l1.md` §4 for the media backend), and the point of the order is
+FFmpeg, libopus and ALSA are dependencies of the binary, accepted as such
+(`docs/arch/l1.md` §4 for the media backend), and the point of the order is
 that the C++ and its zig chain leave the build before anything else does.
+Oniguruma is the one that is already gone from the Rust side and outlives this
+paragraph only as `tjsRegExp.cpp`'s link dependency.
 
 When the last file goes, the toolchain list in `AGENTS.md` §1.2 shrinks to Rust
 plus a C compiler for those libraries — no C++ compiler, no zig, no bison, no

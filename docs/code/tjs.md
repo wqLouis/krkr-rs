@@ -290,7 +290,8 @@ state makes concurrent engines unsafe.
   are Rust, and the C++ that is still entered is what `Tjs2Engine`'s own
   entries call. The order that removes it, and the point after which no script
   enters the C++ engine, is [tjs/engine.md](tjs/engine.md) §4–§5; the build
-  keeps zig and oniguruma until then.
+  keeps zig until then; oniguruma is no longer used by the Rust path, only by the
+  C++ class file that is still compiled.
 * `docs.old/vm-defects.md` records the VM and reference defects a rewrite must
   not rediscover.
 

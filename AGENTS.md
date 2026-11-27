@@ -43,7 +43,7 @@ task seems to need.**
   mess the user can clean up later, and the session may have to be stopped
   for it.
 
-**Seven rules, stated once, up front.** The rest of this file explains *why* a
+**Six rules, stated once, up front.** The rest of this file explains *why* a
 change is made the way it is; these say *what* you owe the next person.
 
 **For a worker — a subagent with a scope:**
@@ -51,11 +51,11 @@ change is made the way it is; these say *what* you owe the next person.
 1. **Your scope is the only place you may write.** Every other path is
    blocked for you. If the task needs a file outside it, stop and report it
    rather than reaching for the file.
-2. **You may edit the working tree.** Do not copy the repository, and never
-   commit or push. But you **must notify the main agent**: end your turn with
-   a status that names the patch path, every file you touched, what changed
-   in each, and what you need from the main agent. A change without a status
-   is invisible, and an invisible change is an unreviewed change.
+2. **You edit the working tree, in place.** Do not copy the repository, and
+   never commit or push. End your turn with a status that names every file you
+   touched, what changed in each, and what you need from the main agent. A
+   change without a status is invisible, and an invisible change is an
+   unreviewed change.
 3. **Do not run cargo.** Not `cargo build`, `cargo check`, `cargo clippy`,
    `cargo test`, `cargo run` or `rustc`: concurrent builds in one target
    directory have livelocked this machine, and the main agent runs the builds
@@ -73,23 +73,20 @@ change is made the way it is; these say *what* you owe the next person.
    a build directory. Report the load average with your numbers: a load above
    about four invalidates a timing.
 4. **Scratch goes under `/tmp`, never on the hard disk**, and you delete it
-   when the task ends. `/tmp` is a 16 GB tmpfs: keep the build directories
-   out of `/tmp/pi-patches/`, and remove them when they are done.
-5. **Deliver a patch.** `/tmp/<task>.patch` is the diff of the files you
-   touched. Write it incrementally, as you go, so that a rate limit cannot
-   lose it.
+   when the task ends. `/tmp` is a 16 GB tmpfs: keep build directories out
+   of it, and remove what you wrote when the task is done.
 
 **For the integrator — the main agent that owns the change:**
 
-6. **The gate, the builds and the test suites are yours** (§0.4), run one at
+5. **The gate, the builds and the test suites are yours** (§0.4), run one at
    a time and on a quiet machine. A load average above about four invalidates
    a measurement, so a number taken under load is not a result. **P0 — the
    machine** ("the machine") says what "one at a time" means in practice: one
    heavy job in flight, no second job queued behind the lock, and no
    measurement while anything else runs.
-7. **Review the patch, not only the report** (§0.3), and **commit in stages**:
+6. **Review the diff, not only the report** (§0.3), and **commit in stages**:
    a reviewed stage is a commit of its own, never one large commit at the end.
-8. **Freeing disk space is a surgical act, never a blanket delete.** When
+7. **Freeing disk space is a surgical act, never a blanket delete.** When
    the target directory has to shrink, remove what the build does not need
    — the stale artifacts of sources that were deleted, the abandoned
    incremental directories, the build directories of a dependency that is
@@ -164,12 +161,12 @@ reference behaviour is the oracle, what is in flight, and where the risk is.
    **Shape** line carries it.
 2. **Dispatch disjoint workers.** One coherent change per worker, and no two
    workers writing the same file in one wave. The worker edits the working
-   tree and delivers `/tmp/<task>.patch` — the diff of the files it touched —
-   and notifies the main agent, which reviews and integrates (rule 2 and rule 5
-   above). A worker never commits or pushes.
-3. **Verify the patch.** Read the diff, apply it with `git apply --3way`,
-   resolve conflicts, and check the layer boundary, the reference behaviour,
-   the surface lock, the task's non-goals and silent fallbacks.
+   tree in place and notifies the main agent, which reviews and integrates.
+   A worker never commits or pushes.
+3. **Verify the diff.** Read what the worker wrote — `git diff` for the files
+   it names, `git status` for the ones it did not — and check the layer
+   boundary, the reference behaviour, the surface lock, the task's non-goals
+   and silent fallbacks.
 4. **Run the gate.** Only the integrator runs `cargo fmt`, clippy, the full
    static gate and both test suites (§0.4).
 5. **Measure.** Re-run the trace or benchmark that motivated the change; a
@@ -178,12 +175,12 @@ reference behaviour is the oracle, what is in flight, and where the risk is.
    and commit only after the gate and the tests are green. A worker's report
    is a proposal, not a completed change. The integrated change leaves the
    shape that makes the next case natural: one table, one owner, one seam; a
-   patch that makes only the reported case pass is rejected.
+   change that makes only the reported case pass is rejected.
 
-**Deletion is part of the change.** When a patch replaces an implementation,
-test, allowlist entry or doc, the superseded one is deleted in the same patch:
+**Deletion is part of the change.** When a change replaces an implementation,
+test, allowlist entry or doc, the superseded one is deleted in the same change:
 no compatibility shim, no stubbed old signature, no "kept for reference" copy,
-no appended "formerly" section. A patch that adds a path without removing the
+no appended "formerly" section. A change that adds a path without removing the
 one it replaces is rejected, and so is a doc that appends a superseded
 section instead of replacing it.
 
@@ -196,7 +193,7 @@ Goal:        one behavior or cleanup, with the evidence that proves it
 Shape:       the current shape, why the bug is a consequence of it, and the
              shape the fix must leave behind
 Write:       exact files/directories; no other writes
-Work:        deliver /tmp/<task>.patch; no repo commit; notify the main agent
+Work:        edit the working tree in place; no commit; report every file touched
 Read:        the module, its callers, and the cited reference lines
 Must hold:   invariants, public/script surface, layer boundary
 Do not:      unrelated fixes, new deps, public renames, commits, cargo
@@ -215,15 +212,13 @@ checks (§0.4) and already-built binaries under `target/debug/`. A worker
 whose task is a measurement may build, under the shared lock, and reports the
 load average with its numbers.
 
-When a result arrives, the integrator reads the patch, not only the report: it
+When a result arrives, the integrator reads the diff, not only the report: it
 checks the layer boundary, the reference behaviour, the surface lock and the
 task's non-goals, and rejects silent fallbacks, unrelated refactors, new
 dependencies, unreviewed public/script changes, an added path that leaves the
 superseded one in place, and a doc that appends a superseded section. A shape
 refactor the brief's **Shape** line called for is in scope; an unrelated
-refactor is not. The
-patch is applied with `git apply --check` and then `git apply --3way`; a patch
-with conflict markers is never accepted.
+refactor is not.
 
 ### 0.4 The gate — the integrator runs it, nobody else
 
@@ -630,7 +625,7 @@ silent fallback?** Block and fix any of these:
   `house-style` gate has no allowlist exemption for one.
 - A stub `todo!`/`unimplemented!`/approximation in L3 (D32). Android-only stubs
   are the sole exception.
-- **A symptom patch for a shape bug** — a special case for one title, archive,
+- **A symptom fix for a shape bug** — a special case for one title, archive,
   member or game; a second copy of a list or table the owning crate already
   has; a bypass around the layer that owns the data; an `if` the reference does
   not have. The change reports the shape problem and lands the refactor that
@@ -788,7 +783,7 @@ Two-sided tests:
 7. If the cause is the shape of the code — a missing abstraction, a duplicated
    table or list, an owner in the wrong layer, a seam only one caller uses —
    the change reports the shape problem and lands the refactor that makes the
-   behaviour natural; a symptom-only patch is not done. A refactor too large
+   behaviour natural; a symptom-only fix is not done. A refactor too large
    for one change lands its first coherent step (no shim, no special case) and
    records the rest.
 8. The integrator's full gate is green.
