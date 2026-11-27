@@ -756,22 +756,19 @@ fn debug_window_property(
     if !cached {
         let class = which.class();
         let scripts = ScriptScope::new(host, &ctx);
-        let object = match scripts.eval(
-            &format!("new {class}()"),
-            "Debug",
-            ScriptOptions::default(),
-        ) {
-            Ok(RetainedValue::Object(object)) => object,
-            Ok(RetainedValue::Value(_)) => {
-                return report_error(
-                    out_error,
-                    &format!("Debug.{}: unexpected scalar result", which.member()),
-                );
-            }
-            Err(error) => {
-                return report_error(out_error, &format!("Debug.{}: {error}", which.member()));
-            }
-        };
+        let object =
+            match scripts.evaluate(&format!("new {class}()"), "Debug", ScriptOptions::default()) {
+                Ok(RetainedValue::Object(object)) => object,
+                Ok(RetainedValue::Value(_)) => {
+                    return report_error(
+                        out_error,
+                        &format!("Debug.{}: unexpected scalar result", which.member()),
+                    );
+                }
+                Err(error) => {
+                    return report_error(out_error, &format!("Debug.{}: {error}", which.member()));
+                }
+            };
         let mut state = services.state::<DebugState>();
         match which {
             DebugWindow::Console => state.console = Some(object),

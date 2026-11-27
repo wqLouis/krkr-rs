@@ -2,41 +2,25 @@
 //!
 //! The front end compiles script text into code streams; this module executes
 //! one. A call takes a block from the page stack, lays the frame out in it, and
-//! the run loop reads the code one instruction at a time.
+//! the run loop reads one decoded instruction at a time.
 //!
 //! # What this part executes
 //!
-//! | group | opcodes | what it does |
-//! |---|---|---|
-//! | the control and comparison instructions | `0 … 17` | the condition flag, the compare, the jump |
-//! | the step instructions | `18 … 25` | `++` and `--`, on a register and on a member |
-//! | the two-operand operators | `26 … 81` | the fourteen compound assignments, on a register and on a member |
-//! | the single-operand operators | `82 … 98` | `~`, `typeof`, `#`, `$`, `+`, `-`, `int`, `real`, `string`, `octet`, `invalidate`, `isvalid`, `instanceof` |
-//! | the compile instructions | `86`, `87` | the text a register holds, compiled and run as an expression |
-//! | the frame instructions | `118`, `119`, `127` | the result, the return, the debugger break |
-//!
-//! Everything else is owned by another part of the interpreter and is named as
-//! such: [`Fault::Refused`] carries the opcode and the part that owns it, so a
-//! refusal says who is missing rather than saying the opcode is unknown. The
-//! opcodes outside this part are the fifteen member accesses and the two `typeof`
-//! member forms, the four calls, the three exception instructions and the four
-//! context instructions.
-//!
-//! # The two opcodes the generator cannot emit
-//!
-//! The consecutive clear and the member write that creates a hidden member are
-//! not reachable from the code generator, and a script block that arrives as
-//! bytecode can still carry them. The consecutive clear executes here; the hidden
-//! write reaches the member seam with its flags resolved, so the one thing it
-//! adds — the hidden flag — is decided where every other member write's flags
-//! are.
+//! Every one of the 128 opcodes. The stream a context runs is decoded once, when
+//! the block is built ([`instruction`]), so an instruction names the slot, the
+//! constant, the jump target or the argument list its arm works on and the loop
+//! does no arithmetic per operand. A word that is not an opcode, an operand that
+//! is outside the frame's window or a jump outside the stream refuses the block
+//! there, before any instruction of it runs.
 //!
 //! # The member seam
 //!
-//! A member read or write is the member access part's, not this one's, so the
-//! fifteen access opcodes and the two `typeof` member forms stop at a named
-//! seam. The compound assignment on a member is not that seam: it reads, applies
-//! and writes through the object surface, which is the engine's own base-object
+//! A member read or write stops at the member part ([`member`]), a call at the
+//! call part ([`call`]), a protected region at the exception part ([`throw`]) and
+//! a context instruction at the context part ([`context`]): each takes the
+//! operands the stream already resolved and answers the failure of its own rule.
+//! The compound assignment on a member is not that seam: it reads, applies and
+//! writes through the object surface, which is the engine's own base-object
 //! behaviour, and the closure form asks the object's `operation` entry instead.
 //!
 //! # The compile instructions
@@ -62,6 +46,7 @@ pub mod call;
 pub mod context;
 pub mod decode;
 pub mod frame;
+pub mod instruction;
 pub mod member;
 pub mod op;
 pub mod throw;
@@ -69,18 +54,19 @@ pub mod throw;
 pub use context::ContextObject;
 pub use decode::{Operator, PropertyForm};
 pub use frame::{BlockStack, Code, Frame, ObjThisContext};
+pub use instruction::{Instruction, Name, Op, Slot, Stream};
 
-/// The failure a raising rule reports.
+/// The reason a raise names.
 ///
-/// The value that failed travels with it, so the message a script reads can be
-/// the engine's own text rather than a summary.
-#[derive(Clone, Debug)]
-#[non_exhaustive]
+/// A reason is static: the text it reads is an entry of the message table, and
+/// the value or the name that text carries travels beside the reason, in the
+/// [`Unwind`] the raise becomes. That is what keeps the executor's error type
+/// free of owned data, so a suspended operation that cannot raise costs nothing
+/// and a raise that happens pays for its data once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Raise {
     /// A value has no conversion of the kind the operation asked for.
     Convert {
-        /// The value the conversion was asked of.
-        value: Box<Variant>,
         /// The kind the conversion asked for, in the target word.
         to: &'static str,
     },
@@ -90,11 +76,20 @@ pub enum Raise {
     IntegerOutOfRange,
     /// A member the instruction named is not there.
     ///
-    /// The name travels because the engine's own message carries it.
-    MemberNotFound {
-        /// The name the instruction named.
-        name: TjsString,
-    },
+    /// The name travels in the [`Unwind`], because the engine's own message
+    /// carries it.
+    MemberNotFound,
+    /// A member is reached on a null object.
+    ///
+    /// The engine reads a null closure before it reads anything else, so this is
+    /// the failure of every operation on one, whatever member it named.
+    NullAccess,
+    /// A pack or unpack template names no kind it reads.
+    UnknownPackTemplate,
+    /// A bit run of a template holds a character that is not a bit.
+    UnknownBitString,
+    /// A hex run of a template holds a character that is not a hex digit.
+    UnknownHexString,
     /// A member the instruction named cannot be written: a text's or a byte
     /// string's surface is read-only, and a write to it is an access denial
     /// rather than a missing member.
@@ -104,12 +99,8 @@ pub enum Raise {
     /// A value a call instruction named cannot be called.
     ///
     /// The engine answers this as the language's own failure rather than as a
-    /// refusal of the object surface, so a script sees it; the member the call
-    /// named travels with it because a script's message names it.
-    NotCallable {
-        /// The member the call named, or nothing when it named none.
-        name: TjsString,
-    },
+    /// refusal of the object surface, so a script sees it.
+    NotCallable,
     /// A member's call gives a number of parameters it does not accept.
     ParameterCount,
     /// A member's call gives a parameter the rule cannot use.
@@ -120,152 +111,97 @@ pub enum Raise {
     NotAnArray,
     /// The text a compile instruction holds does not compile.
     ///
-    /// The message is the front end's own, so a handler that reads it reads what
-    /// the parse failed on rather than a summary of it.
-    ScriptError {
-        /// The front end's message for the first failure.
-        message: TjsString,
-    },
-}
-
-/// Two raises are the same failure when they are the same kind, name the same
-/// kind and hold equal values.
-///
-/// A variant has no equality of its own, so the value is compared with the strict
-/// comparison, which is equality over every kind.
-impl PartialEq for Raise {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Convert {
-                    value: left,
-                    to: left_to,
-                },
-                Self::Convert {
-                    value: right,
-                    to: right_to,
-                },
-            ) => left_to == right_to && op::discern_equals(left, right),
-            (Self::DivideByZero, Self::DivideByZero) => true,
-            (Self::IntegerOutOfRange, Self::IntegerOutOfRange) => true,
-            (Self::MemberNotFound { name: left }, Self::MemberNotFound { name: right }) => {
-                left == right
-            }
-            (Self::AccessDenied, Self::AccessDenied) => true,
-            (Self::RangeError, Self::RangeError) => true,
-            (Self::NotCallable { name: left }, Self::NotCallable { name: right }) => left == right,
-            (Self::ParameterCount, Self::ParameterCount) => true,
-            (Self::InvalidParameter, Self::InvalidParameter) => true,
-            (Self::FormatString, Self::FormatString) => true,
-            (Self::NotAnArray, Self::NotAnArray) => true,
-            (Self::ScriptError { message: left }, Self::ScriptError { message: right }) => {
-                left == right
-            }
-            _ => false,
-        }
-    }
+    /// The message is the front end's own, so it travels in the [`Unwind`]: a
+    /// handler that reads it reads what the parse failed on rather than a
+    /// summary of it.
+    ScriptError,
 }
 
 /// The reason an instruction did not answer.
 ///
 /// Every branch is a distinct outcome, because a caller has to tell them apart:
 /// a part is missing, the code raised, the code stream is defective, or a
-/// register is outside the window.
-#[derive(Clone, Debug, thiserror::Error)]
+/// register is outside the window. A fault names its cause and holds no value,
+/// so it can be copied and needs no drop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Fault {
     /// The instruction belongs to a part of the interpreter this build does not
     /// have.
-    #[error("the instruction {opcode} belongs to {part}")]
     Refused {
-        /// The instruction's mnemonic.
-        opcode: String,
+        /// The instruction's opcode.
+        opcode: i32,
         /// The part that owns the behaviour.
         part: &'static str,
     },
     /// The code raised: a conversion, a divisor, or an integer that did not fit.
-    #[error("the code raised")]
     Raised(Raise),
     /// The code stream does not hold an opcode at this position.
-    #[error("the word {0} is not an opcode")]
     InvalidOpcode(i32),
     /// The code stream ends in the middle of an instruction.
-    #[error("the code stream ends inside an instruction")]
     Truncated,
     /// The code stream does something the encoding does not allow.
-    #[error("the code stream is defective: {0}")]
     Broken(&'static str),
     /// A register address is not a multiple of the size of a variant.
-    #[error("the register address {0} is not a variant boundary")]
     MisalignedRegister(i32),
     /// A code address is not a multiple of the size of a word.
-    #[error("the code address {0} is not a word boundary")]
     MisalignedCode(i32),
     /// A register address is outside the frame's window.
-    #[error("the register address {address} is outside the frame")]
     RegisterOutOfWindow {
         /// The address the instruction named.
         address: i32,
     },
     /// The object surface refused a call the instruction needed.
-    #[error("the object refused the call")]
     Object(ObjectError),
-    /// A script threw this value.
+    /// A script threw a value.
     ///
     /// It is its own kind and not a reason, because a catch can reach into the
     /// value and a handler has to be able to tell a script's failure from the
-    /// engine's.
-    #[error("the script threw a value")]
-    Thrown {
-        /// The value the script threw.
-        value: Box<Variant>,
-    },
+    /// engine's. The value itself travels in the [`Unwind`].
+    Thrown,
     /// The failure is silent: it passes every protected region by.
     ///
     /// A cancellation is not a value a handler may inspect, so it is not turned
     /// into one.
-    #[error("the code cancelled silently")]
     Silent,
 }
 
-/// Two faults are the same failure when they are the same kind and carry equal
-/// data.
-///
-/// The comparison is written out because a thrown value is a variant, and a
-/// variant has no equality of its own: the strict comparison is the one that
-/// compares every kind and every handle.
-impl PartialEq for Fault {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                Self::Refused {
-                    opcode: left,
-                    part: left_part,
-                },
-                Self::Refused {
-                    opcode: right,
-                    part: right_part,
-                },
-            ) => left == right && left_part == right_part,
-            (Self::Raised(left), Self::Raised(right)) => left == right,
-            (Self::Thrown { value: left }, Self::Thrown { value: right }) => {
-                op::discern_equals(left, right)
+impl std::fmt::Display for Fault {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused { opcode, part } => write!(
+                formatter,
+                "the instruction {} belongs to {part}",
+                decode::mnemonic(*opcode)
+            ),
+            Self::Raised(_) => formatter.write_str("the code raised"),
+            Self::InvalidOpcode(word) => write!(formatter, "the word {word} is not an opcode"),
+            Self::Truncated => formatter.write_str("the code stream ends inside an instruction"),
+            Self::Broken(why) => write!(formatter, "the code stream is defective: {why}"),
+            Self::MisalignedRegister(address) => write!(
+                formatter,
+                "the register address {address} is not a variant boundary"
+            ),
+            Self::MisalignedCode(address) => {
+                write!(
+                    formatter,
+                    "the code address {address} is not a word boundary"
+                )
             }
-            (Self::InvalidOpcode(left), Self::InvalidOpcode(right)) => left == right,
-            (Self::Truncated, Self::Truncated) => true,
-            (Self::Broken(left), Self::Broken(right)) => left == right,
-            (Self::MisalignedRegister(left), Self::MisalignedRegister(right)) => left == right,
-            (Self::MisalignedCode(left), Self::MisalignedCode(right)) => left == right,
-            (
-                Self::RegisterOutOfWindow { address: left },
-                Self::RegisterOutOfWindow { address: right },
-            ) => left == right,
-            (Self::Object(left), Self::Object(right)) => left == right,
-            (Self::Silent, Self::Silent) => true,
-            _ => false,
+            Self::RegisterOutOfWindow { address } => {
+                write!(
+                    formatter,
+                    "the register address {address} is outside the frame"
+                )
+            }
+            Self::Object(_) => formatter.write_str("the object refused the call"),
+            Self::Thrown => formatter.write_str("the script threw a value"),
+            Self::Silent => formatter.write_str("the code cancelled silently"),
         }
     }
 }
+
+impl std::error::Error for Fault {}
 
 impl From<ObjectError> for Fault {
     fn from(error: ObjectError) -> Self {
@@ -276,12 +212,14 @@ impl From<ObjectError> for Fault {
 // A script that does not compile is the language's own failure and a script can
 // catch it; the two failures after it are defects of the front end, and no
 // script can see them.
-impl From<build::CompileError> for Fault {
+impl From<build::CompileError> for throw::Unwind {
     fn from(error: build::CompileError) -> Self {
         match error {
-            build::CompileError::Syntax { message } => Self::Raised(Raise::ScriptError { message }),
+            build::CompileError::Syntax { message } => {
+                Self::raised(Raise::ScriptError).with_text(message)
+            }
             build::CompileError::Image(_) | build::CompileError::Build(_) => {
-                Self::Broken("the compiled script does not describe a block")
+                Fault::Broken("the compiled script does not describe a block").into()
             }
         }
     }
@@ -298,6 +236,14 @@ pub struct Machine {
     /// block of its own — a compiled text — therefore enters the same machine
     /// while the call that reads the instruction is still borrowing it.
     blocks: RefCell<BlockStack>,
+    /// The empty text a call that names no member passes.
+    empty_name: TjsString,
+    /// The lists the arguments of a call are built in.
+    ///
+    /// The lists are behind a cell for the reason the pages are: a call takes
+    /// one and gives it back, and a call instruction runs a callee while it is
+    /// itself borrowing the machine.
+    arguments: RefCell<call::ArgumentStack>,
     /// The object a frame's scope falls back to, when there is one.
     global: Option<Rc<dyn Dispatch>>,
 }
@@ -322,6 +268,8 @@ impl Machine {
     pub fn with_global(global: Rc<dyn Dispatch>) -> Self {
         Self {
             blocks: RefCell::new(BlockStack::new()),
+            empty_name: TjsString::new(),
+            arguments: RefCell::new(call::ArgumentStack::new()),
             global: Some(global),
         }
     }
@@ -329,6 +277,21 @@ impl Machine {
     /// The pages the machine has handed out and taken back.
     pub fn blocks(&self) -> Ref<'_, BlockStack> {
         self.blocks.borrow()
+    }
+
+    /// The empty text a call that names no member passes.
+    fn empty_name(&self) -> &TjsString {
+        &self.empty_name
+    }
+
+    /// A list for one call's arguments.
+    fn take_argument_list(&self) -> Vec<Variant> {
+        self.arguments.borrow_mut().take()
+    }
+
+    /// Takes a call's argument list back, to be handed to the next call.
+    fn give_argument_list(&self, list: Vec<Variant>) {
+        self.arguments.borrow_mut().give(list);
     }
 
     /// Runs one call of `code` with `receiver` as its `this` and `argv` as the
@@ -341,9 +304,8 @@ impl Machine {
         code: &Code,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
-    ) -> Result<Variant, Fault> {
+    ) -> Result<Variant, throw::Unwind> {
         self.run_frame(code, None, receiver, argv)
-            .map_err(throw::Unwind::fault)
     }
 
     /// Runs one call of a context object's own code.
@@ -358,15 +320,15 @@ impl Machine {
         context: &ContextObject,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
-    ) -> Result<Variant, Fault> {
+    ) -> Result<Variant, throw::Unwind> {
         self.call_context(context, receiver, argv)
     }
 
     /// Runs one call of a context object's own code, keeping the trace.
     ///
-    /// The caller that reports an uncaught failure needs the frames it passed;
-    /// [`Self::run_context`] answers only the fault, which is what a caller that
-    /// catches or reports the failure without a trace needs.
+    /// The caller that reports an uncaught failure needs the frames it passed,
+    /// and every entry answers them: a failure crosses the boundary as the
+    /// [`throw::Unwind`] it already is.
     pub fn run_context_traced(
         &mut self,
         context: &ContextObject,
@@ -376,19 +338,32 @@ impl Machine {
         self.run_frame(context.code(), Some(context), receiver, argv)
     }
 
-    /// Runs one call of a context object's code from inside this machine.
+    /// Runs one call of a context object's code from inside this machine,
+    /// keeping the trace.
     ///
     /// A call instruction runs the code of the value it calls while it is itself
     /// borrowing the machine, so the entry it reaches borrows the machine: the
     /// page pool is behind a cell and nothing else about it changes.
+    pub(crate) fn call_context_traced(
+        &self,
+        context: &ContextObject,
+        receiver: Option<Rc<dyn Dispatch>>,
+        argv: &[Variant],
+    ) -> Result<Variant, throw::Unwind> {
+        self.run_frame(context.code(), Some(context), receiver, argv)
+    }
+
+    /// Runs one call of a context object's code from inside this machine.
+    ///
+    /// A call instruction uses [`Self::call_context_traced`], and the two are
+    /// the same entry: a failure keeps the frames it crossed either way.
     fn call_context(
         &self,
         context: &ContextObject,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
-    ) -> Result<Variant, Fault> {
-        self.run_frame(context.code(), Some(context), receiver, argv)
-            .map_err(throw::Unwind::fault)
+    ) -> Result<Variant, throw::Unwind> {
+        self.call_context_traced(context, receiver, argv)
     }
 
     /// Runs one call of `code` in a frame of its own.
@@ -431,236 +406,265 @@ impl Machine {
         context: Option<&ContextObject>,
         start: usize,
     ) -> Result<Variant, throw::Unwind> {
-        let mut ip: usize = start;
+        let instructions = code.stream.instructions();
+        let mut pc = start;
         let mut flag = false;
         let mut result = Variant::Void;
         loop {
-            let opcode = decode::word(&code.code, ip)?;
-            let next = ip
-                .checked_add(decode::length(&code.code, ip)?)
-                .ok_or(Fault::Broken("a code position does not fit a length"))?;
-            match opcode {
+            let Some(instruction) = instructions.get(pc) else {
+                return Err(Fault::Truncated.into());
+            };
+            pc += 1;
+            match &instruction.op {
                 // the instructions with nothing to do
-                vm::NOP | vm::DEBUGGER => {}
+                Op::Nop | Op::Debugger => {}
                 // the constant area
-                vm::CONST => {
-                    let value = code.constant(operand(&code.code, ip, 2)?)?.clone();
-                    *frame.reg_mut(operand(&code.code, ip, 1)?)? = value;
-                }
-                vm::CP => {
-                    let source = operand(&code.code, ip, 2)?;
-                    let value = frame.reg(source)?.clone();
-                    *frame.reg_mut(operand(&code.code, ip, 1)?)? = value;
-                }
-                vm::CL => {
-                    *frame.reg_mut(operand(&code.code, ip, 1)?)? = Variant::Void;
-                }
-                vm::CCL => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let count = operand(&code.code, ip, 2)?;
-                    frame.clear_run(address, count)?;
-                }
+                Op::Const { dst, value } => frame.store(*dst, code.value(*value).clone()),
+                Op::Copy { dst, source } => frame.store(*dst, frame.slot(*source).clone()),
+                Op::Clear { dst } => frame.store(*dst, Variant::Void),
+                Op::ClearRun { start, count } => frame.clear_run(*start, *count)?,
                 // the condition flag
-                vm::TT => {
-                    flag = op::truth(frame.reg(operand(&code.code, ip, 1)?)?)?;
+                Op::Truth { source } => flag = op::truth(frame.slot(*source))?,
+                Op::Falsity { source } => flag = !op::truth(frame.slot(*source))?,
+                Op::Equal { left, right } => {
+                    flag = frame.slot(*left).equals(frame.slot(*right));
                 }
-                vm::TF => {
-                    flag = !op::truth(frame.reg(operand(&code.code, ip, 1)?)?)?;
+                Op::DiscernEqual { left, right } => {
+                    flag = op::discern_equals(frame.slot(*left), frame.slot(*right));
                 }
-                vm::CEQ => {
-                    let left = operand(&code.code, ip, 1)?;
-                    let right = operand(&code.code, ip, 2)?;
-                    flag = frame.reg(left)?.equals(frame.reg(right)?);
+                Op::Less { left, right } => flag = less(frame.slot(*left), frame.slot(*right))?,
+                Op::Greater { left, right } => {
+                    flag = greater(frame.slot(*left), frame.slot(*right))?
                 }
-                vm::CDEQ => {
-                    let left = operand(&code.code, ip, 1)?;
-                    let right = operand(&code.code, ip, 2)?;
-                    flag = op::discern_equals(frame.reg(left)?, frame.reg(right)?);
+                Op::StoreFlag { dst } => frame.store(*dst, Variant::Integer(i64::from(flag))),
+                Op::StoreNotFlag { dst } => {
+                    frame.store(*dst, Variant::Integer(i64::from(!flag)));
                 }
-                vm::CLT => {
-                    let left = operand(&code.code, ip, 1)?;
-                    let right = operand(&code.code, ip, 2)?;
-                    flag = less(frame.reg(left)?, frame.reg(right)?)?;
-                }
-                vm::CGT => {
-                    let left = operand(&code.code, ip, 1)?;
-                    let right = operand(&code.code, ip, 2)?;
-                    flag = greater(frame.reg(left)?, frame.reg(right)?)?;
-                }
-                vm::SETF => {
-                    *frame.reg_mut(operand(&code.code, ip, 1)?)? =
-                        Variant::Integer(i64::from(flag));
-                }
-                vm::SETNF => {
-                    *frame.reg_mut(operand(&code.code, ip, 1)?)? =
-                        Variant::Integer(i64::from(!flag));
-                }
-                vm::LNOT => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = op::logical_not(&value)?;
-                }
-                vm::NF => {
-                    flag = !flag;
-                }
-                // the jumps: the distance is from the instruction's own position
-                vm::JF => {
-                    if flag {
-                        ip = jump(&code.code, ip, operand(&code.code, ip, 1)?)?;
-                        continue;
-                    }
-                }
-                vm::JNF => {
-                    if !flag {
-                        ip = jump(&code.code, ip, operand(&code.code, ip, 1)?)?;
-                        continue;
-                    }
-                }
-                vm::JMP => {
-                    ip = jump(&code.code, ip, operand(&code.code, ip, 1)?)?;
-                    continue;
-                }
-                // the result and the return
-                vm::SRV => {
-                    result = frame.reg(operand(&code.code, ip, 1)?)?.clone();
-                }
-                vm::RET => return Ok(result),
+                Op::NotFlag => flag = !flag,
                 // the single-operand operators
-                vm::BNOT => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = op::complement(&value)?;
+                Op::LogicalNot { target } => {
+                    let answer = op::logical_not(frame.slot(*target))?;
+                    frame.store(*target, answer);
                 }
-                vm::CHS => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = op::negate(&value)?;
+                Op::Complement { target } => {
+                    let answer = op::complement(frame.slot(*target))?;
+                    frame.store(*target, answer);
                 }
-                vm::NUM => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = op::to_number(&value)?;
+                Op::Negate { target } => {
+                    let answer = op::negate(frame.slot(*target))?;
+                    frame.store(*target, answer);
                 }
-                vm::ASC => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = op::character_code(&value)?;
+                Op::ToNumber { target } => {
+                    let answer = op::to_number(frame.slot(*target))?;
+                    frame.store(*target, answer);
                 }
-                vm::CHR => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = op::character_from(&value)?;
+                Op::CharacterCode { target } => {
+                    let answer = op::character_code(frame.slot(*target))?;
+                    frame.store(*target, answer);
                 }
-                vm::INT => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
+                Op::Character { target } => {
+                    let answer = op::character_from(frame.slot(*target))?;
+                    frame.store(*target, answer);
+                }
+                Op::ToInteger { target } => {
+                    let value = frame.slot(*target);
                     let integer = value
                         .to_integer()
-                        .map_err(|error| op::refused_conversion(error, &value))?;
-                    *frame.reg_mut(address)? = Variant::Integer(integer);
+                        .map_err(|error| op::refused_conversion(error, value))?;
+                    frame.store(*target, Variant::Integer(integer));
                 }
-                vm::REAL => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
+                Op::ToReal { target } => {
+                    let value = frame.slot(*target);
                     let real = value
                         .to_real()
-                        .map_err(|error| op::refused_conversion(error, &value))?;
-                    *frame.reg_mut(address)? = Variant::Real(real);
+                        .map_err(|error| op::refused_conversion(error, value))?;
+                    frame.store(*target, Variant::Real(real));
                 }
-                vm::STR => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
+                Op::ToString { target } => {
+                    let value = frame.slot(*target);
                     let text = value
                         .to_string()
-                        .map_err(|error| op::refused_conversion(error, &value))?;
-                    *frame.reg_mut(address)? = Variant::String(text);
+                        .map_err(|error| op::refused_conversion(error, value))?;
+                    frame.store(*target, Variant::String(text));
                 }
-                vm::OCTET => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
+                Op::ToOctet { target } => {
+                    let value = frame.slot(*target);
                     let octet = value
                         .to_octet()
-                        .map_err(|error| op::refused_conversion(error, &value))?;
-                    *frame.reg_mut(address)? = Variant::Octet(octet);
+                        .map_err(|error| op::refused_conversion(error, value))?;
+                    frame.store(*target, Variant::Octet(octet));
                 }
-                // the compile instructions: the text a register holds, compiled
-                // and run as an expression of its own
-                vm::EVAL | vm::EEXP => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    let answer = self.evaluate(&*frame, &value, opcode == vm::EVAL)?;
-                    if let Some(answer) = answer {
-                        *frame.reg_mut(address)? = answer;
-                    }
+                Op::TypeOf { target } => {
+                    let name = TjsString::from(frame.slot(*target).type_name());
+                    frame.store(*target, Variant::String(name));
                 }
-                vm::TYPEOF => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    *frame.reg_mut(address)? = Variant::String(TjsString::from(value.type_name()));
+                Op::InstanceOf { target, class } => {
+                    let class = op::class_name(frame.slot(*class))?;
+                    let belongs = instance_of(frame.slot(*target), &class)?;
+                    frame.store(*target, Variant::Integer(i64::from(belongs)));
                 }
-                vm::INV => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    let invalidated = match &value {
+                Op::Invalidate { target } => {
+                    let invalidated = match frame.slot(*target) {
                         Variant::Object(closure) => match &closure.object {
                             Some(object) => object.invalidate(),
                             None => false,
                         },
                         _ => false,
                     };
-                    *frame.reg_mut(address)? = Variant::Integer(i64::from(invalidated));
+                    frame.store(*target, Variant::Integer(i64::from(invalidated)));
                 }
-                vm::CHKINV => {
-                    let address = operand(&code.code, ip, 1)?;
-                    let value = frame.reg(address)?.clone();
-                    let valid = match &value {
+                Op::IsValid { target } => {
+                    let valid = match frame.slot(*target) {
                         Variant::Object(closure) => match &closure.object {
                             Some(object) => object.is_valid(),
                             None => true,
                         },
                         _ => true,
                     };
-                    *frame.reg_mut(address)? = Variant::Integer(i64::from(valid));
+                    frame.store(*target, Variant::Integer(i64::from(valid)));
                 }
-                vm::CHKINS => {
-                    let target = operand(&code.code, ip, 1)?;
-                    let name = operand(&code.code, ip, 2)?;
-                    let value = frame.reg(name)?.clone();
-                    let class = op::class_name(&value)?;
-                    let instance = frame.reg(target)?;
-                    let belongs = match instance {
-                        Variant::Object(closure) => match &closure.object {
-                            Some(object) => {
-                                object.is_instance_of(&class, closure.objthis.as_deref())?
-                            }
-                            None => false,
-                        },
-                        _ => false,
-                    };
-                    *frame.reg_mut(target)? = Variant::Integer(i64::from(belongs));
-                }
-                // the member instructions, then the two families, and then the
-                // parts another part owns
-                _ if member::handles(opcode) => member::execute(code, frame, ip, opcode)?,
-                _ if call::handles(opcode) => call::execute(self, code, frame, argv, ip, opcode)?,
-                // an exit from a protected region ends the context with the result
-                // the stream has stored so far
-                vm::EXTRY => return Ok(result),
-                _ if throw::handles(opcode) => {
-                    return throw::execute(self, code, frame, argv, context, ip, opcode);
-                }
-                _ if context::handles(opcode) => {
-                    context::execute(code, frame, context, self.global.as_ref(), ip, opcode)?;
-                }
-                _ => match (decode::step_of(opcode), decode::operator_of(opcode)) {
-                    (Some((up, form)), _) => self.step(frame, code, ip, up, form)?,
-                    (None, Some((operator, form))) => {
-                        self.operate(frame, code, ip, operator, form)?;
+                // the jumps: a distance is resolved to an instruction of the stream
+                Op::Jump { target } => pc = *target,
+                Op::JumpIfFlag { target } => {
+                    if flag {
+                        pc = *target;
                     }
-                    (None, None) => return Err(refused(opcode).into()),
+                }
+                Op::JumpIfNotFlag { target } => {
+                    if !flag {
+                        pc = *target;
+                    }
+                }
+                // the result and the return
+                Op::Result { source } => result = frame.slot(*source).clone(),
+                Op::Return | Op::ExitProtected => return Ok(result),
+                // the compile instructions: the text a register holds, compiled
+                // and run as an expression of its own
+                Op::Evaluate { text, keep, at } => {
+                    let answer = match self.evaluate(frame, frame.slot(*text), *keep) {
+                        Ok(answer) => answer,
+                        Err(mut unwind) => {
+                            unwind.add_frame(context, *at as usize);
+                            return Err(unwind);
+                        }
+                    };
+                    if let Some(answer) = answer {
+                        frame.store(*text, answer);
+                    }
+                }
+                // the step instructions
+                Op::StepReg { up, target } => {
+                    let value = frame.slot(*target);
+                    let answer = if *up {
+                        op::step_up(value)?
+                    } else {
+                        op::step_down(value)?
+                    };
+                    frame.store(*target, answer);
+                }
+                Op::StepMember {
+                    up,
+                    form,
+                    target,
+                    object,
+                    name,
+                } => self.member_operation(
+                    frame,
+                    code,
+                    MemberCall {
+                        what: MemberOperation::Step(*up),
+                        form: *form,
+                        target: *target,
+                        object: *object,
+                        name,
+                        parameter: None,
+                    },
+                )?,
+                // the two-operand operators
+                Op::OperateReg {
+                    operator,
+                    target,
+                    source,
+                } => {
+                    let answer = op::apply(*operator, frame.slot(*target), frame.slot(*source))?;
+                    frame.store(*target, answer);
+                }
+                Op::OperateMember {
+                    operator,
+                    form,
+                    target,
+                    object,
+                    name,
+                    parameter,
+                } => self.member_operation(
+                    frame,
+                    code,
+                    MemberCall {
+                        what: MemberOperation::Operator(*operator),
+                        form: *form,
+                        target: *target,
+                        object: *object,
+                        name,
+                        parameter: Some(*parameter),
+                    },
+                )?,
+                // the member instructions
+                Op::ReadMember {
+                    form,
+                    flags,
+                    dst,
+                    object,
+                    name,
+                } => member::read(code, frame, *form, *flags, *dst, *object, name)?,
+                Op::WriteMember {
+                    form,
+                    flags,
+                    object,
+                    name,
+                    value,
+                } => member::write(code, frame, *form, *flags, *object, name, *value)?,
+                Op::DeleteMember {
+                    form,
+                    dst,
+                    object,
+                    name,
+                } => member::delete(code, frame, *form, *dst, *object, name)?,
+                Op::TypeOfMember {
+                    form,
+                    flags,
+                    dst,
+                    object,
+                    name,
+                } => member::type_of(code, frame, *form, *flags, *dst, *object, name)?,
+                Op::ReadProperty { dst, object } => member::read_property(frame, *dst, *object)?,
+                Op::WriteProperty { object, value } => {
+                    member::write_property(frame, *object, *value)?;
+                }
+                // the calls
+                Op::Call(call) => match call::execute(self, code, frame, argv, call) {
+                    Ok(()) => {}
+                    Err(mut unwind) => {
+                        unwind.add_frame(context, call.at as usize);
+                        return Err(unwind);
+                    }
                 },
+                // the context instructions
+                Op::Global { dst } => context::global(frame, self.global.as_ref(), *dst)?,
+                Op::ChangeThis { target, receiver } => {
+                    context::change_this(frame, *target, *receiver)?;
+                }
+                Op::PublishMembers => context::publish_members(context, frame)?,
+                Op::AddClassName { target, name } => {
+                    context::add_class_name(frame, *target, *name)?;
+                }
+                // the exception instructions
+                Op::Enter(entry) => {
+                    return throw::enter(self, code, frame, argv, context, pc, entry);
+                }
+                Op::Throw { value, at } => {
+                    return Err(throw::raise(frame, context, *value, *at as usize));
+                }
             }
-            ip = next;
         }
     }
 
@@ -676,7 +680,7 @@ impl Machine {
         frame: &Frame,
         value: &Variant,
         result_needed: bool,
-    ) -> Result<Option<Variant>, Fault> {
+    ) -> Result<Option<Variant>, throw::Unwind> {
         let text = value
             .to_string()
             .map_err(|error| op::refused_conversion(error, value))?;
@@ -691,113 +695,37 @@ impl Machine {
             .ok_or(Fault::Broken("an evaluated script has no top level"))?;
         // the scope the text runs in is this frame's receiver, which the frame
         // entry turns into the global object when the frame has none
-        let answer = self
-            .run_frame(
-                top.object().code(),
-                Some(top.object()),
-                frame.receiver(),
-                &[],
-            )
-            .map_err(throw::Unwind::fault)?;
+        let answer = self.run_frame(
+            top.object().code(),
+            Some(top.object()),
+            frame.receiver(),
+            &[],
+        )?;
         Ok(result_needed.then_some(answer))
     }
 
-    /// Applies a step instruction.
-    ///
-    /// The plain form converts and stores the register; the three property forms
-    /// are the same instruction on a member.
-    fn step(
-        &self,
-        frame: &mut Frame,
-        code: &Code,
-        ip: usize,
-        up: bool,
-        form: PropertyForm,
-    ) -> Result<(), Fault> {
-        let target = operand(&code.code, ip, 1)?;
-        if form == PropertyForm::Plain {
-            let value = frame.reg(target)?.clone();
-            let answer = if up {
-                op::step_up(&value)?
-            } else {
-                op::step_down(&value)?
-            };
-            *frame.reg_mut(target)? = answer;
-            return Ok(());
-        }
-        let call = MemberCall {
-            what: MemberOperation::Step(up),
-            form,
-            target,
-            object: operand(&code.code, ip, 2)?,
-            name: match form {
-                PropertyForm::Direct => Name::Constant(operand(&code.code, ip, 3)?),
-                PropertyForm::Indirect => Name::Register(operand(&code.code, ip, 3)?),
-                _ => Name::None,
-            },
-            parameter: None,
-        };
-        self.member_operation(frame, code, call)
-    }
-
-    /// Applies a two-operand operator.
-    fn operate(
-        &self,
-        frame: &mut Frame,
-        code: &Code,
-        ip: usize,
-        operator: Operator,
-        form: PropertyForm,
-    ) -> Result<(), Fault> {
-        let target = operand(&code.code, ip, 1)?;
-        if form == PropertyForm::Plain {
-            let source = operand(&code.code, ip, 2)?;
-            let left = frame.reg(target)?.clone();
-            let right = frame.reg(source)?.clone();
-            let answer = op::apply(operator, &left, &right)?;
-            *frame.reg_mut(target)? = answer;
-            return Ok(());
-        }
-        let call = MemberCall {
-            what: MemberOperation::Operator(operator),
-            form,
-            target,
-            object: operand(&code.code, ip, 2)?,
-            name: match form {
-                PropertyForm::Direct => Name::Constant(operand(&code.code, ip, 3)?),
-                PropertyForm::Indirect => Name::Register(operand(&code.code, ip, 3)?),
-                _ => Name::None,
-            },
-            parameter: match form {
-                PropertyForm::Direct | PropertyForm::Indirect => Some(operand(&code.code, ip, 4)?),
-                _ => Some(operand(&code.code, ip, 3)?),
-            },
-        };
-        self.member_operation(frame, code, call)
-    }
-
-    /// Applies an operator to a member.
+    /// Applies an operation to a member.
     ///
     /// A member named by a constant or by a register is read, operated on and
     /// written back, which is what the engine's base object does for a compound
-    /// assignment. The closure form — the object itself as the
-    /// property — is the one the object's own `operation` entry is asked, because
-    /// it is the one form the surface can express without a name.
+    /// assignment. The closure form — the object itself as the property — is the
+    /// one the object's own `operation` entry is asked, because it is the one
+    /// form the surface can express without a name.
     ///
-    /// # Why the property forms do not consult the object's own entry
+    /// # Why the named forms do not consult the object's own entry
     ///
-    /// The engine hands the object the member's *name* and the operation, and a
-    /// name-kind operation is not on this runtime's object surface, which takes
-    /// the operator and the right operand only. So a named member takes the base
+    /// The surface the operation would reach through is the object's name-kind
+    /// entry, which this runtime's object surface does not have: it takes the
+    /// operator and the right operand only. So a named member takes the base
     /// object's path. Every object that does not override the entry behaves
     /// identically; an object that does override it is reached by the closure
-    /// form, and by the named forms only through the seam this names.
+    /// form.
     fn member_operation(
         &self,
         frame: &mut Frame,
         code: &Code,
-        call: MemberCall,
-    ) -> Result<(), Fault> {
+        call: MemberCall<'_>,
+    ) -> Result<(), throw::Unwind> {
         let MemberCall {
             what,
             form,
@@ -806,32 +734,29 @@ impl Machine {
             name,
             parameter,
         } = call;
-        let receiver = frame.reg(object)?.clone();
-        let closure = match &receiver {
+        let closure = match frame.slot(object) {
             Variant::Object(closure) => closure.clone(),
             _ => {
                 return Err(Fault::Broken(
                     "a property operation names a value that is not an object",
-                ));
+                )
+                .into());
             }
         };
         let holder = match &closure.object {
             Some(holder) => holder.clone(),
             None => {
-                return Err(Fault::Broken("a property operation names a null object"));
+                return Err(Fault::Broken("a property operation names a null object").into());
             }
         };
         let objthis = closure.objthis.as_deref();
         let parameter = match parameter {
-            Some(address) => frame.reg(address)?.clone(),
+            Some(slot) => frame.slot(slot).clone(),
             None => Variant::Void,
         };
-        let text = match &name {
-            Name::Constant(slot) => text_of(code.constant(*slot)?)?,
-            Name::Register(address) => {
-                let value = frame.reg(*address)?.clone();
-                text_of(&value)?
-            }
+        let text = match name {
+            Name::Constant(index) => text_of(code.value(*index))?,
+            Name::Register(slot) => text_of(frame.slot(*slot))?,
             Name::None => TjsString::new(),
         };
         if form == PropertyForm::Closure {
@@ -849,7 +774,7 @@ impl Machine {
             let served = holder.operation(&operator, &parameter, objthis)?;
             if !served {
                 return Err(Fault::Refused {
-                    opcode: decode::mnemonic(match what {
+                    opcode: match what {
                         MemberOperation::Operator(operator) => operator_opcode(operator),
                         MemberOperation::Step(up) => {
                             if up {
@@ -858,14 +783,13 @@ impl Machine {
                                 vm::DEC_P
                             }
                         }
-                    }),
+                    },
                     part: "the closure form of a property operation",
-                });
+                }
+                .into());
             }
             let answer = holder.prop_get(&text, MemberFlags::IGNORE_PROPERTY, objthis)?;
-            if target != 0 {
-                *frame.reg_mut(target)? = answer;
-            }
+            frame.store(target, answer);
             return Ok(());
         }
         let current = holder.prop_get(&text, MemberFlags::NONE, objthis)?;
@@ -880,31 +804,29 @@ impl Machine {
             }
         };
         holder.prop_set(&text, MemberFlags::NONE, &answer, objthis)?;
-        if target != 0 {
-            *frame.reg_mut(target)? = answer;
-        }
+        frame.store(target, answer);
         Ok(())
     }
 }
 
 /// One property operation, as the instruction spells it.
-struct MemberCall {
+struct MemberCall<'a> {
     /// The operation the instruction applies.
     what: MemberOperation,
     /// The form the instruction takes.
     form: PropertyForm,
-    /// The register the result goes to, or `0` for none.
-    target: i32,
-    /// The register that holds the object.
-    object: i32,
+    /// The slot the result goes to, or none.
+    target: Slot,
+    /// The slot that holds the object.
+    object: Slot,
     /// Where the member's name comes from.
-    name: Name,
-    /// The register that holds the right operand, when there is one.
-    parameter: Option<i32>,
+    name: &'a Name,
+    /// The slot that holds the right operand, when there is one.
+    parameter: Option<Slot>,
 }
 
 /// The text a value names a member with.
-fn text_of(value: &Variant) -> Result<TjsString, Fault> {
+fn text_of(value: &Variant) -> Result<TjsString, throw::Unwind> {
     value
         .to_string()
         .map_err(|error| op::refused_conversion(error, value))
@@ -917,17 +839,6 @@ enum MemberOperation {
     Operator(Operator),
     /// An increment or a decrement; the flag says which.
     Step(bool),
-}
-
-/// Where a member operation's name comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Name {
-    /// The constant area.
-    Constant(i32),
-    /// A register.
-    Register(i32),
-    /// Nowhere: the value itself is the property.
-    None,
 }
 
 /// The opcode a member operation belongs to, for a message.
@@ -952,58 +863,16 @@ fn operator_opcode(operator: Operator) -> i32 {
     (26 + offset * 4) + 3
 }
 
-/// The fault for an instruction another part owns.
-fn refused(opcode: i32) -> Fault {
-    match decode::owner(opcode) {
-        Some(part) => Fault::Refused {
-            opcode: decode::mnemonic(opcode),
-            part,
-        },
-        None => Fault::Broken("a refused instruction names no owner"),
-    }
-}
-
-/// The `slot`-th operand of the instruction at `ip`.
-///
-/// The slot counts from the opcode, so slot 1 is the first operand.
-pub(super) fn operand(code: &[i32], ip: usize, slot: usize) -> Result<i32, Fault> {
-    let index = ip
-        .checked_add(slot)
-        .ok_or(Fault::Broken("an instruction's operand is out of range"))?;
-    decode::word(code, index)
-}
-
-/// The instruction position a jump distance names.
-///
-/// The distance is relative to the instruction the jump is, not to the
-/// instruction after it.
-fn jump(code: &[i32], ip: usize, distance: i32) -> Result<usize, Fault> {
-    let offset = decode::code_position(distance)?;
-    let target = i64::try_from(ip)
-        .map_err(|_| Fault::Broken("a code position does not fit an address"))?
-        .checked_add(i64::from(offset))
-        .ok_or(Fault::Broken("a jump target is out of range"))?;
-    if target < 0 {
-        return Err(Fault::Broken("a jump target is before the code stream"));
-    }
-    let target =
-        usize::try_from(target).map_err(|_| Fault::Broken("a jump target is out of range"))?;
-    if target > code.len() {
-        return Err(Fault::Broken("a jump target is past the code stream"));
-    }
-    Ok(target)
-}
-
 /// The comparison the less-than instruction asks for.
 ///
 /// The comparison answers whether the *other* operand is greater, which is the
 /// same question as whether this one is less.
-pub fn less(left: &Variant, right: &Variant) -> Result<bool, Fault> {
+pub fn less(left: &Variant, right: &Variant) -> Result<bool, throw::Unwind> {
     ordering(left, right, Ordering::Less)
 }
 
 /// The comparison the greater-than instruction asks for.
-pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
+pub fn greater(left: &Variant, right: &Variant) -> Result<bool, throw::Unwind> {
     ordering(left, right, Ordering::Greater)
 }
 
@@ -1011,11 +880,36 @@ pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
 ///
 /// An unordered pair — one operand is a not-a-number — is false for both
 /// operators, and a value with no ordering at all is refused.
-fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, Fault> {
+fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, throw::Unwind> {
     match left.compare(right) {
         Ok(Some(order)) => Ok(order == wanted),
         Ok(None) => Ok(false),
         Err(error) => Err(op::refused_conversion(error, left)),
+    }
+}
+
+/// Whether `value` belongs to the class `class` names.
+///
+/// The empty value belongs to nothing, not even to `"Object"`. Every other
+/// value belongs to `"Object"` and to the one name its kind carries: an integer
+/// and a real are `"Number"`, a text is `"String"` and an octet is `"Octet"`.
+/// No other name is a kind's, so a number is neither an `"Integer"` nor a
+/// `"Real"`. An object answers through the class names it carries, and a value
+/// whose object handle is absent belongs to nothing beyond the name already
+/// answered.
+fn instance_of(value: &Variant, class: &TjsString) -> Result<bool, Fault> {
+    match value {
+        Variant::Void => Ok(false),
+        _ if class.eq_str("Object") => Ok(true),
+        Variant::Integer(_) | Variant::Real(_) => Ok(class.eq_str("Number")),
+        Variant::String(_) => Ok(class.eq_str("String")),
+        Variant::Octet(_) => Ok(class.eq_str("Octet")),
+        Variant::Object(closure) => match &closure.object {
+            Some(handle) => handle
+                .is_instance_of(class, closure.objthis.as_deref())
+                .map_err(Fault::from),
+            None => Ok(false),
+        },
     }
 }
 
@@ -1033,6 +927,8 @@ mod tests {
             max_frame_count: 4,
             ..Code::default()
         }
+        .decoded()
+        .expect("the stream decodes")
     }
 
     fn register(number: i32) -> i32 {
@@ -1452,7 +1348,7 @@ mod tests {
         let answer = machine.run(&code, None, &[]);
         assert!(matches!(
             answer,
-            Err(Fault::Raised(Raise::Convert { to: "string", .. }))
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::Convert { to: "string" })
         ));
     }
 
@@ -1528,7 +1424,10 @@ mod tests {
             None,
             &[],
         );
-        assert!(matches!(refused, Err(Fault::Raised(Raise::Convert { .. }))));
+        assert!(matches!(
+            refused,
+            Err(unwind) if matches!(unwind.fault(), Fault::Raised(Raise::Convert { .. }))
+        ));
     }
 
     /// The property access reaches an object that is not there through the
@@ -1542,7 +1441,7 @@ mod tests {
         let answer = machine.run(&code, None, &[]);
         // the register holds no object, so the surface refuses the conversion
         match answer {
-            Err(Fault::Raised(Raise::Convert { to, .. })) => assert_eq!(to, "Object"),
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::Convert { to: "Object" }) => {}
             other => panic!("expected a refused conversion, got {other:?}"),
         }
     }
@@ -1589,36 +1488,43 @@ mod tests {
             variable_reserve_count: 2,
             max_frame_count: 4,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let mut machine = Machine::new();
         let answer = machine.run(&code, None, &[]).expect("the stream runs");
         assert!(op::discern_equals(&answer, &Variant::Integer(5)));
     }
 
-    /// A code stream that ends inside an instruction is refused, not read past
+    /// A code stream that ends inside an instruction is refused when the block
+    /// is built, so no instruction of it runs
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1300`).
     #[test]
     fn a_truncated_stream_is_refused() {
-        let code = code_of(&[vm::CONST, register(1)], &[]);
-        let mut machine = Machine::new();
-        assert!(matches!(
-            machine.run(&code, None, &[]),
-            Err(Fault::Truncated)
-        ));
+        let code = Code {
+            code: vec![vm::CONST, register(1)],
+            variable_reserve_count: 2,
+            max_frame_count: 4,
+            ..Code::default()
+        };
+        assert!(matches!(code.decoded(), Err(Fault::Truncated)));
     }
 
-    /// A jump before the first instruction or past the last is refused.
+    /// A jump before the first instruction or past the last is refused when the
+    /// block is built.
     #[test]
     fn a_jump_outside_the_stream_is_refused() {
-        let code = code_of(
-            &[vm::JMP, crate::vm::codegen::opcode::vm_code_addr(-4)],
-            &[],
-        );
-        let mut machine = Machine::new();
-        assert!(matches!(
-            machine.run(&code, None, &[]),
-            Err(Fault::Broken(_))
-        ));
+        let out_of_stream = |distance: i32| {
+            Code {
+                code: vec![vm::JMP, crate::vm::codegen::opcode::vm_code_addr(distance)],
+                variable_reserve_count: 2,
+                max_frame_count: 4,
+                ..Code::default()
+            }
+            .decoded()
+        };
+        assert!(matches!(out_of_stream(-4), Err(Fault::Broken(_))));
+        assert!(matches!(out_of_stream(4), Err(Fault::Broken(_))));
     }
 
     /// The frame's receiver is reachable from the code
@@ -1630,7 +1536,9 @@ mod tests {
             code: vec![vm::SRV, register(-1), vm::RET],
             variable_reserve_count: 2,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let mut machine = Machine::new();
         let answer = machine
             .run(&code, Some(this.clone()), &[])
@@ -1650,5 +1558,67 @@ mod tests {
         assert_eq!(operator_opcode(Operator::LOr), vm::LOR_P);
         assert_eq!(operator_opcode(Operator::Mul), vm::MUL_P);
         assert_eq!(decode::mnemonic(operator_opcode(Operator::Add)), "ADDP");
+    }
+
+    /// A value that is not an object answers by its kind: one name per kind and
+    /// `"Object"` for every kind but the empty value. An integer and a real are
+    /// both `"Number"`, a text is `"String"`, an octet is `"Octet"`, and the
+    /// `typeof` spellings `"Integer"` and `"Real"` name no instance
+    /// (`reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1712-1756`).
+    #[test]
+    fn a_kind_answers_the_names_it_carries() {
+        let number = TjsString::from("Number");
+        let text_value = TjsString::from("String");
+        let octet_name = TjsString::from("Octet");
+        let object_name = TjsString::from("Object");
+        let integer_name = TjsString::from("Integer");
+        let real_name = TjsString::from("Real");
+        let cases = [
+            (Variant::Integer(1), &number),
+            (Variant::Real(1.5), &number),
+            (Variant::from("a"), &text_value),
+            (
+                Variant::Octet(crate::vm::runtime::octet::Octet::new()),
+                &octet_name,
+            ),
+        ];
+        for (value, kind) in cases {
+            assert_eq!(instance_of(&value, kind), Ok(true), "the kind's own name");
+            assert_eq!(
+                instance_of(&value, &object_name),
+                Ok(true),
+                "every kind but the empty value is an Object"
+            );
+            assert_eq!(
+                instance_of(&value, &integer_name),
+                Ok(false),
+                "a typeof spelling names no instance"
+            );
+            assert_eq!(
+                instance_of(&value, &real_name),
+                Ok(false),
+                "a typeof spelling names no instance"
+            );
+        }
+        assert_eq!(
+            instance_of(&Variant::Integer(1), &text_value),
+            Ok(false),
+            "a number is no text"
+        );
+        assert_eq!(
+            instance_of(&Variant::from("a"), &number),
+            Ok(false),
+            "a text is no number"
+        );
+        assert_eq!(
+            instance_of(&Variant::Void, &object_name),
+            Ok(false),
+            "the empty value belongs to nothing, the object name included"
+        );
+        assert_eq!(
+            instance_of(&Variant::Void, &TjsString::from("void")),
+            Ok(false),
+            "the empty value answers no typeof spelling either"
+        );
     }
 }

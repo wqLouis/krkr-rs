@@ -2683,7 +2683,7 @@ fn read_register_value(ctx: &CompatCtx, key: &str) -> Result<Option<RetainedValu
     );
     // SAFETY: a `CompatCtx` is only created for a bound, live engine.
     let engine = unsafe { ctx.engine() };
-    match ScriptScope::new(engine, ctx).eval(
+    match ScriptScope::new(engine, ctx).evaluate(
         &script,
         "System.readRegValue",
         ScriptOptions::default(),
@@ -2939,7 +2939,7 @@ pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     let host = unsafe { ctx.engine() };
     let scripts = ScriptScope::new(host, ctx);
     if let (Ok(RetainedValue::Object(class)), Ok(null)) = (
-        scripts.eval("System", "System.defaults", ScriptOptions::default()),
+        scripts.evaluate("System", "System.defaults", ScriptOptions::default()),
         host.retain_null(),
     ) {
         for name in ["exceptionHandler", "onActivate", "onDeactivate"] {

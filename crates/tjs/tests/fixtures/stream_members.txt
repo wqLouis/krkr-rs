@@ -1,0 +1,38 @@
+# the engine's answers, recorded by `crates/tjs/examples/stream_oracle.rs`; regenerate with the command in the example's docs
+save_show_text	text	(const) [\r\n "one",\r\n 2,\r\n -9,\r\n 0x1.C000000000000p1 /* 3.5 */,\r\n 1234567890123,\r\n <% 00 AB %>,\r\n void,\r\n null,\r\n "a,b\\r\\n\\"q\\"",\r\n (const) [\r\n  1,\r\n  "two",\r\n  (const) %[\r\n   "k" => 1\r\n  ]\r\n ],\r\n (const) %[\r\n  "num" => 7,\r\n  "key" => "value"\r\n ],\r\n (const) [\r\n ],\r\n (const) %[\r\n ]\r\n]
+save_show_text_reloaded	text	(const) [\r\n "one",\r\n 2,\r\n -9,\r\n 0x1.C000000000000p1 /* 3.5 */,\r\n 1234567890123,\r\n <% 00 AB %>,\r\n void,\r\n null,\r\n "a,b\\r\\n\\"q\\"",\r\n (const) [\r\n  1,\r\n  "two",\r\n  (const) %[\r\n   "k" => 1\r\n  ]\r\n ],\r\n (const) %[\r\n  "num" => 7,\r\n  "key" => "value"\r\n ],\r\n (const) [\r\n ],\r\n (const) %[\r\n ]\r\n]
+save_show_lines	text	one\r\n2\r\n-9\r\n3.5\r\n1234567890123\r\n\r\n\r\n\r\na,b\r\n"q"\r\n\r\n\r\n\r\n\r\n
+load_lines_count	Integer	14
+load_lines_first	String	one
+load_lines_real	String	3.5
+load_lines_octet	String	
+save_lines_again	text	one\r\n2\r\n-9\r\n3.5\r\n1234567890123\r\n\r\n\r\n\r\na,b\r\n"q"\r\n\r\n\r\n\r\n\r\n
+save_show_binary	bytes	4B424144313030009DA36F006E00650002D0F7CB0000000000000C40CFCB04FB711F010000D600ABC1C0A861002C0062000D000A002200710022009301A3740077006F0081A16B000182A36E0075006D0007A36B0065007900A5760061006C00750065009080
+load_struct_bin_count	Integer	13
+load_struct_bin_huge	Integer	1234567890123
+load_struct_bin_real	Real	3.5
+load_struct_bin_real_kind	String	Real
+load_struct_bin_octet	String	Octet
+load_struct_bin_null	String	Object
+save_struct_bin_again	bytes	4B424144313030009DA36F006E00650002D0F7CB0000000000000C40CFCB04FB711F010000D600ABC1C0A861002C0062000D000A002200710022009301A3740077006F0081A16B000182A36E0075006D0007A36B0065007900A5760061006C00750065009080
+save_saved_frame	text	(const) [\r\n (const) %[\r\n  "integer" => 42,\r\n  "text" => "a,b\\r\\n\\"q\\"",\r\n  "self" => null /* object recursion detected */,\r\n  "empty" => (const) %[\r\n  ],\r\n  "nested" => (const) %[\r\n   "inner" => 1\r\n  ],\r\n  "list" => (const) [\r\n   1,\r\n   2\r\n  ]\r\n ]\r\n]
+save_plain_frame	text	(const) [\r\n (const) %[\r\n  "map" => (const) %[\r\n   "deep" => 1\r\n  ],\r\n  "octet" => <% 01 02 %>,\r\n  "count" => 3,\r\n  "name" => "plain",\r\n  "list" => (const) [\r\n   1,\r\n   "two"\r\n  ],\r\n  "real" => 0x1.0000000000000p-1 /* 0.5 */\r\n ]\r\n]
+save_plain_frame_binary	bytes	4B424144313030009186A36D006100700081A4640065006500700001A56F006300740065007400D60102A563006F0075006E00740003A46E0061006D006500A570006C00610069006E00A46C006900730074009201A3740077006F00A47200650061006C00CB000000000000E03F
+save_plain_reload	bytes	4B424144313030009186A36D006100700081A4640065006500700001A563006F0075006E00740003A56F006300740065007400D60102A46E0061006D006500A570006C00610069006E00A47200650061006C00CB000000000000E03FA46C006900730074009201A3740077006F00
+save_copy_binary	bytes	4B424144313030009401A3740077006F00CB0000000000000C40920405
+save_tiny_binary	bytes	4B4241443130300091A6610062006300640065006600
+load_absent	!raise	Cannot open storage @tjs-stream-fixture-absent
+load_struct_absent	!raise	Cannot open storage @tjs-stream-fixture-absent
+assign_struct_mismatch	!raise	Specify a Dictionary object or an Array object
+assign_struct_null	!raise	Accessing to nullptr object
+load_struct_not_binary	!raise	Invalid argument
+load_struct_truncated	!raise	Read error
+save_answer_kind	String	Object
+save_answer_self	Integer	1
+save_struct_answer_kind	String	Object
+save_struct_answer_self	Integer	1
+load_answer_kind	String	Object
+load_answer_self	Integer	1
+load_struct_answer_kind	String	Object
+load_struct_answer_self	Integer	1
+assign_answer_kind	String	void

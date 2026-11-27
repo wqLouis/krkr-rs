@@ -133,7 +133,10 @@ impl RetainedTable {
             value: Some(value),
         });
         self.held += 1;
-        RetainedId { slot, generation: 0 }
+        RetainedId {
+            slot,
+            generation: 0,
+        }
     }
 
     /// Keeps `object` as an object value, with itself as its receiver.
@@ -184,10 +187,7 @@ impl RetainedTable {
     ///
     /// [`RetainError::Stale`] when the id names no held value.
     pub fn release(&mut self, id: RetainedId) -> Result<Variant, RetainError> {
-        let slot = self
-            .slots
-            .get_mut(id.slot)
-            .ok_or(RetainError::Stale(id))?;
+        let slot = self.slots.get_mut(id.slot).ok_or(RetainError::Stale(id))?;
         if slot.generation != id.generation {
             return Err(RetainError::Stale(id));
         }

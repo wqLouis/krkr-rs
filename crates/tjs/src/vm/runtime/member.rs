@@ -67,6 +67,14 @@ struct Member<V> {
     next: Cell<u32>,
 }
 
+impl<V> Member<V> {
+    /// Whether this member is the one `hash` and `name` denote.
+    #[inline]
+    fn matches(&self, hash: u32, name: &TjsString) -> bool {
+        self.hash == hash && self.name.as_utf16() == name.as_utf16()
+    }
+}
+
 /// One bucket of the symbol array.
 struct Bucket<V> {
     /// The bucket's primary member, while its slot is taken.
@@ -195,7 +203,7 @@ impl<V> MemberMap<V> {
         let is_primary = self.buckets[bucket]
             .primary
             .as_ref()
-            .is_some_and(|primary| primary.hash == hash && primary.name == *name);
+            .is_some_and(|primary| primary.matches(hash, name));
         if is_primary {
             self.buckets[bucket].primary = None;
             self.len -= 1;
@@ -205,7 +213,7 @@ impl<V> MemberMap<V> {
         let mut index = self.buckets[bucket].chain.get();
         while index != NO_MEMBER {
             let member = self.overflow(index);
-            let matches = member.hash == hash && member.name == *name;
+            let matches = member.matches(hash, name);
             let next = member.next.get();
             if matches {
                 if previous == NO_MEMBER {
@@ -304,7 +312,7 @@ impl<V> MemberMap<V> {
         let mut index = self.buckets[bucket].chain.get();
         while index != NO_MEMBER {
             let member = self.overflow(index);
-            if member.hash == hash && member.name == *name {
+            if member.matches(hash, name) {
                 let found = Found::Chain {
                     previous,
                     index,
@@ -326,9 +334,7 @@ impl<V> MemberMap<V> {
             index = member.next.get();
         }
         match self.buckets[bucket].primary.as_ref() {
-            Some(member) if member.hash == hash && member.name == *name => {
-                Some(Found::Primary(bucket))
-            }
+            Some(member) if member.matches(hash, name) => Some(Found::Primary(bucket)),
             _ => None,
         }
     }
@@ -670,6 +676,42 @@ mod tests {
         assert_eq!(map.get_mut(&names[1]).copied(), Some(1));
         // enumeration moves nothing
         assert_eq!(keys(&map), keys(&map));
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1035-1046
+    #[test]
+    fn a_surrogate_pair_and_the_empty_name_resolve_by_their_units() {
+        let names = [
+            TjsString::from("\u{29e3d}"),
+            TjsString::new(),
+            TjsString::from("plain"),
+        ];
+        let mut map: MemberMap<u32> = MemberMap::new();
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(map.insert(name.clone(), index as u32), None);
+        }
+        for (index, name) in names.iter().enumerate() {
+            assert_eq!(map.get(name), Some(&(index as u32)));
+        }
+        assert_eq!(map.get(&TjsString::from("\u{29e3e}")), None);
+        assert_eq!(map.get(&TjsString::from("plain ")), None);
+        assert!(map.remove(&names[0]));
+        assert!(map.remove(&names[1]));
+        assert_eq!(map.get(&names[2]), Some(&2));
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1035-1046
+    #[test]
+    fn a_bucket_collision_resolves_each_name_and_refuses_the_absent_one() {
+        let names = colliding_names(4);
+        let mut map: MemberMap<u32> = MemberMap::new();
+        for (index, name) in names[..3].iter().enumerate() {
+            map.insert(name.clone(), index as u32);
+        }
+        for (index, name) in names[..3].iter().enumerate() {
+            assert_eq!(map.get(name), Some(&(index as u32)), "{name:?}");
+        }
+        assert_eq!(map.get(&names[3]), None);
     }
 
     // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:895-983

@@ -1,0 +1,28 @@
+# the engine's answers, recorded by `crates/tjs/examples/message_oracle.rs`; regenerate with the command in the example's docs
+default_variant_convert	Cannot convert the variable type ((object)(object 0x0:0x0) to int)
+default_variant_convert_to_object	Cannot convert the variable type ((int)1 to Object)
+default_divide_by_zero	Division by zero
+default_integer_out_of_range	The integer result is out of range
+default_member_not_found	Member "absent" does not exist
+default_access_denied	Invalid operation for Read-only or Write-only property
+default_range_error	The value is out of the range
+default_not_callable	Not a function or invalid method/property type
+default_parameter_count	Invalid argument count
+default_invalid_parameter	Invalid argument
+default_format_string	Invalid format string
+default_not_an_array	Specify an Array object
+default_not_implemented	Called method is not implemented
+assign_known	1
+later_raise	the assigned count
+saved_raise	the assigned count
+assign_replacement	1
+already_raised	the assigned count
+later_raise_after_replacement	the second count
+assign_unknown	0
+assign_internal_error	1
+assign_with_placeholder	1
+later_raise_with_placeholder	changed (object)(object 0x0:0x0) to int
+assign_not_implemented	1
+later_raise_not_implemented	the assigned method
+assign_integer_out_of_range	1
+later_raise_integer_out_of_range	the assigned integer

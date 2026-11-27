@@ -352,11 +352,10 @@ impl RandomGeneratorMember {
 
     /// The member `name` denotes, or `None` when it names no member.
     pub fn lookup(name: &TjsString) -> Option<Self> {
-        let units = name.as_utf16();
         Self::ALL
             .iter()
             .copied()
-            .find(|member| units.iter().copied().eq(member.name().encode_utf16()))
+            .find(|member| name.len() == member.name().len() && name.eq_str(member.name()))
     }
 
     /// The name the class publishes the member under.

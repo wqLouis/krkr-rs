@@ -53,6 +53,8 @@ const SETUP: &str = r#"function arrayMembers() {
 }
 var a = arrayMembers();
 delete this.arrayMembers;
+var invalidated = new Array();
+invalidate invalidated;
 function arrayProbe(value) {
     return (typeof (value)) + ":" + ("" + value);
 }
@@ -207,6 +209,22 @@ const PROBES: &[(&str, &str)] = &[
     ("instanceof_array", "a instanceof Array"),
     ("instanceof_object", "a instanceof Object"),
     ("instanceof_dictionary", "a instanceof Dictionary"),
+    // an array answers the class names it carries, and no other name
+    ("instanceof_array_name", "a instanceof \"Array\""),
+    ("instanceof_object_name", "a instanceof \"Object\""),
+    ("instanceof_dictionary_name", "a instanceof \"Dictionary\""),
+    ("instanceof_string_name", "a instanceof \"String\""),
+    ("instanceof_number_name", "a instanceof \"Number\""),
+    ("instanceof_octet_name", "a instanceof \"Octet\""),
+    // split, a literal and a construction all carry the class name
+    (
+        "instanceof_split_name",
+        "\"a,b\".split(\",\") instanceof \"Array\"",
+    ),
+    ("instanceof_literal_name", "[] instanceof \"Array\""),
+    ("instanceof_new_name", "(new Array()) instanceof \"Array\""),
+    // an invalidated array refuses the class question
+    ("instanceof_invalidated", "invalidated instanceof \"Array\""),
     // split uses every character of the pattern as a boundary, and the purge
     // flag drops the empty fields a boundary leaves
     (

@@ -221,7 +221,7 @@ impl KagEnv {
             // everything later consumers need, so a side effect cannot run
             // twice.
             let value = scripts
-                .eval(
+                .evaluate(
                     exp,
                     "KAGParser",
                     ScriptOptions {

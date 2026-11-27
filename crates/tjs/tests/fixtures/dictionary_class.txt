@@ -1,0 +1,23 @@
+# the engine's answers, recorded by the ignored `record_the_engine_answers` test in `crates/tjs/tests/dictionary_class.rs`; regenerate with `cargo test -p tjs --test dictionary_class -- --ignored`
+class_members	String	assign,assignStruct,clear,load,loadStruct,save,saveStruct
+class_member_count	Integer	7
+class_member_types	String	Object|Object|Object|Object|Object|Object|Object
+instance_member_types	String	undefined|undefined|undefined|undefined|undefined|undefined|undefined
+constructor_instance	String	Object|value
+load_with	String	void||1
+save_with	String	void||1
+clear_with	String	void||undefined
+assign_with	String	void|||2
+assign_keep	String	void|1|2
+assign_array	String	5|6
+assign_null	!raise	Accessing to nullptr object
+assign_struct_with	String	void|||2
+save_struct_with	String	Object|1|1
+load_struct_with	String	Object|1|1|undefined
+load_struct_without	String	Object|1
+load_without	!raise	Invalid object context
+save_without	!raise	Invalid object context
+clear_without	!raise	Invalid object context
+assign_without	!raise	Invalid object context
+assign_struct_without	!raise	Invalid object context
+save_struct_without	!raise	Invalid object context

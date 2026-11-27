@@ -37,8 +37,8 @@
 pub mod codegen;
 pub mod commands;
 pub mod lexer;
-mod onig;
 pub mod parser;
+mod regexp_engine;
 pub mod runtime;
 mod stats;
 

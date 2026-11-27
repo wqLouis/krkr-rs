@@ -29,6 +29,10 @@ use super::exception::{CLASS_NAME as EXCEPTION, Exception, ExceptionMember};
 use super::math::MathMember;
 use super::random::{RandomGenerator, RandomGeneratorMember, Seed, Xorshift};
 use super::regexp::{CLASS_NAME as REGEXP, RegExpMember, RegExpObject};
+use crate::vm::runtime::bridge::CHandle;
+use crate::vm::runtime::dictionary::{
+    CLASS_NAME as DICTIONARY, Dictionary, DictionaryMember, DictionaryReceiver, identity,
+};
 use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
@@ -40,7 +44,7 @@ const MATH: &str = "Math";
 const RANDOM_GENERATOR: &str = "RandomGenerator";
 
 /// The call a method value makes.
-type MethodCall = dyn Fn(&[Variant]) -> Result<Variant, ObjectError>;
+type MethodCall = dyn Fn(&[Variant], Option<&dyn Dispatch>) -> Result<Variant, ObjectError>;
 
 /// The classes the Rust side publishes, by the global name each is read from.
 ///
@@ -52,31 +56,57 @@ pub struct NativeRegistry {
 }
 
 impl NativeRegistry {
-    /// The classes a global scope publishes.
+    /// The classes a global scope publishes, with no engine class behind them.
     pub fn new() -> Self {
+        Self::over(None)
+    }
+
+    /// The classes a global scope publishes, with `fallback` as the engine's
+    /// global object.
+    ///
+    /// A class object asks the engine's class of its own name for a member it
+    /// does not publish, so a member the host attached to the engine's class
+    /// stays reachable when the Rust class answers the name first.
+    pub fn over(fallback: Option<Rc<CHandle>>) -> Self {
         let last = Rc::new(LastRegExp::default());
-        let random_generator: Rc<dyn Dispatch> = class_object(RandomGeneratorClass);
-        let math = class_object(MathClass {
-            random: Rc::new(RefCell::new(Xorshift::seeded(clock_word()))),
-            random_generator: Rc::clone(&random_generator),
-        });
-        let exception = class_object(ExceptionClass);
-        let regexp = class_object(RegExpClass { last });
-        let date = class_object(DateClass {
-            zone: system_offset(),
-        });
+        let random_generator: Rc<dyn Dispatch> =
+            class_object(RandomGeneratorClass, fallback.clone());
+        let math = class_object(
+            MathClass {
+                random: Rc::new(RefCell::new(Xorshift::seeded(clock_word()))),
+                random_generator: Rc::clone(&random_generator),
+            },
+            fallback.clone(),
+        );
+        let exception = class_object(ExceptionClass, fallback.clone());
+        let regexp = class_object(RegExpClass { last }, fallback.clone());
+        let date = class_object(
+            DateClass {
+                zone: system_offset(),
+            },
+            fallback.clone(),
+        );
 
         let mut classes = BTreeMap::new();
         classes.insert(MATH, math);
         classes.insert(EXCEPTION, exception);
         classes.insert(REGEXP, regexp);
         classes.insert(date::CLASS_NAME, date);
+        classes.insert(
+            DICTIONARY,
+            class_object(
+                DictionaryClass {
+                    instances: Rc::new(RefCell::new(Vec::new())),
+                },
+                fallback,
+            ),
+        );
         Self { classes }
     }
 
     /// The class object the global name denotes, when it denotes one.
     pub fn get(&self, name: &TjsString) -> Option<Variant> {
-        let key = class_key(name)?;
+        let key = self.class_key(name)?;
         self.classes
             .get(key)
             .map(|object| object_value(Rc::clone(object)))
@@ -84,12 +114,23 @@ impl NativeRegistry {
 
     /// Whether the global name denotes a class this registry publishes.
     pub fn contains(&self, name: &TjsString) -> bool {
-        class_key(name).is_some()
+        self.class_key(name).is_some()
     }
 
     /// The names the registry publishes.
     pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.classes.keys().copied()
+    }
+
+    /// The registry key a name denotes, when the name is one of the classes.
+    ///
+    /// The key is the map's own: a class cannot be listed by [`Self::names`]
+    /// without also being resolvable here.
+    fn class_key(&self, name: &TjsString) -> Option<&'static str> {
+        self.classes
+            .keys()
+            .copied()
+            .find(|candidate| name.len() == candidate.len() && name.eq_str(candidate))
     }
 }
 
@@ -99,22 +140,19 @@ impl Default for NativeRegistry {
     }
 }
 
-/// The registry key a name denotes, when the name is one of the global classes.
-fn class_key(name: &TjsString) -> Option<&'static str> {
-    let units = name.as_utf16();
-    [MATH, EXCEPTION, REGEXP, date::CLASS_NAME]
-        .iter()
-        .copied()
-        .find(|candidate| units.iter().copied().eq(candidate.encode_utf16()))
-}
-
 /// A class object: the members a class publishes and the instances it makes.
 struct ClassObject {
+    /// The name the class object answers for.
+    name: TjsString,
     /// The class's own rules.
     class: Box<dyn Class>,
     /// Members a script added to the class object, and the object's class
     /// names.
     members: CustomObject,
+    /// The engine's global object, asked for the class of this name.
+    fallback: Option<Rc<CHandle>>,
+    /// The engine's class object, once it has been resolved.
+    engine: RefCell<Option<Rc<dyn Dispatch>>>,
 }
 
 /// The rules one class contributes to its class object.
@@ -129,7 +167,12 @@ trait Class {
     fn get(&self, name: &TjsString) -> Option<Variant>;
 
     /// Calls the member `name`.
-    fn call(&self, name: &TjsString, arguments: &[Variant]) -> Result<Variant, ObjectError>;
+    fn call(
+        &self,
+        name: &TjsString,
+        arguments: &[Variant],
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError>;
 
     /// Constructs an instance.
     fn construct(&self, _arguments: &[Variant]) -> Result<Variant, ObjectError> {
@@ -138,12 +181,76 @@ trait Class {
 }
 
 /// A class object over one class's rules.
-fn class_object<T: Class + 'static>(class: T) -> Rc<dyn Dispatch> {
+fn class_object<T: Class + 'static>(class: T, fallback: Option<Rc<CHandle>>) -> Rc<dyn Dispatch> {
     let name = TjsString::from(class.name());
     Rc::new(ClassObject {
+        name: name.clone(),
         class: Box::new(class),
         members: CustomObject::new([name]),
+        fallback,
+        engine: RefCell::new(None),
     })
+}
+
+impl ClassObject {
+    /// The engine's class object of this name, once it is needed.
+    ///
+    /// The engine's global object is the one source of the class: a global
+    /// without one answers nothing, and the class then has no fallback.
+    fn engine_class(&self) -> Result<Option<Rc<dyn Dispatch>>, ObjectError> {
+        if let Some(engine) = self.engine.borrow().as_ref() {
+            return Ok(Some(Rc::clone(engine)));
+        }
+        let Some(fallback) = self.fallback.as_ref() else {
+            return Ok(None);
+        };
+        let engine = match fallback.prop_get(&self.name, MemberFlags::NONE, None) {
+            Ok(Variant::Object(closure)) => match closure.object {
+                Some(engine) => engine,
+                None => return Ok(None),
+            },
+            Ok(
+                Variant::Void
+                | Variant::Integer(_)
+                | Variant::Real(_)
+                | Variant::String(_)
+                | Variant::Octet(_),
+            ) => return Ok(None),
+            Err(ObjectError::MemberNotFound | ObjectError::MemberMustExist) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        *self.engine.borrow_mut() = Some(Rc::clone(&engine));
+        Ok(Some(engine))
+    }
+
+    /// Whether the Rust class object itself publishes `name`.
+    fn publishes(&self, name: &TjsString) -> bool {
+        name == &self.name
+            || self
+                .class
+                .members()
+                .iter()
+                .any(|member| name.len() == member.len() && name.eq_str(member))
+    }
+
+    /// Whether a script has already written `name` onto this class object.
+    fn holds(&self, name: &TjsString) -> bool {
+        self.members
+            .prop_get(
+                name,
+                MemberFlags::MUST_EXIST | MemberFlags::IGNORE_PROPERTY,
+                None,
+            )
+            .is_ok()
+    }
+
+    /// The engine class that answers `name`, when the Rust class does not.
+    fn engine_member(&self, name: &TjsString) -> Result<Option<Rc<dyn Dispatch>>, ObjectError> {
+        if self.publishes(name) {
+            return Ok(None);
+        }
+        self.engine_class()
+    }
 }
 
 impl Dispatch for ClassObject {
@@ -158,10 +265,16 @@ impl Dispatch for ClassObject {
             Err(ObjectError::MemberNotFound | ObjectError::MemberMustExist) => {}
             Err(error) => return Err(error),
         }
-        if *name == TjsString::from(self.class.name()) {
+        if name == &self.name {
             return Ok(refused_method());
         }
-        self.class.get(name).ok_or(ObjectError::MemberNotFound)
+        if let Some(value) = self.class.get(name) {
+            return Ok(value);
+        }
+        match self.engine_member(name)? {
+            Some(engine) => engine.prop_get(name, flags, objthis),
+            None => Err(ObjectError::MemberNotFound),
+        }
     }
 
     fn prop_set(
@@ -171,6 +284,12 @@ impl Dispatch for ClassObject {
         value: &Variant,
         objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
+        if !self.publishes(name)
+            && !self.holds(name)
+            && let Some(engine) = self.engine_class()?
+        {
+            return engine.prop_set(name, flags, value, objthis);
+        }
         self.members.prop_set(name, flags, value, objthis)
     }
 
@@ -180,6 +299,12 @@ impl Dispatch for ClassObject {
         flags: MemberFlags,
         objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
+        if !self.publishes(name)
+            && !self.holds(name)
+            && let Some(engine) = self.engine_class()?
+        {
+            return engine.delete_member(name, flags, objthis);
+        }
         self.members.delete_member(name, flags, objthis)
     }
 
@@ -217,16 +342,26 @@ impl Dispatch for ClassObject {
         // The class-name constructor is a member of the class object, so a
         // member walk publishes it even though the module's table does not
         // list it.
-        let class_name = TjsString::from(self.class.name());
-        if !seen.contains(&class_name) {
+        let class_name = &self.name;
+        if !seen.contains(class_name) {
             let value = if flags.contains(MemberFlags::ENUM_NO_VALUE) {
                 Variant::Void
             } else {
                 refused_method()
             };
-            if !callback(&class_name, 0, &value) {
+            if !callback(class_name, 0, &value) {
                 return Ok(());
             }
+            seen.push(class_name.clone());
+        }
+        if let Some(engine) = self.engine_class()? {
+            engine.enum_members(flags, &mut |name, member_flags, value| {
+                if seen.contains(name) {
+                    return true;
+                }
+                seen.push(name.clone());
+                callback(name, member_flags, value)
+            })?;
         }
         Ok(())
     }
@@ -239,7 +374,7 @@ impl Dispatch for ClassObject {
         if self.members.is_instance_of(class, objthis)? {
             return Ok(true);
         }
-        Ok(*class == TjsString::from("Class"))
+        Ok(class.eq_str("Class"))
     }
 
     fn class_names(&self) -> Vec<TjsString> {
@@ -262,12 +397,27 @@ impl Dispatch for ClassObject {
         &self,
         name: &TjsString,
         argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
-        if name.is_empty() || *name == TjsString::from(self.class.name()) {
+        if name.is_empty() || name == &self.name {
             return Err(ObjectError::CallNotServed);
         }
-        self.class.call(name, argv.unwrap_or(&[]))
+        // the class object is not one of its instances, so a member that takes
+        // a receiver has none when the call reaches the class object itself
+        let objthis = objthis.filter(|object| {
+            !std::ptr::eq(
+                *object as *const dyn Dispatch as *const (),
+                self as *const Self as *const (),
+            )
+        });
+        if self.publishes(name) {
+            return self.class.call(name, argv.unwrap_or(&[]), objthis);
+        }
+        let Some(engine) = self.engine_class()? else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let receiver = objthis.or(Some(engine.as_ref()));
+        engine.func_call(name, argv, receiver)
     }
 
     fn create_new(
@@ -304,37 +454,42 @@ impl Class for MathClass {
     }
 
     fn get(&self, name: &TjsString) -> Option<Variant> {
-        if *name == TjsString::from("random") {
+        if name.len() == "random".len() && name.eq_str("random") {
             let random = Rc::clone(&self.random);
-            return Some(method(move |_arguments| {
+            return Some(method(move |_arguments, _objthis| {
                 Ok(Variant::Real(random.borrow_mut().next_real()))
             }));
         }
-        if *name == TjsString::from(RANDOM_GENERATOR) {
+        if name.len() == RANDOM_GENERATOR.len() && name.eq_str(RANDOM_GENERATOR) {
             return Some(object_value(Rc::clone(&self.random_generator)));
         }
-        if *name == TjsString::from("finalize") {
+        if name.len() == "finalize".len() && name.eq_str("finalize") {
             return Some(empty_method());
         }
         let member = MathMember::lookup(name)?;
         if let Some(value) = member.value() {
             return Some(value);
         }
-        Some(method(move |arguments| {
+        Some(method(move |arguments, _objthis| {
             member
                 .call(arguments)
                 .map_err(|_| ObjectError::CallNotServed)
         }))
     }
 
-    fn call(&self, name: &TjsString, arguments: &[Variant]) -> Result<Variant, ObjectError> {
-        if *name == TjsString::from("random") {
+    fn call(
+        &self,
+        name: &TjsString,
+        arguments: &[Variant],
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        if name.len() == "random".len() && name.eq_str("random") {
             return Ok(Variant::Real(self.random.borrow_mut().next_real()));
         }
-        if *name == TjsString::from("finalize") {
+        if name.len() == "finalize".len() && name.eq_str("finalize") {
             return Ok(Variant::Void);
         }
-        if *name == TjsString::from(RANDOM_GENERATOR) {
+        if name.len() == RANDOM_GENERATOR.len() && name.eq_str(RANDOM_GENERATOR) {
             return Err(ObjectError::CallNotServed);
         }
         let Some(member) = MathMember::lookup(name) else {
@@ -373,7 +528,12 @@ impl Class for RandomGeneratorClass {
         })
     }
 
-    fn call(&self, name: &TjsString, _arguments: &[Variant]) -> Result<Variant, ObjectError> {
+    fn call(
+        &self,
+        name: &TjsString,
+        _arguments: &[Variant],
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
         if RandomGeneratorMember::lookup(name) == Some(RandomGeneratorMember::Finalize) {
             return Ok(Variant::Void);
         }
@@ -411,7 +571,12 @@ impl Class for ExceptionClass {
         None
     }
 
-    fn call(&self, name: &TjsString, _arguments: &[Variant]) -> Result<Variant, ObjectError> {
+    fn call(
+        &self,
+        name: &TjsString,
+        _arguments: &[Variant],
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
         if ExceptionMember::lookup(name).is_some_and(|member| member.is_class_member()) {
             return Ok(Variant::Void);
         }
@@ -455,7 +620,12 @@ impl Class for RegExpClass {
         None
     }
 
-    fn call(&self, name: &TjsString, _arguments: &[Variant]) -> Result<Variant, ObjectError> {
+    fn call(
+        &self,
+        name: &TjsString,
+        _arguments: &[Variant],
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
         if RegExpMember::lookup(name) == Some(RegExpMember::Finalize) {
             return Ok(Variant::Void);
         }
@@ -498,7 +668,7 @@ impl Class for DateClass {
             return Some(refused_method());
         }
         let zone = self.zone.clone();
-        Some(method(move |arguments| {
+        Some(method(move |arguments, _objthis| {
             let offset = zone.clone().map_err(|_| ObjectError::CallNotServed)?;
             let mut date = Date { seconds: 0, offset };
             DateMember::GetTimezoneOffset
@@ -507,7 +677,12 @@ impl Class for DateClass {
         }))
     }
 
-    fn call(&self, name: &TjsString, arguments: &[Variant]) -> Result<Variant, ObjectError> {
+    fn call(
+        &self,
+        name: &TjsString,
+        arguments: &[Variant],
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
         let Some(member) = DateMember::lookup(name) else {
             return Err(ObjectError::CallNotServed);
         };
@@ -530,6 +705,94 @@ impl Class for DateClass {
         let date = Date::new(arguments, self.offset()?).map_err(|_| ObjectError::CallNotServed)?;
         Ok(date_value(date))
     }
+}
+
+/// The dictionary class object.
+struct DictionaryClass {
+    /// The instances the class made, held weakly so the class does not keep
+    /// them alive.
+    instances: Rc<RefCell<Vec<Weak<Dictionary>>>>,
+}
+
+impl Class for DictionaryClass {
+    fn name(&self) -> &'static str {
+        DICTIONARY
+    }
+
+    fn members(&self) -> Vec<&'static str> {
+        DictionaryMember::all()
+            .map(DictionaryMember::name)
+            .collect()
+    }
+
+    fn get(&self, name: &TjsString) -> Option<Variant> {
+        let member = DictionaryMember::lookup(name)?;
+        let instances = Rc::clone(&self.instances);
+        Some(method(move |arguments, objthis| {
+            let receiver = dictionary_receiver(&instances, objthis);
+            member.call(arguments, receiver.as_ref())
+        }))
+    }
+
+    fn call(
+        &self,
+        name: &TjsString,
+        arguments: &[Variant],
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        let Some(member) = DictionaryMember::lookup(name) else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let receiver = dictionary_receiver(&self.instances, objthis);
+        member.call(arguments, receiver.as_ref())
+    }
+
+    fn construct(&self, _arguments: &[Variant]) -> Result<Variant, ObjectError> {
+        let dictionary = Rc::new(Dictionary::new());
+        {
+            let mut instances = self.instances.borrow_mut();
+            instances.retain(|weak| weak.strong_count() > 0);
+            instances.push(Rc::downgrade(&dictionary));
+        }
+        let object: Rc<dyn Dispatch> = dictionary;
+        Ok(object_value(object))
+    }
+}
+
+/// The receiver a dictionary class static runs on.
+///
+/// The receiver is a dictionary when the value carries the class name; the
+/// class object itself is filtered out by the class object before this is
+/// asked. The handle is the value that names the receiver, when the class
+/// still holds one, so a member that answers the receiver can hand it back.
+fn dictionary_receiver<'a>(
+    instances: &RefCell<Vec<Weak<Dictionary>>>,
+    objthis: Option<&'a dyn Dispatch>,
+) -> Option<DictionaryReceiver<'a>> {
+    let object = objthis?;
+    if !object
+        .class_names()
+        .iter()
+        .any(|name| name.eq_str(DICTIONARY))
+    {
+        return None;
+    }
+    let mut instances = instances.borrow_mut();
+    instances.retain(|weak| weak.strong_count() > 0);
+    let handle = instances.iter().find_map(|weak| {
+        let dictionary = weak.upgrade()?;
+        // the receiver and the instance are one object: the same data behind
+        // the dispatch value, whatever route reached it
+        if identity(object) != identity(&*dictionary) {
+            return None;
+        }
+        let handle: Rc<dyn Dispatch> = dictionary;
+        Some(Variant::Object(Closure {
+            object: Some(Rc::clone(&handle)),
+            objthis: Some(handle),
+        }))
+    });
+    Some(DictionaryReceiver::new(object, handle))
 }
 
 /// The value the last `test` or `exec` recorded for the class object.
@@ -596,8 +859,9 @@ impl Dispatch for TrackedRegExp {
         }
         let last = self.last.clone();
         let this = self.this.clone();
-        Ok(method(move |arguments| {
-            let answer = call_value(&value, arguments)?;
+        let none = TjsString::new();
+        Ok(method(move |arguments, _objthis| {
+            let answer = call_value(&value, &none, arguments)?;
             record_last(&last, &this);
             Ok(answer)
         }))
@@ -704,7 +968,7 @@ impl Dispatch for RandomGeneratorObject {
             return Err(ObjectError::MemberNotFound);
         };
         let state = Rc::clone(&self.state);
-        Ok(method(move |arguments| {
+        Ok(method(move |arguments, _objthis| {
             let mut generator = state.borrow_mut();
             member
                 .call(&mut generator, arguments, fresh_seed())
@@ -757,7 +1021,7 @@ impl Dispatch for RandomGeneratorObject {
                 Variant::Void
             } else {
                 let state = Rc::clone(&self.state);
-                method(move |arguments| {
+                method(move |arguments, _objthis| {
                     let mut generator = state.borrow_mut();
                     member
                         .call(&mut generator, arguments, fresh_seed())
@@ -846,7 +1110,7 @@ impl Dispatch for DateObject {
             return Err(ObjectError::MemberNotFound);
         };
         let state = Rc::clone(&self.state);
-        Ok(method(move |arguments| {
+        Ok(method(move |arguments, _objthis| {
             let mut date = state.borrow_mut();
             member
                 .call(&mut date, arguments)
@@ -899,7 +1163,7 @@ impl Dispatch for DateObject {
                 Variant::Void
             } else {
                 let state = Rc::clone(&self.state);
-                method(move |arguments| {
+                method(move |arguments, _objthis| {
                     let mut date = state.borrow_mut();
                     member
                         .call(&mut date, arguments)
@@ -1002,9 +1266,7 @@ impl Dispatch for NativeMethod {
         class: &TjsString,
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
-        let object = TjsString::from("Object");
-        let function = TjsString::from("Function");
-        Ok(*class == object || *class == function)
+        Ok(class.eq_str("Object") || class.eq_str("Function"))
     }
 
     fn class_names(&self) -> Vec<TjsString> {
@@ -1027,17 +1289,19 @@ impl Dispatch for NativeMethod {
         &self,
         name: &TjsString,
         argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         if !name.is_empty() {
             return Err(ObjectError::CallNotServed);
         }
-        (self.call)(argv.unwrap_or(&[]))
+        (self.call)(argv.unwrap_or(&[]), objthis)
     }
 }
 
 /// The method a member read answers.
-fn method(call: impl Fn(&[Variant]) -> Result<Variant, ObjectError> + 'static) -> Variant {
+fn method(
+    call: impl Fn(&[Variant], Option<&dyn Dispatch>) -> Result<Variant, ObjectError> + 'static,
+) -> Variant {
     let object: Rc<dyn Dispatch> = Rc::new(NativeMethod {
         call: Box::new(call),
     });
@@ -1046,12 +1310,12 @@ fn method(call: impl Fn(&[Variant]) -> Result<Variant, ObjectError> + 'static) -
 
 /// The empty finalizer a class object publishes.
 fn empty_method() -> Variant {
-    method(|_arguments| Ok(Variant::Void))
+    method(|_arguments, _objthis| Ok(Variant::Void))
 }
 
 /// A method a class object publishes but cannot run without an instance.
 fn refused_method() -> Variant {
-    method(|_arguments| Err(ObjectError::CallNotServed))
+    method(|_arguments, _objthis| Err(ObjectError::CallNotServed))
 }
 
 /// The object value a dispatch object becomes.
@@ -1096,7 +1360,11 @@ fn record_last(last: &Weak<LastRegExp>, this: &Weak<TrackedRegExp>) {
 }
 
 /// Calls a method value with the receiver it carries.
-fn call_value(value: &Variant, arguments: &[Variant]) -> Result<Variant, ObjectError> {
+fn call_value(
+    value: &Variant,
+    name: &TjsString,
+    arguments: &[Variant],
+) -> Result<Variant, ObjectError> {
     let Variant::Object(closure) = value else {
         return Err(ObjectError::CallNotServed);
     };
@@ -1104,11 +1372,7 @@ fn call_value(value: &Variant, arguments: &[Variant]) -> Result<Variant, ObjectE
         .object
         .as_deref()
         .ok_or(ObjectError::CallNotServed)?;
-    object.func_call(
-        &TjsString::new(),
-        Some(arguments),
-        closure.objthis.as_deref(),
-    )
+    object.func_call(name, Some(arguments), closure.objthis.as_deref())
 }
 
 /// The low word of the wall clock's seconds, the seed the generators use.
@@ -1335,4 +1599,28 @@ fn posix_part(text: Option<&str>) -> Result<i64, ZoneError> {
         return Err(ZoneError::Text);
     }
     text.parse::<i64>().map_err(|_| ZoneError::Text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::NativeRegistry;
+    use crate::vm::runtime::string::TjsString;
+
+    /// Every name the registry lists resolves through the same table, so a
+    /// class cannot be half registered.
+    #[test]
+    fn every_published_name_resolves() {
+        let registry = NativeRegistry::new();
+        let mut seen = Vec::new();
+        for name in registry.names() {
+            seen.push(name);
+            let name = TjsString::from(name);
+            assert!(registry.contains(&name), "the name is not contained");
+            assert!(registry.get(&name).is_some(), "the name does not resolve");
+        }
+        assert!(
+            seen.contains(&"Dictionary"),
+            "the dictionary class is absent"
+        );
+    }
 }

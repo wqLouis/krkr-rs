@@ -34,7 +34,7 @@
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
-use crate::vm::onig;
+use crate::vm::regexp_engine;
 use crate::vm::runtime::array::{ArrayError, ArrayObject};
 use crate::vm::runtime::natives::string::Arity;
 use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
@@ -48,7 +48,8 @@ pub const CLASS_NAME: &str = "RegExp";
 const GLOBAL_SEARCH: u32 = 1 << 31;
 
 /// The flags a pattern with no flag letter gets.
-const DEFAULT_FLAGS: u32 = onig::OPTION_CAPTURE_GROUP | onig::OPTION_FIND_NOT_EMPTY;
+const DEFAULT_FLAGS: u32 =
+    regexp_engine::OPTION_CAPTURE_GROUP | regexp_engine::OPTION_FIND_NOT_EMPTY;
 
 /// A member of the class.
 ///
@@ -120,11 +121,10 @@ impl RegExpMember {
 
     /// The member `name` denotes, or `None` when it names no member.
     pub fn lookup(name: &TjsString) -> Option<Self> {
-        let units = name.as_utf16();
         Self::ALL
             .iter()
             .copied()
-            .find(|member| units.iter().copied().eq(member.name().encode_utf16()))
+            .find(|member| name.len() == member.name().len() && name.eq_str(member.name()))
     }
 
     /// The name the class publishes the member under.
@@ -290,7 +290,7 @@ impl RegExpMember {
 /// The state of one `RegExp` instance.
 pub struct RegExp {
     /// The compiled expression, absent until a pattern is compiled.
-    expression: Option<onig::Expression>,
+    expression: Option<regexp_engine::Expression>,
     /// The option bits the flags produced.
     flags: u32,
     /// The code unit a search starts at.
@@ -598,14 +598,13 @@ impl RegExp {
             None => Some(text_of(replacement, 1)?),
         };
         let expression = self.expression.as_ref().ok_or(RegExpError::NotCompiled)?;
-        let bytes = onig::encode(target.as_utf16());
         let units = target.as_utf16();
         let end = units.len();
         let global = self.flags & GLOBAL_SEARCH != 0;
         let mut cursor = 0usize;
         let mut output: Vec<u16> = Vec::new();
         let Some(mut region) = expression
-            .search(&bytes, 0, end)
+            .search(units, 0, end)
             .map_err(|_| RegExpError::Range)?
         else {
             output.extend_from_slice(units);
@@ -653,7 +652,7 @@ impl RegExp {
                 break;
             }
             let Some(next) = expression
-                .search(&bytes, cursor, end)
+                .search(units, cursor, end)
                 .map_err(|_| RegExpError::Range)?
             else {
                 break;
@@ -687,12 +686,11 @@ impl RegExp {
             None => false,
         };
         let expression = self.expression.as_ref().ok_or(RegExpError::NotCompiled)?;
-        let bytes = onig::encode(target.as_utf16());
         let units = target.as_utf16();
         let end = units.len();
         let array = Rc::new(ArrayObject::new());
         let Some(mut region) = expression
-            .search(&bytes, 0, end)
+            .search(units, 0, end)
             .map_err(|_| RegExpError::Range)?
         else {
             array.push(&[Variant::String(target)])?;
@@ -709,7 +707,7 @@ impl RegExp {
             let advance = unit_offset(region.end(0))?;
             cursor = cursor.checked_add(advance).ok_or(RegExpError::Range)?;
             let Some(next) = expression
-                .search(&bytes, cursor, end)
+                .search(units, cursor, end)
                 .map_err(|_| RegExpError::Range)?
             else {
                 break;
@@ -726,8 +724,11 @@ impl RegExp {
     /// Replaces the expression, leaving the old one freed first.
     fn replace_expression(&mut self, pattern: &TjsString, flags: u32) -> Result<(), RegExpError> {
         self.expression = None;
-        let expression = onig::Expression::compile(pattern.as_utf16(), flags & onig::OPTION_MASK)
-            .map_err(|message| RegExpError::Compile {
+        let expression = regexp_engine::Expression::compile(
+            pattern.as_utf16(),
+            flags & regexp_engine::OPTION_MASK,
+        )
+        .map_err(|message| RegExpError::Compile {
             message: TjsString::from(message),
         })?;
         self.expression = Some(expression);
@@ -738,19 +739,19 @@ impl RegExp {
     /// Searches `target` from `start`.
     fn search(
         &self,
-        expression: &onig::Expression,
+        expression: &regexp_engine::Expression,
         target: &TjsString,
         start: u32,
-    ) -> Result<Option<onig::Region>, RegExpError> {
+    ) -> Result<Option<regexp_engine::Region>, RegExpError> {
         let length = u32::try_from(target.len()).map_err(|_| RegExpError::Range)?;
         if start >= length {
             return Ok(None);
         }
-        let bytes = onig::encode(target.as_utf16());
+        let units = target.as_utf16();
         let start = usize::try_from(start).map_err(|_| RegExpError::Range)?;
         let end = usize::try_from(length).map_err(|_| RegExpError::Range)?;
         expression
-            .search(&bytes, start, end)
+            .search(units, start, end)
             .map_err(|_| RegExpError::Range)
     }
 }
@@ -995,9 +996,7 @@ impl Dispatch for RegExpMethod {
         class: &TjsString,
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
-        let object = TjsString::from("Object");
-        let function = TjsString::from("Function");
-        Ok(*class == object || *class == function)
+        Ok(class.eq_str("Object") || class.eq_str("Function"))
     }
 
     fn class_names(&self) -> Vec<TjsString> {
@@ -1116,7 +1115,7 @@ fn parse_flags(text: &TjsString) -> u32 {
         }
         match unit {
             unit if unit == u16::from(b'g') => flags |= GLOBAL_SEARCH,
-            unit if unit == u16::from(b'i') => flags |= onig::OPTION_IGNORECASE,
+            unit if unit == u16::from(b'i') => flags |= regexp_engine::OPTION_IGNORECASE,
             _ => {}
         }
     }
@@ -1167,7 +1166,7 @@ fn slice_units(
 fn result_array(
     target: &TjsString,
     start: u32,
-    region: Option<&onig::Region>,
+    region: Option<&regexp_engine::Region>,
 ) -> Result<Variant, RegExpError> {
     let start = usize::try_from(start).map_err(|_| RegExpError::Range)?;
     result_array_units(target.as_utf16(), start, region)
@@ -1177,7 +1176,7 @@ fn result_array(
 fn result_array_units(
     target: &[u16],
     start: usize,
-    region: Option<&onig::Region>,
+    region: Option<&regexp_engine::Region>,
 ) -> Result<Variant, RegExpError> {
     let array = Rc::new(ArrayObject::new());
     if let Some(region) = region {

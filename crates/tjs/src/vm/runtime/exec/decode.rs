@@ -627,21 +627,6 @@ pub fn is_operand_less(opcode: i32) -> bool {
     )
 }
 
-/// The part of the runtime an opcode belongs to, when this part does not
-/// execute it.
-///
-/// The name is the part's, so a refusal says who owns the behaviour instead of
-/// saying the opcode is unknown.
-pub fn owner(opcode: i32) -> Option<&'static str> {
-    match opcode {
-        // the fifteen member instructions are executed by this interpreter's
-        // member module; the two property-object instructions read and write
-        // the member as a property, which no part implements yet
-        vm::ENTRY | vm::EXTRY | vm::THROW => Some("the exception part"),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,45 +769,5 @@ mod tests {
                 "opcode {opcode}"
             );
         }
-    }
-
-    /// Every opcode this part does not execute names its owner, and every
-    /// opcode it does execute names none
-    /// (`docs/code/tjs/interpreter.md` §6, the packet plan).
-    #[test]
-    fn the_opcodes_another_part_owns_are_named() {
-        let executed = [
-            vm::NOP,
-            vm::CONST,
-            vm::CP,
-            vm::CL,
-            vm::CCL,
-            vm::TT,
-            vm::TF,
-            vm::CEQ,
-            vm::CDEQ,
-            vm::CLT,
-            vm::CGT,
-            vm::SETF,
-            vm::SETNF,
-            vm::LNOT,
-            vm::NF,
-            vm::JF,
-            vm::JNF,
-            vm::JMP,
-            vm::SRV,
-            vm::RET,
-            vm::DEBUGGER,
-        ];
-        for opcode in executed {
-            assert_eq!(owner(opcode), None, "{} is executed", mnemonic(opcode));
-        }
-        assert_eq!(owner(vm::GPD), None, "the member instructions execute");
-        assert_eq!(owner(vm::SPDEH), None);
-        assert_eq!(owner(vm::TYPEOFD), None);
-        assert_eq!(owner(vm::THROW), Some("the exception part"));
-        assert_eq!(owner(vm::ADDCI), None, "the class-name write executes");
-        assert_eq!(owner(vm::EVAL), None, "the compile instructions execute");
-        assert_eq!(owner(vm::EEXP), None);
     }
 }

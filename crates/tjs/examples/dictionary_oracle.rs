@@ -88,6 +88,12 @@ const PROBES: &[(&str, &str)] = &[
     ("deleted_text", "\"\" + (m.deleted)"),
     ("own_class", "\"\" + (m instanceof \"Dictionary\")"),
     ("object_class", "\"\" + (m instanceof \"Object\")"),
+    // the class names a dictionary answers, and the class object's text
+    ("array_class", "\"\" + (m instanceof \"Array\")"),
+    ("class_object", "\"\" + (m instanceof Dictionary)"),
+    ("string_class", "\"\" + (m instanceof \"String\")"),
+    ("number_class", "\"\" + (m instanceof \"Number\")"),
+    ("octet_class", "\"\" + (m instanceof \"Octet\")"),
     // the class's static members, and the names that are not members at all
     ("instance_save_struct", "typeof (m.saveStruct)"),
     ("instance_load_struct", "typeof (m.loadStruct)"),

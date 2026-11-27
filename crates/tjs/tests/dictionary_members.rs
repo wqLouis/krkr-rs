@@ -23,6 +23,10 @@ use tjs::vm::runtime::octet::Octet;
 use tjs::vm::runtime::string::TjsString;
 use tjs::vm::runtime::variant::{Closure, Variant};
 
+/// The text a class object has on the right of `instanceof`: its handle, never
+/// its class name (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187-213`).
+const CLASS_OBJECT_TEXT: &str = "(object 0:0)";
+
 /// The probes the record must hold, in the recorder's order.
 const PROBES: &[&str] = &[
     "absent_typeof",
@@ -34,6 +38,11 @@ const PROBES: &[&str] = &[
     "deleted_text",
     "own_class",
     "object_class",
+    "array_class",
+    "class_object",
+    "string_class",
+    "number_class",
+    "octet_class",
     "instance_save_struct",
     "instance_load_struct",
     "instance_clear",
@@ -182,6 +191,11 @@ fn answer(
         }
         "own_class" => instance_answer(member, "Dictionary"),
         "object_class" => instance_answer(member, "Object"),
+        "array_class" => instance_answer(member, "Array"),
+        "class_object" => instance_answer(member, CLASS_OBJECT_TEXT),
+        "string_class" => instance_answer(member, "String"),
+        "number_class" => instance_answer(member, "Number"),
+        "octet_class" => instance_answer(member, "Octet"),
         other => panic!("the check has no answer for the recorded probe: {other}"),
     }
 }
@@ -303,12 +317,30 @@ fn a_hidden_member_is_not_saved() {
 #[test]
 fn a_dictionary_answers_its_class_and_the_object_class() {
     let dictionary = Dictionary::new();
+    // reference/krkr2/cpp/core/tjs2/tjsNative.cpp:323-325 (the construction
+    // adds the class name); reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1767-1781
+    // (a custom object answers a class name it carries).
     assert_eq!(
         dictionary.is_instance_of(&name("Dictionary"), None),
         Ok(true)
     );
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1721-1722 (every value but
+    // the empty one is an Object).
     assert_eq!(dictionary.is_instance_of(&name("Object"), None), Ok(true));
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1767-1781 (a name the object
+    // does not carry is false).
     assert_eq!(dictionary.is_instance_of(&name("Array"), None), Ok(false));
+    // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187-213 (a class object's
+    // text is its handle, so it names no class).
+    assert_eq!(
+        dictionary.is_instance_of(&name(CLASS_OBJECT_TEXT), None),
+        Ok(false)
+    );
+    // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1728-1740 (a dictionary is
+    // neither a number, a text nor an octet and carries no such name).
+    assert_eq!(dictionary.is_instance_of(&name("String"), None), Ok(false));
+    assert_eq!(dictionary.is_instance_of(&name("Number"), None), Ok(false));
+    assert_eq!(dictionary.is_instance_of(&name("Octet"), None), Ok(false));
 }
 
 /// The dictionary the recorder's member script builds, replayed through the

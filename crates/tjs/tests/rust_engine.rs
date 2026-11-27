@@ -237,13 +237,13 @@ const DEFERRED: &[(&str, usize, &str)] = &[
     ),
     (
         "array_members",
-        156,
+        166,
         "the expressions live in `examples/array_oracle.rs`; a replay would have \
          to guess them from the ids",
     ),
     (
         "dictionary_members",
-        25,
+        30,
         "the expressions live in `examples/dictionary_oracle.rs`; a replay would \
          have to guess them from the ids",
     ),
@@ -362,7 +362,9 @@ fn recorded_text(engine: &Rc<Tjs2Engine>, probe: &str, expression: &str) -> Stri
             Ok(text) => text.to_string(),
             Err(_) => RAISED.to_string(),
         },
-        Err(error) if matches!(&error, EngineError::Run(Fault::Raised(_))) => RAISED.to_string(),
+        Err(EngineError::Run(unwind)) if matches!(unwind.fault(), Fault::Raised(_)) => {
+            RAISED.to_string()
+        }
         Err(error) => panic!("probe {probe}: {error:?}"),
     }
 }

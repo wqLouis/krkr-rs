@@ -305,6 +305,18 @@ pub enum BuildError {
     /// The object surface refused a member while the constant was being built.
     #[error(transparent)]
     Object(#[from] ObjectError),
+
+    /// A context's code stream does not decode: an operand is outside the
+    /// frame's window, a jump is outside the stream, or an instruction does not
+    /// fit the words it occupies.
+    #[error("context {context}'s code stream does not decode: {error}")]
+    Stream {
+        /// The context whose stream it is.
+        context: usize,
+        /// The failure the decode reported.
+        #[source]
+        error: super::Fault,
+    },
 }
 
 impl Block {
@@ -578,7 +590,7 @@ fn code_of(
     for value in context.data() {
         data.push(constant_of(value, built, index)?);
     }
-    Ok(Code {
+    let code = Code {
         code: context.code().to_vec(),
         data,
         max_variable_count: shape.variable_count,
@@ -588,6 +600,11 @@ fn code_of(
         func_decl_collapse_base: shape.func_collapse_base,
         func_decl_unnamed_arg_array_base: shape.func_unnamed_arg_base,
         name: context.name.clone().unwrap_or_default(),
+        ..Code::default()
+    };
+    code.decoded().map_err(|error| BuildError::Stream {
+        context: index,
+        error,
     })
 }
 

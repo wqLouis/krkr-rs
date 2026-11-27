@@ -14,7 +14,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use tjs::vm::runtime::exec::Raise;
-use tjs::vm::runtime::exec::throw::message_of;
+use tjs::vm::runtime::exec::throw::{Unwind, message_of};
 use tjs::vm::runtime::octet::Octet;
 use tjs::vm::runtime::variant::{Closure, Target, Variant};
 
@@ -83,25 +83,22 @@ fn message(probe: &str) -> String {
         "convert_string_octet_long" => {
             conversion(Variant::from(Octet::from_slice(&[1; 174])), Target::Text)
         }
-        "access_denied_text_length" => Raise::AccessDenied,
-        "range_error_text_index" => Raise::RangeError,
-        "range_error_octet_index" => Raise::RangeError,
-        "format_string_sprintf" => Raise::FormatString,
-        "parameter_count_sprintf" => Raise::ParameterCount,
-        "parameter_count_char_at" => Raise::ParameterCount,
-        "parameter_count_unpack" => Raise::ParameterCount,
-        "invalid_parameter_unpack" => Raise::InvalidParameter,
+        "access_denied_text_length" => Raise::AccessDenied.into(),
+        "range_error_text_index" => Raise::RangeError.into(),
+        "range_error_octet_index" => Raise::RangeError.into(),
+        "format_string_sprintf" => Raise::FormatString.into(),
+        "parameter_count_sprintf" => Raise::ParameterCount.into(),
+        "parameter_count_char_at" => Raise::ParameterCount.into(),
+        "parameter_count_unpack" => Raise::ParameterCount.into(),
+        "invalid_parameter_unpack" => Raise::InvalidParameter.into(),
         other => panic!("the check has no replay for the recorded probe: {other}"),
     };
     message_of(&raise)
 }
 
 /// A refused conversion's raise.
-fn conversion(value: Variant, target: Target) -> Raise {
-    Raise::Convert {
-        value: Box::new(value),
-        to: target.name(),
-    }
+fn conversion(value: Variant, target: Target) -> Unwind {
+    Unwind::raised(Raise::Convert { to: target.name() }).with_value(&value)
 }
 
 /// One recorded message.

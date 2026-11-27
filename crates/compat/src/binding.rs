@@ -81,6 +81,11 @@ pub(crate) fn install(
     services: *mut CompatServices,
     registry: &PluginRegistry,
 ) -> Result<(), CompatError> {
+    if tjs::vm::runtime::stream::host().is_some() {
+        return Err(CompatError::Register(
+            "the stream host is already installed".into(),
+        ));
+    }
     {
         let mut slot = lock();
         if slot.is_some() {
@@ -103,11 +108,23 @@ pub(crate) fn install(
     // payload; the host owns the detector. SAFETY: the callback carries no
     // user pointer, and `uninstall` clears the seam first.
     unsafe { tjs::set_text_decode_callback(Some(text_decode), ptr::null_mut()) };
+    // The Rust executor's save/load members reach the same storage through
+    // the stream host. It is installed once, with the binding, and removed
+    // before the services it names are dropped.
+    if let Err(error) = crate::streams::install(services) {
+        // SAFETY: undoing the seams above passes no user pointer.
+        unsafe { tjs::set_storage_read_callback(None, ptr::null_mut()) };
+        // SAFETY: undoing the seams above passes no user pointer.
+        unsafe { tjs::set_text_decode_callback(None, ptr::null_mut()) };
+        *lock() = None;
+        return Err(error);
+    }
     Ok(())
 }
 
 /// Remove the binding (called before the engine is dropped).
 pub(crate) fn uninstall() {
+    crate::streams::uninstall();
     // SAFETY: clearing the seam passes no user pointer.
     unsafe { tjs::set_storage_read_callback(None, ptr::null_mut()) };
     // SAFETY: clearing the seam passes no user pointer.

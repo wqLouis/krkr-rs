@@ -8,6 +8,11 @@ created_text	String	7
 deleted_text	String	
 own_class	String	1
 object_class	String	1
+array_class	String	0
+class_object	String	0
+string_class	String	0
+number_class	String	0
+octet_class	String	0
 instance_save_struct	String	undefined
 instance_load_struct	String	undefined
 instance_clear	String	undefined

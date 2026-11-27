@@ -30,8 +30,8 @@
 //!
 //! [`ScriptScope::run`] compiles and runs its argument as a script; a
 //! top-level `return` is its answer and falling off the end answers `void`.
-//! [`ScriptScope::eval`] compiles it as an expression and answers its value.
-//! A failure keeps the shape the script diagnostic has: `block(line):
+//! [`ScriptScope::evaluate`] compiles it as an expression and answers its
+//! value. A failure keeps the shape the script diagnostic has: `block(line):
 //! message`, with the block name the caller supplied.
 #![allow(unsafe_code)]
 
@@ -121,7 +121,7 @@ impl<'a> ScriptScope<'a> {
     ///
     /// The compile, block-build or run failure as `block(line): message`, and
     /// the refusal when an object answer cannot be retained.
-    pub(crate) fn eval(
+    pub(crate) fn evaluate(
         &self,
         expression: &str,
         block_name: &str,
@@ -137,4 +137,3 @@ impl<'a> ScriptScope<'a> {
         )
     }
 }
-

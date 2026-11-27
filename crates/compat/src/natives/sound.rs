@@ -717,7 +717,7 @@ fn set_retained_out(out: *mut Value, id: Tjs2ValueId) {
 /// Evaluate `expr` and return the resulting object, retained; `None` when the
 /// expression did not yield an object.
 fn eval_object(scripts: &ScriptScope<'_>, expr: &str, what: &str) -> Option<DetachedValue> {
-    match scripts.eval(expr, what, ScriptOptions::default()) {
+    match scripts.evaluate(expr, what, ScriptOptions::default()) {
         Ok(RetainedValue::Object(object)) => Some(object),
         Ok(_) => None,
         Err(error) => {

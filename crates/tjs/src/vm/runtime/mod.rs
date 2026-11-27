@@ -14,13 +14,16 @@
 //! | the string | [`string`] | the heap string a script's text values are |
 //! | the number conversion | [`number`] | the text-to-number rules a string's arithmetic uses |
 //! | the member table | [`hash`] | the table an object's members are stored in |
+//! | the message table | [`message`] | the registered messages and the text a raise reads |
 //! | the object model | [`object`] | the member surface and the objects that hold members |
 //! | the variant | [`variant`] | the value a script holds, and its operators |
 //! | the interpreter | [`exec`] | the frame and the instructions a compiled block runs |
 //! | the engine adapter | [`bridge`] | an object the engine owns, seen as a dispatch object |
 //! | the script entry | [`engine`] | script text in, the top-level call out |
+//! | the global scope | [`global`] | the members, the class objects and the engine behind them |
+//! | the stream seam | [`stream`] | the host's streams a save and a load read and write |
 //! | the held values | [`retained`] | the ids that name the values an engine keeps |
-//! | the engine object | [`engine_core`] | the global scope, the held values and the compiled scripts |
+//! | the engine object | [`engine_core`] | the held values, the compiled scripts and the scope they run in |
 //!
 //! Every part of the runtime is safe Rust: a value owns its storage and is
 //! borrowed or cloned, never passed as a handle a caller must free. The two
@@ -59,14 +62,17 @@ pub mod dictionary;
 pub mod engine;
 pub mod engine_core;
 pub mod exec;
+pub mod global;
 pub mod hash;
 pub mod member;
+pub mod message;
 pub mod natives;
 pub mod number;
 pub mod object;
 pub mod octet;
 pub mod octet_pack;
 pub mod retained;
+pub mod stream;
 pub mod string;
 pub mod variant;
 

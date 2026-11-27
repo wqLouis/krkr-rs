@@ -553,6 +553,31 @@ fn constants_include_the_image_tag_layer_type_dictionary() {
     );
 }
 
+/// The constants are the engine's global members, so a script the **Rust**
+/// executor runs reads them through the global object's fallback: the engine's
+/// global object is the one source a name the scope does not hold is asked of
+/// (`runtime/global.rs`, the resolution order), and the dictionary is an object
+/// the engine holds rather than a store kept beside it.
+///
+/// `Scripts.eval` is the Rust executor's entry (`natives/scripts.rs:620`).
+#[test]
+fn the_rust_executor_reads_the_global_constants() {
+    let _lock = vm_lock();
+    let env = Env::new();
+    assert_eq!(
+        env.eval_int("Scripts.eval(\"ltPsColorBurn === 23 ? 1 : 0\")"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("Scripts.eval(\"imageTagLayerType.alpha.type === ltAlpha ? 1 : 0\")"),
+        1
+    );
+    assert_eq!(
+        env.eval_int("Scripts.eval(\"typeof imageTagLayerType\") === \"Object\" ? 1 : 0"),
+        1
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Clipboard (utils/ClipboardIntf.cpp + impl/ClipboardImpl.cpp)
 // ---------------------------------------------------------------------------

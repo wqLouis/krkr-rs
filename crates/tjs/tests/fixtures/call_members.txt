@@ -1,0 +1,28 @@
+# the engine's answers, recorded by `crates/tjs/examples/call_members_oracle.rs`; regenerate with the command in the example's docs
+add	Integer	3
+add_read	Integer	1
+insert	void	
+insert_read	Integer	99
+erase	void	
+erase_read	Integer	2
+find	Integer	2
+sort_push	Integer	7
+sort	void	
+sort_read	String	1,1,1,2,2,3,3
+count_call	!raise	Called method is not implemented
+reverse	void	
+reverse_read	String	3,3,2,2,1,1,1
+clear	void	
+clear_count	Integer	0
+remove_push	Integer	3
+remove	Integer	1
+remove_read	String	5,4
+add_wrong_count	!raise	Invalid argument count
+insert_wrong_count	!raise	Invalid argument count
+array_named_call	Integer	7
+array_named_absent	!raise	Member "missing" does not exist
+object_call	Integer	42
+object_not_function	!raise	Not a function or invalid method/property type
+object_absent	!raise	Member "f" does not exist
+dictionary_instance_member	void	
+dictionary_instance_call	!raise	Member "saveStruct" does not exist

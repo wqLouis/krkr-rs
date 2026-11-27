@@ -41,14 +41,15 @@
 //! and computing the type from the value would be more correct than the engine
 //! and therefore wrong.
 
-use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::object::{MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Target, Variant};
 
 use super::frame::{Code, Frame};
+use super::instruction::{Form, Name, Slot};
 use super::op;
+use super::throw::Unwind;
 use super::{Fault, Raise};
 
 /// The text a value with no text answers when a member instruction names it
@@ -56,126 +57,49 @@ use super::{Fault, Raise};
 /// name.
 const NO_NAME: &str = "";
 
-/// Whether an opcode is one of the member instructions.
-pub fn handles(opcode: i32) -> bool {
-    matches!(
-        opcode,
-        vm::GPD
-            | vm::GPDS
-            | vm::SPD
-            | vm::SPDE
-            | vm::SPDEH
-            | vm::SPDS
-            | vm::GPI
-            | vm::GPIS
-            | vm::SPI
-            | vm::SPIE
-            | vm::SPIS
-            | vm::DELD
-            | vm::DELI
-            | vm::TYPEOFD
-            | vm::TYPEOFI
-            | vm::SETP
-            | vm::GETP
-    )
-}
-
-/// Executes a member instruction.
-pub fn execute(code: &Code, frame: &mut Frame, ip: usize, opcode: i32) -> Result<(), Fault> {
-    match opcode {
-        vm::GPD => read(code, frame, ip, Form::Direct, MemberFlags::NONE),
-        vm::GPDS => read(code, frame, ip, Form::Direct, MemberFlags::IGNORE_PROPERTY),
-        vm::GPI => read(code, frame, ip, Form::Indirect, MemberFlags::NONE),
-        vm::GPIS => read(
-            code,
-            frame,
-            ip,
-            Form::Indirect,
-            MemberFlags::IGNORE_PROPERTY,
-        ),
-        vm::SPD => write(code, frame, ip, Form::Direct, MemberFlags::NONE),
-        vm::SPDE => write(code, frame, ip, Form::Direct, MemberFlags::ENSURE),
-        vm::SPDEH => write(
-            code,
-            frame,
-            ip,
-            Form::Direct,
-            MemberFlags::ENSURE | MemberFlags::HIDDEN,
-        ),
-        vm::SPDS => write(
-            code,
-            frame,
-            ip,
-            Form::Direct,
-            MemberFlags::ENSURE | MemberFlags::IGNORE_PROPERTY,
-        ),
-        vm::SPI => write(code, frame, ip, Form::Indirect, MemberFlags::NONE),
-        vm::SPIE => write(code, frame, ip, Form::Indirect, MemberFlags::ENSURE),
-        vm::SPIS => write(
-            code,
-            frame,
-            ip,
-            Form::Indirect,
-            MemberFlags::ENSURE | MemberFlags::IGNORE_PROPERTY,
-        ),
-        vm::DELD => delete(code, frame, ip, Form::Direct),
-        vm::DELI => delete(code, frame, ip, Form::Indirect),
-        vm::GETP => property_get(code, frame, ip),
-        vm::SETP => property_set(code, frame, ip),
-        vm::TYPEOFD => typeof_member(code, frame, ip, Form::Direct),
-        vm::TYPEOFI => typeof_member(code, frame, ip, Form::Indirect),
-        _ => Err(Fault::Broken("a member instruction that is not one")),
-    }
-}
-
-/// Which form an instruction takes: the name from the constant area, or from a
-/// register.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Form {
-    /// `%d %o @k`
-    Direct,
-    /// `%d %o %n`
-    Indirect,
-}
+/// The member a text and a byte string answer their count with.
+const LENGTH: &str = "length";
 
 /// A read: `%d = %o[@k]` or `%d = %o[%n]`.
-fn read(
+pub fn read(
     code: &Code,
     frame: &mut Frame,
-    ip: usize,
     form: Form,
     flags: MemberFlags,
-) -> Result<(), Fault> {
-    let destination = operand(code, ip, 1)?;
-    let holder = operand(code, ip, 2)?;
-    let name = value_of(code, frame, form, operand(code, ip, 3)?)?;
-    let value = frame.reg(holder)?.clone();
-    let answer = match &value {
+    destination: Slot,
+    holder: Slot,
+    name: &Name,
+) -> Result<(), Unwind> {
+    let name = value_of(code, frame, name);
+    let value = frame.slot(holder);
+    let answer = match value {
         Variant::String(text) => string_get(text, &name)?,
         Variant::Octet(octet) => octet_get(octet, &name)?,
-        _ => object_get(&value, form, &name, flags)?,
+        _ => object_get(value, form, &name, flags)?,
     };
-    frame.set(destination, answer)
+    frame.store(destination, answer);
+    Ok(())
 }
 
 /// A write: `%o[@k] = %v` or `%o[%n] = %v`, and the four spellings that decide
 /// whether the member is created, hidden or written through its property.
-fn write(
+pub fn write(
     code: &Code,
     frame: &mut Frame,
-    ip: usize,
     form: Form,
     flags: MemberFlags,
-) -> Result<(), Fault> {
-    let holder = operand(code, ip, 1)?;
-    let name = value_of(code, frame, form, operand(code, ip, 2)?)?;
-    let value = frame.reg(operand(code, ip, 3)?)?.clone();
-    let target = frame.reg(holder)?.clone();
-    match &target {
+    holder: Slot,
+    name: &Name,
+    written: Slot,
+) -> Result<(), Unwind> {
+    let name = value_of(code, frame, name);
+    let value = frame.slot(written);
+    let target = frame.slot(holder);
+    match target {
         // a text and a byte string cannot grow, and the refusal is an access
         // denial rather than a missing member
         Variant::String(_) | Variant::Octet(_) => Err(write_refused(&name)),
-        _ => object_set(&target, form, &name, &value, flags),
+        _ => object_set(target, form, &name, value, flags),
     }
 }
 
@@ -184,35 +108,37 @@ fn write(
 /// The member name is the null one the engine passes, which this surface
 /// spells as the empty text: an object that does not answer it refuses, and a
 /// script sees a raise either way.
-fn property_get(code: &Code, frame: &mut Frame, ip: usize) -> Result<(), Fault> {
-    let destination = operand(code, ip, 1)?;
-    let holder = operand(code, ip, 2)?;
-    let target = frame.reg(holder)?.clone();
+pub fn read_property(frame: &mut Frame, destination: Slot, holder: Slot) -> Result<(), Unwind> {
+    let target = frame.slot(holder);
     let name = Variant::String(TjsString::new());
-    let answer = object_get(&target, Form::Direct, &name, MemberFlags::NONE)?;
-    frame.set(destination, answer)
+    let answer = object_get(target, Form::Direct, &name, MemberFlags::NONE)?;
+    frame.store(destination, answer);
+    Ok(())
 }
 
 /// A write through a property object: `*%o = %v`.
-fn property_set(code: &Code, frame: &mut Frame, ip: usize) -> Result<(), Fault> {
-    let holder = operand(code, ip, 1)?;
-    let written = operand(code, ip, 2)?;
-    let target = frame.reg(holder)?.clone();
-    let value = frame.reg(written)?.clone();
+pub fn write_property(frame: &mut Frame, holder: Slot, written: Slot) -> Result<(), Unwind> {
+    let target = frame.slot(holder);
+    let value = frame.slot(written);
     let name = Variant::String(TjsString::new());
-    object_set(&target, Form::Direct, &name, &value, MemberFlags::NONE)
+    object_set(target, Form::Direct, &name, value, MemberFlags::NONE)
 }
 
 /// A delete: `%d = delete %o[@k]` and its indirect form.
 ///
 /// A failure answers a false rather than raising, and the destination may be
 /// the discard register, which asks for no answer.
-fn delete(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), Fault> {
-    let destination = operand(code, ip, 1)?;
-    let holder = operand(code, ip, 2)?;
-    let name = value_of(code, frame, form, operand(code, ip, 3)?)?;
-    let value = frame.reg(holder)?.clone();
-    let closure = as_closure(&value)?;
+pub fn delete(
+    code: &Code,
+    frame: &mut Frame,
+    form: Form,
+    destination: Slot,
+    holder: Slot,
+    name: &Name,
+) -> Result<(), Unwind> {
+    let name = value_of(code, frame, name);
+    let value = frame.slot(holder);
+    let closure = as_closure(value)?;
     let object = closure.object.as_deref().ok_or_else(null_object)?;
     let text = text_of(&name)?;
     // the direct form hands the delete the frame's own receiver and the
@@ -226,44 +152,49 @@ fn delete(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), F
         // a refusal is the answer, not a failure the instruction reports
         Err(_refused) => Variant::Integer(0),
     };
-    if destination != 0 {
-        frame.set(destination, answer)?;
-    }
+    frame.store(destination, answer);
     Ok(())
 }
 
 /// The type of a member: `%d = typeof %o[@k]` and its indirect form.
-fn typeof_member(code: &Code, frame: &mut Frame, ip: usize, form: Form) -> Result<(), Fault> {
-    let destination = operand(code, ip, 1)?;
-    let holder = operand(code, ip, 2)?;
-    let name = value_of(code, frame, form, operand(code, ip, 3)?)?;
-    let value = frame.reg(holder)?.clone();
-    let answer = match &value {
+pub fn type_of(
+    code: &Code,
+    frame: &mut Frame,
+    form: Form,
+    flags: MemberFlags,
+    destination: Slot,
+    holder: Slot,
+    name: &Name,
+) -> Result<(), Unwind> {
+    let name = value_of(code, frame, name);
+    let value = frame.slot(holder);
+    let answer = match value {
         Variant::String(text) => {
             let character = string_get(text, &name)?;
             // the indirect form's text branch never reaches its destination, so
             // the character it read is the answer
             match form {
-                Form::Direct => type_of(&character),
+                Form::Direct => type_of_value(&character),
                 Form::Indirect => character,
             }
         }
         // the byte string's branch applies the type in both forms
-        Variant::Octet(octet) => type_of(&octet_get(octet, &name)?),
-        _ => match object_get(&value, form, &name, MemberFlags::MUST_EXIST) {
-            Ok(read) => type_of(&read),
+        Variant::Octet(octet) => type_of_value(&octet_get(octet, &name)?),
+        _ => match object_get(value, form, &name, flags) {
+            Ok(read) => type_of_value(&read),
             // an absent member is the text `undefined`, and no other failure is
-            Err(Fault::Raised(Raise::MemberNotFound { .. })) => {
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::MemberNotFound) => {
                 Variant::String(TjsString::from("undefined"))
             }
             Err(other) => return Err(other),
         },
     };
-    frame.set(destination, answer)
+    frame.store(destination, answer);
+    Ok(())
 }
 
 /// The type of a value: its kind, in the language's spelling.
-fn type_of(value: &Variant) -> Variant {
+fn type_of_value(value: &Variant) -> Variant {
     Variant::String(TjsString::from(value.type_name()))
 }
 
@@ -273,7 +204,7 @@ fn object_get(
     form: Form,
     name: &Variant,
     flags: MemberFlags,
-) -> Result<Variant, Fault> {
+) -> Result<Variant, Unwind> {
     let closure = as_closure(value)?;
     let object = closure.object.as_deref().ok_or_else(null_object)?;
     let objthis = closure.objthis.as_deref();
@@ -299,7 +230,7 @@ fn object_set(
     name: &Variant,
     written: &Variant,
     flags: MemberFlags,
-) -> Result<(), Fault> {
+) -> Result<(), Unwind> {
     let closure = as_closure(value)?;
     let object = closure.object.as_deref().ok_or_else(null_object)?;
     let objthis = closure.objthis.as_deref();
@@ -322,12 +253,12 @@ fn object_set(
 /// A name that is a number is an index; the name `length` answers the number of
 /// units; a name that starts with a digit is a decimal index; anything else is
 /// not there.
-fn string_get(text: &TjsString, name: &Variant) -> Result<Variant, Fault> {
+fn string_get(text: &TjsString, name: &Variant) -> Result<Variant, Unwind> {
     if let Some(index) = index_of(name) {
         return string_index(text, index);
     }
     let name = diversion_name(name)?;
-    if name == TjsString::from("length") {
+    if name.eq_str(LENGTH) {
         return Ok(Variant::Integer(length_of(text)?));
     }
     if starts_with_digit(&name) {
@@ -339,16 +270,16 @@ fn string_get(text: &TjsString, name: &Variant) -> Result<Variant, Fault> {
 /// A text's member write: every name is refused, and the two that name a
 /// position or the count are refused *as an access* rather than as a missing
 /// member.
-fn write_refused(name: &Variant) -> Fault {
+fn write_refused(name: &Variant) -> Unwind {
     if index_of(name).is_some() {
-        return Fault::Raised(Raise::AccessDenied);
+        return Raise::AccessDenied.into();
     }
     let name = match diversion_name(name) {
         Ok(name) => name,
         Err(fault) => return fault,
     };
-    if name == TjsString::from("length") || starts_with_digit(&name) {
-        return Fault::Raised(Raise::AccessDenied);
+    if name.eq_str(LENGTH) || starts_with_digit(&name) {
+        return Raise::AccessDenied.into();
     }
     member_not_found(&name)
 }
@@ -357,28 +288,28 @@ fn write_refused(name: &Variant) -> Fault {
 ///
 /// An index exactly at the length answers the empty text, and anything outside
 /// `0 …= length` is a range error.
-fn string_index(text: &TjsString, index: i64) -> Result<Variant, Fault> {
+fn string_index(text: &TjsString, index: i64) -> Result<Variant, Unwind> {
     let length = i64::try_from(text.len()).map_err(|_| Fault::Broken("a text is too long"))?;
     if index == length {
         return Ok(Variant::String(TjsString::new()));
     }
     if index < 0 || index > length {
-        return Err(Fault::Raised(Raise::RangeError));
+        return Err(Raise::RangeError.into());
     }
-    let position = usize::try_from(index).map_err(|_| Fault::Raised(Raise::RangeError))?;
+    let position = usize::try_from(index).map_err(|_| Raise::RangeError)?;
     match text.as_utf16().get(position) {
         Some(unit) => Ok(Variant::String(TjsString::from(&[*unit][..]))),
-        None => Err(Fault::Raised(Raise::RangeError)),
+        None => Err(Raise::RangeError.into()),
     }
 }
 
 /// A byte string's member read.
-fn octet_get(octet: &Octet, name: &Variant) -> Result<Variant, Fault> {
+fn octet_get(octet: &Octet, name: &Variant) -> Result<Variant, Unwind> {
     if let Some(index) = index_of(name) {
         return octet_index(octet, index);
     }
     let name = diversion_name(name)?;
-    if name == TjsString::from("length") {
+    if name.eq_str(LENGTH) {
         return Ok(Variant::Integer(length_of_usize(octet.len())?));
     }
     if starts_with_digit(&name) {
@@ -391,16 +322,16 @@ fn octet_get(octet: &Octet, name: &Variant) -> Result<Variant, Fault> {
 ///
 /// An index at the length is a range error: a byte string has no rule that the
 /// end is empty.
-fn octet_index(octet: &Octet, index: i64) -> Result<Variant, Fault> {
+fn octet_index(octet: &Octet, index: i64) -> Result<Variant, Unwind> {
     let length =
         i64::try_from(octet.len()).map_err(|_| Fault::Broken("a byte string is too long"))?;
     if index < 0 || index >= length {
-        return Err(Fault::Raised(Raise::RangeError));
+        return Err(Raise::RangeError.into());
     }
-    let position = usize::try_from(index).map_err(|_| Fault::Raised(Raise::RangeError))?;
+    let position = usize::try_from(index).map_err(|_| Raise::RangeError)?;
     match octet.as_slice().get(position) {
         Some(byte) => Ok(Variant::Integer(i64::from(*byte))),
-        None => Err(Fault::Raised(Raise::RangeError)),
+        None => Err(Raise::RangeError.into()),
     }
 }
 
@@ -420,7 +351,7 @@ fn index_of(name: &Variant) -> Option<i64> {
 
 /// The name a diversion reads, or the "no such member" failure a value with no
 /// text answers.
-fn diversion_name(name: &Variant) -> Result<TjsString, Fault> {
+fn diversion_name(name: &Variant) -> Result<TjsString, Unwind> {
     match name.to_string() {
         Ok(text) => Ok(text),
         Err(_) => Err(member_not_found(&TjsString::from(NO_NAME))),
@@ -429,7 +360,7 @@ fn diversion_name(name: &Variant) -> Result<TjsString, Fault> {
 
 /// The name a member instruction passes to an object, or the conversion failure
 /// a value with no text raises.
-fn text_of(name: &Variant) -> Result<TjsString, Fault> {
+fn text_of(name: &Variant) -> Result<TjsString, Unwind> {
     name.to_string()
         .map_err(|error| op::refused_conversion(error, name))
 }
@@ -476,55 +407,48 @@ fn length_of_usize(length: usize) -> Result<i64, Fault> {
 }
 
 /// The object a value is reached through.
-fn as_closure(value: &Variant) -> Result<&Closure, Fault> {
+fn as_closure(value: &Variant) -> Result<&Closure, Unwind> {
     match value {
         Variant::Object(closure) => Ok(closure),
-        _ => Err(Fault::Raised(Raise::Convert {
-            value: Box::new(value.clone()),
+        _ => Err(Unwind::raised(Raise::Convert {
             to: Target::Object.name(),
-        })),
+        })
+        .with_value(value)),
     }
 }
 
 /// The failure that says the value names no object to reach into.
 ///
-/// The engine reads a null closure and raises the null-access error, which is a
-/// different message from this one; the raise that carries it is the exception
-/// part's to spell.
-fn null_object() -> Fault {
-    Fault::Raised(Raise::Convert {
-        value: Box::new(Variant::Object(Closure::null())),
-        to: Target::Object.name(),
-    })
+/// The engine reaches every member through the value's closure, and a null
+/// closure refuses before it reads anything: the failure is the null access,
+/// whatever member the instruction named.
+fn null_object() -> Unwind {
+    Raise::NullAccess.into()
 }
 
 /// The raise a failed member call becomes, keeping the name the engine's own
 /// message carries.
-fn member_fault(error: ObjectError, name: &TjsString) -> Fault {
+fn member_fault(error: ObjectError, name: &TjsString) -> Unwind {
     match error {
         ObjectError::MemberNotFound | ObjectError::MemberMustExist => {
-            Fault::Raised(Raise::MemberNotFound { name: name.clone() })
+            Unwind::raised(Raise::MemberNotFound).with_text(name.clone())
         }
-        other => Fault::Object(other),
+        other => Unwind::from(other),
     }
 }
 
 /// The raise for a name that is not there.
-pub(super) fn member_not_found(name: &TjsString) -> Fault {
-    Fault::Raised(Raise::MemberNotFound { name: name.clone() })
+pub(super) fn member_not_found(name: &TjsString) -> Unwind {
+    Unwind::raised(Raise::MemberNotFound).with_text(name.clone())
 }
 
-/// The `slot`-th operand of the instruction at `ip`.
-fn operand(code: &Code, ip: usize, slot: usize) -> Result<i32, Fault> {
-    super::operand(&code.code, ip, slot)
-}
-
-/// The value the instruction names: a constant-area slot for the direct form, a
-/// register for the indirect one.
-fn value_of(code: &Code, frame: &Frame, form: Form, slot: i32) -> Result<Variant, Fault> {
-    match form {
-        Form::Direct => code.constant(slot).cloned(),
-        Form::Indirect => frame.reg(slot).cloned(),
+/// The value the instruction names a member with: a constant-area slot for the
+/// direct form and a register for the indirect one.
+fn value_of(code: &Code, frame: &Frame, name: &Name) -> Variant {
+    match name {
+        Name::Constant(index) => code.value(*index).clone(),
+        Name::Register(slot) => frame.slot(*slot).clone(),
+        Name::None => Variant::Void,
     }
 }
 
@@ -537,6 +461,11 @@ mod tests {
     /// Equality over every kind, which a variant does not carry.
     fn same(left: &Variant, right: &Variant) -> bool {
         super::op::discern_equals(left, right)
+    }
+
+    /// Whether the answer is the raise named.
+    fn refused<T>(answer: Result<T, Unwind>, raise: Raise) -> bool {
+        matches!(answer, Err(unwind) if unwind.fault() == Fault::Raised(raise))
     }
 
     fn text(value: &str) -> Variant {
@@ -579,13 +508,10 @@ mod tests {
             &string_get(&source, &integer(3)).expect("the end"),
             &text("")
         ));
-        assert!(matches!(
-            string_get(&source, &integer(4)),
-            Err(Fault::Raised(Raise::RangeError))
-        ));
-        assert!(matches!(
+        assert!(refused(string_get(&source, &integer(4)), Raise::RangeError));
+        assert!(refused(
             string_get(&source, &integer(-1)),
-            Err(Fault::Raised(Raise::RangeError))
+            Raise::RangeError
         ));
     }
 
@@ -593,9 +519,9 @@ mod tests {
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:86-87`).
     #[test]
     fn a_text_answers_no_other_member() {
-        assert!(matches!(
+        assert!(refused(
             string_get(&TjsString::from("abc"), &text("nope")),
-            Err(Fault::Raised(Raise::MemberNotFound { .. }))
+            Raise::MemberNotFound
         ));
     }
 
@@ -603,22 +529,22 @@ mod tests {
     /// missing member (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:110-122`).
     #[test]
     fn a_text_write_is_a_refused_access() {
-        assert!(matches!(
-            write_refused(&text("length")),
+        assert_eq!(
+            write_refused(&text("length")).fault(),
             Fault::Raised(Raise::AccessDenied)
-        ));
-        assert!(matches!(
-            write_refused(&text("1")),
+        );
+        assert_eq!(
+            write_refused(&text("1")).fault(),
             Fault::Raised(Raise::AccessDenied)
-        ));
-        assert!(matches!(
-            write_refused(&integer(1)),
+        );
+        assert_eq!(
+            write_refused(&integer(1)).fault(),
             Fault::Raised(Raise::AccessDenied)
-        ));
-        assert!(matches!(
-            write_refused(&text("nope")),
-            Fault::Raised(Raise::MemberNotFound { .. })
-        ));
+        );
+        assert_eq!(
+            write_refused(&text("nope")).fault(),
+            Fault::Raised(Raise::MemberNotFound)
+        );
     }
 
     /// A byte string's length and index answer numbers, and its end is a range
@@ -639,30 +565,24 @@ mod tests {
             &integer(67)
         ));
         assert!(
-            matches!(
-                octet_get(&source, &integer(3)),
-                Err(Fault::Raised(Raise::RangeError))
-            ),
+            refused(octet_get(&source, &integer(3)), Raise::RangeError),
             "a byte string has no empty end"
         );
-        assert!(matches!(
-            octet_get(&source, &integer(-1)),
-            Err(Fault::Raised(Raise::RangeError))
-        ));
+        assert!(refused(octet_get(&source, &integer(-1)), Raise::RangeError));
     }
 
     /// A byte string cannot be written either
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:169-186`).
     #[test]
     fn a_byte_string_write_is_a_refused_access() {
-        assert!(matches!(
-            write_refused(&text("length")),
+        assert_eq!(
+            write_refused(&text("length")).fault(),
             Fault::Raised(Raise::AccessDenied)
-        ));
-        assert!(matches!(
-            write_refused(&integer(0)),
+        );
+        assert_eq!(
+            write_refused(&integer(0)).fault(),
             Fault::Raised(Raise::AccessDenied)
-        ));
+        );
     }
 
     /// The type of a value is the language's spelling, so the direct form of a
@@ -671,7 +591,7 @@ mod tests {
     #[test]
     fn the_direct_type_of_a_texts_length_is_integer() {
         let length = string_get(&TjsString::from("abc"), &text("length")).expect("a length");
-        assert!(same(&type_of(&length), &text("Integer")));
+        assert!(same(&type_of_value(&length), &text("Integer")));
     }
 
     /// The indirect form of a text's subscript answers the character, because
@@ -684,7 +604,7 @@ mod tests {
         let character = string_get(&TjsString::from("abc"), &integer(1)).expect("a unit");
         assert!(same(&character, &text("b")));
         assert!(
-            !same(&type_of(&character), &text("b")),
+            !same(&type_of_value(&character), &text("b")),
             "the type step would answer String, which is not the recorded answer"
         );
     }
@@ -695,7 +615,7 @@ mod tests {
     #[test]
     fn the_indirect_type_of_a_byte_strings_subscript_is_integer() {
         let byte = octet_get(&Octet::from_slice(b"ABC"), &integer(1)).expect("a byte");
-        assert!(same(&type_of(&byte), &text("Integer")));
+        assert!(same(&type_of_value(&byte), &text("Integer")));
     }
 
     /// A leading digit is a decimal subscript, and the run stops at the first
@@ -714,23 +634,6 @@ mod tests {
         );
     }
 
-    /// A member instruction reads the fifteen opcodes and no others
-    /// (`docs/code/tjs/interpreter.md` §3.4).
-    #[test]
-    fn the_fifteen_instructions_are_the_ones_handled() {
-        for opcode in [vm::GPD, vm::SPD, vm::GPI, vm::DELD, vm::TYPEOFD] {
-            assert!(
-                handles(opcode),
-                "{}",
-                crate::vm::runtime::exec::decode::mnemonic(opcode)
-            );
-        }
-        assert!(handles(vm::SETP), "the property-object access is here");
-        assert!(handles(vm::GETP));
-        assert!(!handles(vm::CALL));
-        assert!(!handles(vm::NOP));
-    }
-
     /// A property object answers its default member, which the engine names with
     /// a null member name and this surface spells as the empty text
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1468-1491`).
@@ -744,9 +647,9 @@ mod tests {
         });
         let name = text("");
         // nothing answers the default member yet, so the read refuses
-        assert!(matches!(
+        assert!(refused(
             object_get(&target, Form::Direct, &name, MemberFlags::NONE),
-            Err(Fault::Raised(Raise::MemberNotFound { .. }))
+            Raise::MemberNotFound
         ));
         object_set(
             &target,
@@ -764,9 +667,9 @@ mod tests {
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:1416-1420`).
     #[test]
     fn a_value_that_is_not_an_object_cannot_be_reached_into() {
-        assert!(matches!(
-            as_closure(&integer(3)),
-            Err(Fault::Raised(Raise::Convert { to: "Object", .. }))
+        assert!(refused(
+            as_closure(&integer(3)).map(|closure| Variant::Object(closure.clone())),
+            Raise::Convert { to: "Object" }
         ));
         let object: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
         let closure = Closure {

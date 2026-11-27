@@ -1,0 +1,21 @@
+# the engine's answers, recorded by `crates/tjs/examples/interpreter_oracle.rs` (the throw table, each row carrying its script); regenerate with `cargo run -p tjs --example interpreter_oracle`
+divide_integer_zero	try {\n    probeValue(7) \\ probeValue(0);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Division by zero
+remainder_zero	try {\n    probeValue(7) % probeValue(0);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Division by zero
+text_index_past_end	try {\n    probeValue("abc")[probeValue(4)];\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	The value is out of the range
+text_index_negative	try {\n    probeValue("abc")[probeValue(-1)];\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	The value is out of the range
+text_length_write	try {\n    probeValue("abc").length = probeValue(1);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Invalid operation for Read-only or Write-only property
+octet_index_past_end	try {\n    probeValue(<%01 02%>)[probeValue(2)];\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	The value is out of the range
+octet_to_string	try {\n    (string)probeValue(<%01%>);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((octet)<% 01 %> to string)
+octet_to_number	try {\n    probeValue(<%01%>) * probeValue(1);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((octet)<% 01 %> to int/real)
+null_member_read	try {\n    probeValue(null).n;\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Accessing to nullptr object
+integer_call	try {\n    probeValue(1)();\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((int)1 to Object)
+absent_global_read	try {\n    probeAbsentName;\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Member "probeAbsentName" does not exist
+absent_global_typeof	try {\n    typeof probeAbsentName;\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Member "probeAbsentName" does not exist
+absent_global_call	try {\n    probeAbsentName();\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Member "probeAbsentName" does not exist
+new_non_class	try {\n    var C = probeValue(1);\n        var x = new C();\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((int)1 to Object)
+sprintf_format	try {\n    var answer = probeValue("%").sprintf();\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Invalid format string
+sprintf_missing	try {\n    var answer = probeValue("%d").sprintf();\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Invalid argument count
+unpack_format	try {\n    var answer = probeValue(<%01%>).unpack(probeValue("q"));\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Unknown pack/unpack TEMPLATE charcter
+convert_null_integer	try {\n    (int)probeValue(null);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((object)(object 0x0:0x0) to int)
+convert_null_real	try {\n    (real)probeValue(null);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((object)(object 0x0:0x0) to real)
+property_access_integer	try {\n    *probeValue(1);\n} catch (e) {\n    return "" + e.message;\n}\nreturn "!nocatch";\n	Cannot convert the variable type ((int)1 to Object)

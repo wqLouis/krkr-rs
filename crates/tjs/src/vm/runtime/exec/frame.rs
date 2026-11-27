@@ -40,6 +40,7 @@ use std::rc::Rc;
 
 use super::Fault;
 use super::decode;
+use super::instruction::{Slot, Stream, Window};
 use crate::vm::runtime::array::ArrayObject;
 use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::string::TjsString;
@@ -77,6 +78,12 @@ pub struct Code {
     pub func_decl_unnamed_arg_array_base: i32,
     /// The name of the context, for a message.
     pub name: String,
+    /// The instructions the code stream decodes to.
+    ///
+    /// A context that is run must be decoded first: [`Self::decoded`] is the
+    /// step that turns the words into instructions, and a context that never
+    /// went through it runs nothing.
+    pub stream: Stream,
 }
 
 /// A context with nothing declared.
@@ -96,6 +103,7 @@ impl Default for Code {
             func_decl_collapse_base: -1,
             func_decl_unnamed_arg_array_base: 0,
             name: String::new(),
+            stream: Stream::default(),
         }
     }
 }
@@ -136,19 +144,34 @@ impl Code {
         usize::try_from(base).map_err(|_| Fault::Broken("a frame does not fit a length"))
     }
 
-    /// A value of the constant area, or the failure that says the instruction
-    /// named a slot that is not there.
+    /// A value of the constant area.
     ///
-    /// The operand is an offset in the constant area, in the same units a
-    /// register address uses, so the slot is that offset over the size of a
-    /// variant.
-    pub fn constant(&self, offset: i32) -> Result<&Variant, Fault> {
-        let slot = super::decode::register(offset)?;
-        let slot =
-            usize::try_from(slot).map_err(|_| Fault::Broken("a constant slot is negative"))?;
-        self.data.get(slot).ok_or(Fault::Broken(
-            "a constant slot is outside the constant area",
-        ))
+    /// The decoder resolved every constant operand against the area this code
+    /// carries, so an index an instruction holds is one the area fills; a
+    /// stream that names another never reaches the run loop.
+    #[inline]
+    pub fn value(&self, index: u32) -> &Variant {
+        &self.data[index as usize]
+    }
+
+    /// The context with its code stream decoded into instructions.
+    ///
+    /// The register window is this context's own, so every register operand is
+    /// resolved to a slot of the block the frame will be laid out in, and a
+    /// register the window does not hold refuses the context instead of
+    /// reaching the run loop.
+    ///
+    /// # Errors
+    ///
+    /// The failure the encoding names for the first defect in the stream; see
+    /// [`Stream::decode`].
+    pub fn decoded(mut self) -> Result<Self, Fault> {
+        let base = i32::try_from(self.frame_base()?)
+            .map_err(|_| Fault::Broken("a frame is larger than a register slot holds"))?;
+        let len = i32::try_from(self.block_len()?)
+            .map_err(|_| Fault::Broken("a frame is larger than a register slot holds"))?;
+        self.stream = Stream::decode(&self.code, Window { base, len }, self.data.len())?;
+        Ok(self)
     }
 }
 
@@ -280,6 +303,21 @@ impl Dispatch for ObjThisContext {
                 Some(second) => second.prop_get(name, flags, self.second_receiver(objthis, second)),
                 None => Err(ObjectError::MemberNotFound),
             },
+            other => other,
+        }
+    }
+
+    /// The view's member for a call, so a name the front object does not hold is
+    /// still reached through the object behind it.
+    fn func_member(
+        &self,
+        name: &TjsString,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Option<Result<Variant, ObjectError>> {
+        match self.primary.func_member(name, self.receiver(objthis)) {
+            Some(Err(ObjectError::MemberNotFound | ObjectError::MemberMustExist)) => self
+                .second()
+                .and_then(|second| second.func_member(name, self.second_receiver(objthis, second))),
             other => other,
         }
     }
@@ -530,13 +568,17 @@ impl Frame {
         if block.len() != code.block_len()? || base >= block.len() {
             return Err(Fault::Broken("a block is not the size its code asks for"));
         }
-        // the objthis-context, in ra[-2]: the receiver with the global object
-        // behind it, or the fallback alone when there is no receiver
+        // the objthis-context, in ra[-2]: the receiver with the object behind it
+        // that its members fall through to, or the fallback alone when there is
+        // no receiver. A receiver with no fallback of its own *is* the view: the
+        // wrapper exists to continue a lookup into another object, and there is
+        // no other object when the two are one.
         let context = match (&receiver, &fallback) {
-            (Some(receiver), fallback) => Some(Rc::new(ObjThisContext::new(
-                receiver.clone(),
-                fallback.clone(),
-            )) as Rc<dyn Dispatch>),
+            (Some(receiver), Some(fallback)) if !Rc::ptr_eq(receiver, fallback) => Some(Rc::new(
+                ObjThisContext::new(receiver.clone(), Some(fallback.clone())),
+            )
+                as Rc<dyn Dispatch>),
+            (Some(receiver), _) => Some(receiver.clone()),
             (None, Some(fallback)) => Some(fallback.clone()),
             (None, None) => None,
         };
@@ -545,15 +587,19 @@ impl Frame {
             base,
             absent: Variant::Void,
         };
-        // The three registers below the base are the caller's. A frame with no
-        // caller writes them through the path that leaves them absent, so a
-        // context that reserves none (`variable_reserve_count` zero) still
-        // builds.
-        frame.set(REG_CONTEXT, object_or_null(context))?;
+        // The three registers at and below the base are the caller's, and a
+        // context that reserves fewer than they need still builds: the puts that
+        // fall below the block write nothing.
+        let base = i64::try_from(base)
+            .map_err(|_| Fault::Broken("a frame base does not fit an address"))?;
+        frame.put(base + REGISTER_OFFSET_CONTEXT, object_or_null(context));
         // ra[-1]: the receiver itself, with itself as its own receiver
-        frame.set(REG_THIS, object_or_null(receiver.clone()))?;
+        frame.put(
+            base + REGISTER_OFFSET_THIS,
+            object_or_null(receiver.clone()),
+        );
         // ra[0]: the discard register, cleared
-        frame.set(0, Variant::Void)?;
+        frame.put(base, Variant::Void);
         // the declared arguments, into ra[-3] downwards, the missing ones empty
         let declared = usize::try_from(code.func_decl_arg_count)
             .map_err(|_| Fault::Broken("a declared argument count is negative"))?;
@@ -562,8 +608,9 @@ impl Frame {
                 Some(value) => value.clone(),
                 None => Variant::Void,
             };
-            let address = address_of_argument(index)?;
-            frame.set(address, value)?;
+            let index = i64::try_from(index)
+                .map_err(|_| Fault::Broken("a declared argument count is too large"))?;
+            frame.put(base - 3 - index, value);
         }
         // the named collapse argument: an array of the surplus arguments
         if code.func_decl_collapse_base >= 0 {
@@ -574,24 +621,44 @@ impl Frame {
 
     /// Builds the array a named collapse argument receives.
     fn build_collapse(&mut self, code: &Code, argv: &[Variant]) -> Result<(), Fault> {
-        let base = usize::try_from(code.func_decl_collapse_base)
+        let index = usize::try_from(code.func_decl_collapse_base)
             .map_err(|_| Fault::Broken("a collapse base is negative"))?;
-        let address = address_of_argument(base)?;
         let array = Rc::new(ArrayObject::new());
-        for value in argv.iter().skip(base) {
+        for value in argv.iter().skip(index) {
             array
                 .append(value.clone())
                 .map_err(|_| Fault::Broken("a collapse array does not fit a length"))?;
         }
         let handle = array as Rc<dyn Dispatch>;
-        self.set(
-            address,
+        let index =
+            i64::try_from(index).map_err(|_| Fault::Broken("a collapse base is too large"))?;
+        let base = i64::try_from(self.base)
+            .map_err(|_| Fault::Broken("a frame base does not fit an address"))?;
+        self.put(
+            base - 3 - index,
             Variant::Object(Closure {
                 object: Some(handle.clone()),
                 objthis: Some(handle),
             }),
-        )?;
+        );
         Ok(())
+    }
+
+    /// Writes the register at a block index, tolerating the registers that
+    /// belong to the caller.
+    ///
+    /// This is the frame setup's writer: an argument past the window's low end
+    /// was the caller's to place, and a frame with no caller places nothing, so
+    /// the register stays absent rather than the call failing.
+    fn put(&mut self, index: i64, value: Variant) {
+        // a register below the base belongs to the caller, and a frame with no
+        // caller places nothing, so the write is skipped rather than failed
+        let Some(index) = usize::try_from(index).ok() else {
+            return;
+        };
+        if let Some(cell) = self.block.get_mut(index) {
+            *cell = value;
+        }
     }
 
     /// The block slot a register address names, when the window holds it.
@@ -632,24 +699,6 @@ impl Frame {
         }
     }
 
-    /// Writes a register, tolerating the registers that belong to the caller.
-    ///
-    /// This is the frame setup's writer: an argument past the window's low end
-    /// was the caller's to place, and a frame with no caller places nothing, so
-    /// the register stays absent rather than the call failing.
-    pub fn set(&mut self, address: i32, value: Variant) -> Result<(), Fault> {
-        match self.locate(address)? {
-            Some(index) => match self.block.get_mut(index) {
-                Some(slot) => {
-                    *slot = value;
-                    Ok(())
-                }
-                None => Err(Fault::RegisterOutOfWindow { address }),
-            },
-            None => Ok(()),
-        }
-    }
-
     /// The value a register address names, for change.
     ///
     /// An instruction never writes below its own frame: the registers there are
@@ -662,6 +711,32 @@ impl Frame {
                 .ok_or(Fault::RegisterOutOfWindow { address }),
             None => Err(Fault::RegisterOutOfWindow { address }),
         }
+    }
+
+    /// The value a decoded slot names.
+    ///
+    /// The slot came out of the decoder's own window, and the window is the
+    /// block this frame holds, so a slot a read names is always inside it: a
+    /// stream whose register a read cannot reach never decodes, and the discard
+    /// register names no read.
+    #[inline]
+    pub(super) fn slot(&self, slot: Slot) -> &Variant {
+        &self.block[slot.index()]
+    }
+
+    /// The value a decoded slot names, for change.
+    #[inline]
+    pub(super) fn slot_mut(&mut self, slot: Slot) -> &mut Variant {
+        &mut self.block[slot.index()]
+    }
+
+    /// Writes a decoded slot, and nothing when the instruction keeps no result.
+    #[inline]
+    pub(super) fn store(&mut self, slot: Slot, value: Variant) {
+        if slot == Slot::DISCARD {
+            return;
+        }
+        *self.slot_mut(slot) = value;
     }
 
     /// The receiver the frame acts on, when it has one.
@@ -700,25 +775,21 @@ impl Frame {
         self.block
     }
 
-    /// Clears `count` registers from `address` upwards.
+    /// Clears `count` slots from `start` upward.
     ///
     /// The consecutive clear, which the generator does not emit and a bytecode
     /// block can carry.
-    pub fn clear_run(&mut self, address: i32, count: i32) -> Result<(), Fault> {
-        let count =
-            usize::try_from(count).map_err(|_| Fault::Broken("a clear count is negative"))?;
-        let step = crate::vm::codegen::opcode::VARIANT_SIZE;
-        for position in 0..count {
-            let position =
-                i32::try_from(position).map_err(|_| Fault::Broken("a clear run is too long"))?;
-            let address = address
-                .checked_add(
-                    position
-                        .checked_mul(step)
-                        .ok_or(Fault::Broken("a clear run is too long"))?,
-                )
-                .ok_or(Fault::Broken("a clear run is too long"))?;
-            *self.reg_mut(address)? = Variant::Void;
+    pub(super) fn clear_run(&mut self, start: Slot, count: u32) -> Result<(), Fault> {
+        let start = start.index();
+        let end = start
+            .checked_add(count as usize)
+            .ok_or(Fault::Broken("a clear run is too long"))?;
+        let run = self
+            .block
+            .get_mut(start..end)
+            .ok_or(Fault::Broken("a clear run is outside the frame"))?;
+        for value in run {
+            *value = Variant::Void;
         }
         Ok(())
     }
@@ -729,6 +800,12 @@ pub const REG_THIS: i32 = -crate::vm::codegen::opcode::VARIANT_SIZE;
 
 /// The register address of the objthis-context.
 pub const REG_CONTEXT: i32 = -2 * crate::vm::codegen::opcode::VARIANT_SIZE;
+
+/// The receiver's slot, from the frame base.
+const REGISTER_OFFSET_THIS: i64 = -1;
+
+/// The objthis-context's slot, from the frame base.
+const REGISTER_OFFSET_CONTEXT: i64 = -2;
 
 /// The register address the `index`-th declared argument is stored at.
 ///
@@ -779,7 +856,9 @@ mod tests {
         let code = Code {
             variable_reserve_count: 2,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         assert_eq!(code.block_len(), Ok(3));
         assert_eq!(code.frame_base(), Ok(2));
         let frame = Frame::new(block_of(&code), &code, None, None, &[]).expect("a frame");
@@ -787,15 +866,17 @@ mod tests {
         assert_eq!(frame.len(), 3);
     }
 
-    /// The receiver is `ra[-1]` and the objthis-context is `ra[-2]`, and both
-    /// name the receiver when there is no global object
+    /// The receiver is `ra[-1]` and the objthis-context is `ra[-2]`; with no
+    /// object behind the receiver the two name it
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:659-707`).
     #[test]
     fn the_receiver_and_its_context_are_the_two_registers_below_the_base() {
         let code = Code {
             variable_reserve_count: 2,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let this = object();
         let frame =
             Frame::new(block_of(&code), &code, Some(this.clone()), None, &[]).expect("a frame");
@@ -808,8 +889,8 @@ mod tests {
         );
         let context = frame.context().expect("a context");
         assert!(
-            !Rc::ptr_eq(&context, &this),
-            "ra[-2] is a view of the receiver, not the receiver"
+            Rc::ptr_eq(&context, &this),
+            "ra[-2] is the receiver when no object stands behind it"
         );
         // %-3 is past the reserved pair on a context with no local, so it names
         // a register no caller filled: it reads as the absent value, and reading
@@ -820,6 +901,46 @@ mod tests {
         ));
     }
 
+    /// A receiver with an object behind it is reached through the view, so a
+    /// member the receiver lacks is the object behind it's
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:659-707`).
+    #[test]
+    fn a_receiver_with_an_object_behind_it_is_a_view() {
+        let code = Code {
+            variable_reserve_count: 2,
+            ..Code::default()
+        }
+        .decoded()
+        .expect("the stream decodes");
+        let this: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        let global: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        global
+            .prop_set(
+                &TjsString::from("g"),
+                MemberFlags::ENSURE,
+                &Variant::Integer(9),
+                None,
+            )
+            .expect("the global member is stored");
+        let frame = Frame::new(
+            block_of(&code),
+            &code,
+            Some(this.clone()),
+            Some(global),
+            &[],
+        )
+        .expect("a frame");
+        let context = frame.context().expect("a context");
+        assert!(
+            !Rc::ptr_eq(&context, &this),
+            "ra[-2] is a view of a receiver with an object behind it"
+        );
+        let found = context
+            .prop_get(&TjsString::from("g"), MemberFlags::NONE, None)
+            .expect("the object behind the receiver answers");
+        assert!(matches!(found, Variant::Integer(9)));
+    }
+
     /// The discard register is `ra[0]` and it is cleared
     /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:708`).
     #[test]
@@ -828,7 +949,9 @@ mod tests {
             variable_reserve_count: 2,
             max_frame_count: 2,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let frame = Frame::new(block_of(&code), &code, None, None, &[]).expect("a frame");
         assert!(matches!(frame.reg(0), Ok(Variant::Void)));
         // the window is the base and the temporaries above it: two registers of
@@ -852,7 +975,9 @@ mod tests {
             max_frame_count: 1,
             func_decl_arg_count: 2,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let argv = [Variant::Integer(7)];
         let frame = Frame::new(block_of(&code), &code, None, None, &argv).expect("a frame");
         assert!(matches!(
@@ -886,7 +1011,9 @@ mod tests {
             func_decl_arg_count: 1,
             func_decl_collapse_base: 1,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let argv = [
             Variant::Integer(1),
             Variant::Integer(2),
@@ -956,7 +1083,9 @@ mod tests {
             variable_reserve_count: 2,
             max_frame_count: 0,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let mut frame = Frame::new(block_of(&code), &code, None, None, &[]).expect("a frame");
         assert!(matches!(
             frame.reg(20),
@@ -981,16 +1110,24 @@ mod tests {
             variable_reserve_count: 2,
             max_frame_count: 3,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let mut frame = Frame::new(block_of(&code), &code, None, None, &[]).expect("a frame");
         *frame.reg_mut(0).expect("a register") = Variant::Integer(1);
         *frame.reg_mut(20).expect("a register") = Variant::Integer(2);
         *frame.reg_mut(40).expect("a register") = Variant::Integer(3);
-        frame.clear_run(0, 3).expect("the run is inside the window");
+        let start = Slot::of(frame.base() as u32);
+        frame
+            .clear_run(start, 3)
+            .expect("the run is inside the window");
         assert!(matches!(frame.reg(0), Ok(Variant::Void)));
         assert!(matches!(frame.reg(20), Ok(Variant::Void)));
         assert!(matches!(frame.reg(40), Ok(Variant::Void)));
-        assert!(frame.clear_run(0, 9).is_err(), "the run leaves the window");
+        assert!(
+            frame.clear_run(start, 9).is_err(),
+            "the run leaves the window"
+        );
     }
 
     /// The objthis-context falls back to the global object on a member the

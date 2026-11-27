@@ -70,6 +70,7 @@ use tjs::{
 use crate::native_util::{args, report_error, set_bool, set_int, set_void, value_as_string};
 use crate::natives::construct;
 use crate::natives::system::{EngineBinding, resolve, set_string_out, value_as_bool, value_as_i64};
+use crate::script::{ScriptOptions, ScriptScope};
 use crate::storage::strip_file_media;
 use crate::{CompatCtx, CompatError};
 
@@ -1904,8 +1905,8 @@ fn temporary_files_check(
 /// Register the plugin's native surface on the VM.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: `ctx` is only created for a bound, live engine.
-    unsafe { ctx.engine() }
-        .exec_script(FILE_ATTRIBUTE_PRE_SCRIPT, "fstat")
+    ScriptScope::new(unsafe { ctx.engine() }, ctx)
+        .run(FILE_ATTRIBUTE_PRE_SCRIPT, "fstat", ScriptOptions::default())
         .map_err(|error| {
             CompatError::Register(format!(
                 "fstat: could not install FILE_ATTRIBUTE_* globals: {error}"

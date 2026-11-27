@@ -374,7 +374,11 @@ fn window_can_deliver(host: &Tjs2Engine, window: Tjs2ValueId) -> bool {
 /// `saveSystemVariables()` when present. Every failure is swallowed, like
 /// the reference's `catch(...)`.
 fn do_save_system_variables(scripts: &ScriptScope<'_>) {
-    let kag = match scripts.eval("kag", "MenuItem.saveSystemVariables", ScriptOptions::default()) {
+    let kag = match scripts.evaluate(
+        "kag",
+        "MenuItem.saveSystemVariables",
+        ScriptOptions::default(),
+    ) {
         Ok(RetainedValue::Object(kag)) => kag,
         _ => return,
     };

@@ -1,0 +1,82 @@
+# the engine's answers, recorded by `crates/tjs/examples/interpreter_oracle.rs` (the ops table, each row carrying its script); regenerate with `cargo run -p tjs --example interpreter_oracle`
+constant_integer	function op_constant_integer() {\n    var a = 41;\n    return probeAnswer(a);\n}\nreturn op_constant_integer();\n	Integer	41
+invalidate_and_isvalid	function op_invalidate_and_isvalid() {\n    var d = probeDictionary();\n    var before = isvalid d;\n    invalidate d;\n    return probeAnswer(before + ":" + isvalid d);\n}\nreturn op_invalidate_and_isvalid();\n	String	1:0
+ignore_property	function op_ignore_property() {\n    var d = probeDictionary();\n    &d.n = probeValue(5);\n    return probeAnswer(&d.n);\n}\nreturn op_ignore_property();\n	Integer	5
+constant_copies	function op_constant_copies() {\n    var a = 7;\n    var b = a;\n    var c = b;\n    return probeAnswer(c);\n}\nreturn op_constant_copies();\n	Integer	7
+constant_cleared_in_loop	function op_constant_cleared_in_loop() {\n    var total = 0;\n    var i = 0;\n    while (i < 3) {\n        var t = probeValue(i) * 2;\n        total = total + t;\n        i = i + 1;\n    }\n    return probeAnswer(total);\n}\nreturn op_constant_cleared_in_loop();\n	Integer	6
+if_true	function op_if_true() {\n    if (probeValue(1)) {\n        return probeAnswer("taken");\n    }\n    return probeAnswer("skipped");\n}\nreturn op_if_true();\n	String	taken
+if_false	function op_if_false() {\n    if (probeValue(0)) {\n        return probeAnswer("taken");\n    }\n    return probeAnswer("skipped");\n}\nreturn op_if_false();\n	String	skipped
+if_else	function op_if_else() {\n    if (probeValue(0)) {\n        return probeAnswer("then");\n    } else {\n        return probeAnswer("else");\n    }\n}\nreturn op_if_else();\n	String	else
+if_not	function op_if_not() {\n    if (!probeValue(0)) {\n        return probeAnswer(1);\n    }\n    return probeAnswer(0);\n}\nreturn op_if_not();\n	Integer	1
+while_count	function op_while_count() {\n    var i = 0;\n    var n = 0;\n    while (i < 4) {\n        n = n + i;\n        i = i + 1;\n    }\n    return probeAnswer(n);\n}\nreturn op_while_count();\n	Integer	6
+do_while_count	function op_do_while_count() {\n    var i = 0;\n    do {\n        i = i + 1;\n    } while (i < 3);\n    return probeAnswer(i);\n}\nreturn op_do_while_count();\n	Integer	3
+for_count	function op_for_count() {\n    var n = 0;\n    for (var i = 0; i < 4; i = i + 1) {\n        n = n + i;\n    }\n    return probeAnswer(n);\n}\nreturn op_for_count();\n	Integer	6
+break_in_loop	function op_break_in_loop() {\n    var n = 0;\n    for (var i = 0; i < 10; i = i + 1) {\n        if (i == 3) {\n            break;\n        }\n        n = n + 1;\n    }\n    return probeAnswer(n);\n}\nreturn op_break_in_loop();\n	Integer	3
+continue_in_loop	function op_continue_in_loop() {\n    var n = 0;\n    for (var i = 0; i < 5; i = i + 1) {\n        if (i == 2) {\n            continue;\n        }\n        n = n + 1;\n    }\n    return probeAnswer(n);\n}\nreturn op_continue_in_loop();\n	Integer	4
+condition_inverted_or	function op_condition_inverted_or() {\n    if ((probeValue(1) >= probeValue(2)) || (probeValue(1) == probeValue(1))) {\n        return probeAnswer("yes");\n    }\n    return probeAnswer("no");\n}\nreturn op_condition_inverted_or();\n	String	yes
+condition_equal	function op_condition_equal() {\n    if (probeValue(2) == probeValue(2)) {\n        return probeAnswer("eq");\n    }\n    return probeAnswer("ne");\n}\nreturn op_condition_equal();\n	String	eq
+condition_strict_equal	function op_condition_strict_equal() {\n    if (probeValue(2) === probeValue(2)) {\n        return probeAnswer("eq");\n    }\n    return probeAnswer("ne");\n}\nreturn op_condition_strict_equal();\n	String	eq
+comparison_value	function op_comparison_value() {\n    var f = probeValue(2) < probeValue(1);\n    return probeAnswer(f);\n}\nreturn op_comparison_value();\n	Integer	0
+negated_comparison_value	function op_negated_comparison_value() {\n    var f = !(probeValue(2) < probeValue(1));\n    return probeAnswer(f);\n}\nreturn op_negated_comparison_value();\n	Integer	1
+increment_local	function op_increment_local() {\n    var a = 1;\n    var b = a++;\n    return probeAnswer(a * 10 + b);\n}\nreturn op_increment_local();\n	Integer	21
+decrement_local	function op_decrement_local() {\n    var a = 2;\n    var b = a--;\n    return probeAnswer(a * 10 + b);\n}\nreturn op_decrement_local();\n	Integer	12
+increment_prefix	function op_increment_prefix() {\n    var a = 1;\n    var b = ++a;\n    return probeAnswer(a * 10 + b);\n}\nreturn op_increment_prefix();\n	Integer	22
+decrement_prefix	function op_decrement_prefix() {\n    var a = 2;\n    var b = --a;\n    return probeAnswer(a * 10 + b);\n}\nreturn op_decrement_prefix();\n	Integer	11
+increment_direct_member	function op_increment_direct_member() {\n    var d = probeDictionary();\n    d.n = 1;\n    var b = d.n++;\n    return probeAnswer(d.n * 10 + b);\n}\nreturn op_increment_direct_member();\n	Integer	21
+decrement_direct_member	function op_decrement_direct_member() {\n    var d = probeDictionary();\n    d.n = 5;\n    var b = d.n--;\n    return probeAnswer(d.n * 10 + b);\n}\nreturn op_decrement_direct_member();\n	Integer	45
+increment_index_member	function op_increment_index_member() {\n    var d = probeDictionary();\n    d["n"] = 1;\n    var b = d["n"]++;\n    return probeAnswer(d.n * 10 + b);\n}\nreturn op_increment_index_member();\n	Integer	21
+decrement_index_member	function op_decrement_index_member() {\n    var d = probeDictionary();\n    d["n"] = 5;\n    var b = d["n"]--;\n    return probeAnswer(d.n * 10 + b);\n}\nreturn op_decrement_index_member();\n	Integer	45
+add	function op_add() {\n    return probeAnswer(probeValue(7) + probeValue(2));\n}\nreturn op_add();\n	Integer	9
+subtract	function op_subtract() {\n    return probeAnswer(probeValue(7) - probeValue(2));\n}\nreturn op_subtract();\n	Integer	5
+multiply	function op_multiply() {\n    return probeAnswer(probeValue(7) * probeValue(2));\n}\nreturn op_multiply();\n	Integer	14
+divide	function op_divide() {\n    return probeAnswer(probeValue(7) / probeValue(2));\n}\nreturn op_divide();\n	Real	3.5
+integer_divide	function op_integer_divide() {\n    return probeAnswer(probeValue(7) \\ probeValue(2));\n}\nreturn op_integer_divide();\n	Integer	3
+remainder	function op_remainder() {\n    return probeAnswer(probeValue(7) % probeValue(3));\n}\nreturn op_remainder();\n	Integer	1
+bit_or	function op_bit_or() {\n    return probeAnswer(probeValue(6) | probeValue(3));\n}\nreturn op_bit_or();\n	Integer	7
+bit_xor	function op_bit_xor() {\n    return probeAnswer(probeValue(6) ^ probeValue(3));\n}\nreturn op_bit_xor();\n	Integer	5
+bit_and	function op_bit_and() {\n    return probeAnswer(probeValue(6) & probeValue(3));\n}\nreturn op_bit_and();\n	Integer	2
+shift_right	function op_shift_right() {\n    return probeAnswer(probeValue(-8) >> probeValue(1));\n}\nreturn op_shift_right();\n	Integer	-4
+shift_left	function op_shift_left() {\n    return probeAnswer(probeValue(1) << probeValue(4));\n}\nreturn op_shift_left();\n	Integer	16
+shift_right_unsigned	function op_shift_right_unsigned() {\n    return probeAnswer(probeValue(-8) >>> probeValue(1));\n}\nreturn op_shift_right_unsigned();\n	Integer	9223372036854775804
+logical_or	function op_logical_or() {\n    return probeAnswer(probeValue(0) || probeValue(1));\n}\nreturn op_logical_or();\n	Integer	1
+logical_and	function op_logical_and() {\n    return probeAnswer(probeValue(1) && probeValue(1));\n}\nreturn op_logical_and();\n	Integer	1
+add_direct_member	function op_add_direct_member() {\n    var d = probeDictionary();\n    d.n = 40;\n    return probeAnswer(d.n + probeValue(2));\n}\nreturn op_add_direct_member();\n	Integer	42
+add_index_member	function op_add_index_member() {\n    var d = probeDictionary();\n    d["n"] = 40;\n    return probeAnswer(d["n"] + probeValue(2));\n}\nreturn op_add_index_member();\n	Integer	42
+compound_add_local	function op_compound_add_local() {\n    var a = 40;\n    a += probeValue(2);\n    return probeAnswer(a);\n}\nreturn op_compound_add_local();\n	Integer	42
+compound_add_direct_member	function op_compound_add_direct_member() {\n    var d = probeDictionary();\n    d.n = 40;\n    d.n += probeValue(2);\n    return probeAnswer(d.n);\n}\nreturn op_compound_add_direct_member();\n	Integer	42
+compound_add_index_member	function op_compound_add_index_member() {\n    var d = probeDictionary();\n    d["n"] = 40;\n    d["n"] += probeValue(2);\n    return probeAnswer(d.n);\n}\nreturn op_compound_add_index_member();\n	Integer	42
+compound_multiply_index_member	function op_compound_multiply_index_member() {\n    var d = probeDictionary();\n    d["n"] = 4;\n    d["n"] *= probeValue(3);\n    return probeAnswer(d.n);\n}\nreturn op_compound_multiply_index_member();\n	Integer	12
+text_concat	function op_text_concat() {\n    return probeAnswer(probeValue("a") + probeValue(1) + probeValue("b"));\n}\nreturn op_text_concat();\n	String	a1b
+typeof_value	function op_typeof_value() {\n    return probeAnswer(typeof probeValue(1));\n}\nreturn op_typeof_value();\n	String	Integer
+typeof_direct_member	function op_typeof_direct_member() {\n    var d = probeDictionary();\n    return probeAnswer(typeof d.n);\n}\nreturn op_typeof_direct_member();\n	String	Integer
+typeof_index_member	function op_typeof_index_member() {\n    var d = probeDictionary();\n    return probeAnswer(typeof d["n"]);\n}\nreturn op_typeof_index_member();\n	String	Integer
+number_of_text	function op_number_of_text() {\n    return probeAnswer(+probeValue("12"));\n}\nreturn op_number_of_text();\n	Integer	12
+negate_text	function op_negate_text() {\n    return probeAnswer(-probeValue("12"));\n}\nreturn op_negate_text();\n	Integer	-12
+character_from	function op_character_from() {\n    return probeAnswer($probeValue(65));\n}\nreturn op_character_from();\n	String	A
+convert_integer	function op_convert_integer() {\n    return probeAnswer((int)probeValue(3.9));\n}\nreturn op_convert_integer();\n	Integer	3
+convert_real	function op_convert_real() {\n    return probeAnswer((real)probeValue(3));\n}\nreturn op_convert_real();\n	Real	3
+convert_string	function op_convert_string() {\n    return probeAnswer((string)probeValue(3));\n}\nreturn op_convert_string();\n	String	3
+evaluate_expression	function op_evaluate_expression() {\n    var text = probeValue("1+2");\n    return probeAnswer(text!);\n}\nreturn op_evaluate_expression();\n	Integer	3
+evaluate_statement	function op_evaluate_statement() {\n    probeGlobalValue = 0;\n    "probeGlobalValue = 5"!;\n    return probeAnswer(probeGlobalValue);\n}\nreturn op_evaluate_statement();\n	Integer	5
+call_declared_function	function op_call_declared_function() {\n    return probeAnswer(probeAddOne(probeValue(41)));\n}\nreturn op_call_declared_function();\n	Integer	42
+call_direct_member	function op_call_direct_member() {\n    return probeAnswer(probeValue("abc").charAt(probeValue(1)));\n}\nreturn op_call_direct_member();\n	String	b
+call_index_member	function op_call_index_member() {\n    var d = new Dictionary();\n    d.f = function (a) { return a * 2; };\n    return probeAnswer(d["f"](probeValue(3)));\n}\nreturn op_call_index_member();\n	Integer	6
+construct_array	function op_construct_array() {\n    var a = new Array();\n    a.push(probeValue(4));\n    return probeAnswer(a.count);\n}\nreturn op_construct_array();\n	Integer	1
+this_member_write	function op_this_member_write() {\n    this.probeThisWrite = probeValue(4);\n    return probeAnswer(this.probeThisWrite);\n}\nreturn op_this_member_write();\n	Integer	4
+call_three_arguments	function op_call_three_arguments() {\n    return probeAnswer(probeSumThree(probeValue(1), probeValue(2), probeValue(3)));\n}\nreturn op_call_three_arguments();\n	Integer	6
+member_read_direct	function op_member_read_direct() {\n    var d = probeDictionary();\n    return probeAnswer(d.n);\n}\nreturn op_member_read_direct();\n	Integer	11
+member_write_direct	function op_member_write_direct() {\n    var d = probeDictionary();\n    d.n = probeValue(5);\n    return probeAnswer(d.n);\n}\nreturn op_member_write_direct();\n	Integer	5
+member_read_index	function op_member_read_index() {\n    var d = probeDictionary();\n    return probeAnswer(d["n"]);\n}\nreturn op_member_read_index();\n	Integer	11
+member_write_index	function op_member_write_index() {\n    var d = probeDictionary();\n    d["n"] = probeValue(5);\n    return probeAnswer(d.n);\n}\nreturn op_member_write_index();\n	Integer	5
+member_write_new_direct	function op_member_write_new_direct() {\n    var d = probeDictionary();\n    d.created = probeValue(9);\n    return probeAnswer(d.created);\n}\nreturn op_member_write_new_direct();\n	Integer	9
+member_write_new_index	function op_member_write_new_index() {\n    var d = probeDictionary();\n    d["created"] = probeValue(9);\n    return probeAnswer(d["created"]);\n}\nreturn op_member_write_new_index();\n	Integer	9
+member_delete_direct	function op_member_delete_direct() {\n    var d = probeDictionary();\n    delete d.n;\n    return probeAnswer(typeof d.n);\n}\nreturn op_member_delete_direct();\n	String	undefined
+member_delete_index	function op_member_delete_index() {\n    var d = probeDictionary();\n    delete d["n"];\n    return probeAnswer(typeof d["n"]);\n}\nreturn op_member_delete_index();\n	String	undefined
+member_text_length	function op_member_text_length() {\n    return probeAnswer(probeValue("abc").length);\n}\nreturn op_member_text_length();\n	Integer	3
+member_text_index	function op_member_text_index() {\n    return probeAnswer(probeValue("abc")[1]);\n}\nreturn op_member_text_index();\n	String	b
+try_catch_script_throw	function op_try_catch_script_throw() {\n    try {\n        throw probeValue("thrown");\n    } catch (e) {\n        return probeAnswer(e);\n    }\n    return probeAnswer("nocatch");\n}\nreturn op_try_catch_script_throw();\n	String	thrown
+try_catch_engine_raise	function op_try_catch_engine_raise() {\n    try {\n        probeValue(1) \\ probeValue(0);\n    } catch (e) {\n        return probeAnswer(e instanceof Exception);\n    }\n    return probeAnswer("nocatch");\n}\nreturn op_try_catch_engine_raise();\n	Integer	0
+try_catch_continue	function op_try_catch_continue() {\n    var n = 0;\n    try {\n        throw probeValue(1);\n    } catch (e) {\n        n = 2;\n    }\n    n = n + 1;\n    return probeAnswer(n);\n}\nreturn op_try_catch_continue();\n	Integer	3
+in_context_of	function op_in_context_of() {\n    var d = probeDictionary();\n    d.n = probeValue(7);\n    return probeAnswer((probeThisMember incontextof d)());\n}\nreturn op_in_context_of();\n	Integer	7
+global_read	function op_global_read() {\n    probeGlobalValue = probeValue(5);\n    return probeAnswer(probeReadGlobal());\n}\nreturn op_global_read();\n	Integer	5
+debugger_statement	function op_debugger_statement() {\n    debugger;\n    return probeAnswer("continued");\n}\nreturn op_debugger_statement();\n	String	continued

@@ -13,14 +13,25 @@
 //! taken from the object itself — [`Dispatch::engine_id`] — never from its
 //! address, and a duplicate of it is made for the call because the engine
 //! consumes the retention it is handed. An object the Rust object model owns
-//! answers no engine id, so a handle keeps such a value in its
-//! [`GlobalMembers`] store instead. Every handle has a store; a context handle
-//! has its own, keyed by the context's retained id in the scope's store.
+//! answers no engine id, so the engine cannot hold it and it stays in the store
+//! of the scope its object belongs to (see [`unaddressable`]); a context
+//! object's store is keyed by the context's retained id in the scope's store.
 //!
 //! An answer crosses **out** of the engine as a [`Variant`]: an object the
 //! call retained becomes a [`CHandle`], so the next entry reaches the same
 //! object; `null` is the null closure, and a byte string becomes the
 //! variant's octet.
+//!
+//! # The global scope
+//!
+//! The object a script's top-level scope is — its `this`, and the object a
+//! `var` or a `function` at the top level is declared on — is the scope's
+//! [`GlobalObject`], not a handle over the engine's global object. That object
+//! owns the scope's members and class objects and asks the engine's global
+//! object as one source for a name it does not hold; the resolution order is
+//! written once, there. A handle's store is then only what its own object
+//! cannot give the engine, and [`scope_global`] is where the scope's object is
+//! read from.
 //!
 //! # What remains limited
 //!
@@ -31,10 +42,10 @@
 //! so the call is refused rather than run on another object.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::rc::{Rc, Weak};
 
-use crate::vm::runtime::natives::registry::NativeRegistry;
+use crate::vm::runtime::global::GlobalObject;
 use crate::vm::runtime::number::Number;
 use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
@@ -42,26 +53,24 @@ use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
 use crate::{CallAnswer, DetachedValue, MemberShape, Tjs2Engine, Tjs2ValueId, TjsValue};
 
-/// The members a handle keeps on the Rust side.
+/// The values one scope keeps for the objects the engine cannot hold them on.
 ///
-/// The engine cannot hold a value of the Rust object model, so a handle may
-/// carry those values here. Scalars and engine objects still cross to the
-/// engine; only an object the engine cannot address stays in this store. The
-/// global scope's store also owns the native class registry: a name the
-/// registry publishes is answered from the registry before the engine, and a
-/// write or a delete of that name is kept here so the two views do not
-/// disagree. A context and every other object have their own store in the same
-/// scope and never apply the global registry.
+/// The engine cannot hold a value of the Rust object model, so an object's
+/// store keeps those values here. Scalars and engine objects still cross to the
+/// engine; only an object the engine cannot address stays in a store. The root
+/// store of a scope also owns the scope's [`GlobalObject`] and the table that
+/// gives a Rust object a stable token, so a later answer for the same engine
+/// object finds the Rust object it stands for.
 pub struct GlobalMembers {
     members: RefCell<BTreeMap<TjsString, Variant>>,
-    removed: RefCell<BTreeSet<TjsString>>,
-    natives: Option<NativeRegistry>,
     log: Option<LogSink>,
     parent: Option<Weak<GlobalMembers>>,
     children: RefCell<HashMap<Tjs2ValueId, SharedGlobals>>,
     host: RefCell<Option<Rc<dyn Dispatch>>>,
     hosts: RefCell<HashMap<i64, Rc<dyn Dispatch>>>,
     next_host: Cell<i64>,
+    /// The global object of this scope, once its first script call made it.
+    global: RefCell<Option<Rc<GlobalObject>>>,
 }
 
 /// What a refused engine call reports to.
@@ -72,33 +81,17 @@ pub type LogSink = Rc<dyn Fn(&str)>;
 const HOST_TOKEN: &str = "__krkr_rust_host";
 
 impl GlobalMembers {
-    /// An empty root store with no log sink.
+    /// An empty store with no log sink.
     pub fn new() -> Self {
         Self {
             members: RefCell::new(BTreeMap::new()),
-            removed: RefCell::new(BTreeSet::new()),
-            natives: Some(NativeRegistry::new()),
             log: None,
             parent: None,
             children: RefCell::new(HashMap::new()),
             host: RefCell::new(None),
             hosts: RefCell::new(HashMap::new()),
             next_host: Cell::new(1),
-        }
-    }
-
-    /// An empty store with no native class registry.
-    fn plain() -> Self {
-        Self {
-            members: RefCell::new(BTreeMap::new()),
-            removed: RefCell::new(BTreeSet::new()),
-            natives: None,
-            log: None,
-            parent: None,
-            children: RefCell::new(HashMap::new()),
-            host: RefCell::new(None),
-            hosts: RefCell::new(HashMap::new()),
-            next_host: Cell::new(1),
+            global: RefCell::new(None),
         }
     }
 
@@ -106,14 +99,13 @@ impl GlobalMembers {
     fn detached_to(root: &SharedGlobals) -> Self {
         Self {
             members: RefCell::new(BTreeMap::new()),
-            removed: RefCell::new(BTreeSet::new()),
-            natives: None,
             log: root.log.clone(),
             parent: Some(Rc::downgrade(root)),
             children: RefCell::new(HashMap::new()),
             host: RefCell::new(None),
             hosts: RefCell::new(HashMap::new()),
             next_host: Cell::new(1),
+            global: RefCell::new(None),
         }
     }
 
@@ -169,7 +161,6 @@ impl GlobalMembers {
 
     /// Stores a member the engine cannot hold.
     fn insert(&self, name: TjsString, value: Variant) {
-        self.removed.borrow_mut().remove(&name);
         self.members.borrow_mut().insert(name, value);
     }
 
@@ -185,53 +176,6 @@ impl GlobalMembers {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
-    }
-
-    /// The class object the name denotes, when the registry publishes one and
-    /// the name has not been deleted.
-    fn native(&self, name: &TjsString) -> Option<Variant> {
-        if self.removed.borrow().contains(name) {
-            return None;
-        }
-        self.natives.as_ref()?.get(name)
-    }
-
-    /// Whether the registry publishes the name.
-    fn is_native(&self, name: &TjsString) -> bool {
-        self.natives
-            .as_ref()
-            .is_some_and(|natives| natives.contains(name))
-    }
-
-    /// Whether the name was deleted from this store's view.
-    fn is_removed(&self, name: &TjsString) -> bool {
-        self.removed.borrow().contains(name)
-    }
-
-    /// Marks a registry name deleted from this store's view.
-    fn mark_removed(&self, name: &TjsString) {
-        self.removed.borrow_mut().insert(name.clone());
-    }
-
-    /// The registry's class objects, by name, excluding deleted names.
-    fn native_entries(&self) -> Vec<(TjsString, Variant)> {
-        let removed = self.removed.borrow();
-        match &self.natives {
-            Some(natives) => {
-                let mut entries = Vec::new();
-                for name in natives.names() {
-                    let name = TjsString::from(name);
-                    if removed.contains(&name) {
-                        continue;
-                    }
-                    if let Some(value) = natives.get(&name) {
-                        entries.push((name, value));
-                    }
-                }
-                entries
-            }
-            None => Vec::new(),
-        }
     }
 }
 
@@ -283,6 +227,66 @@ pub fn context_members(globals: &SharedGlobals, id: Tjs2ValueId) -> SharedGlobal
     child_of(globals, id)
 }
 
+/// The global object the scope's scripts run against, when it has one.
+///
+/// The object's members are the scope's, so the answer is the same object for as
+/// long as the scope lives.
+pub fn scope_global(scope: &SharedGlobals) -> Option<Rc<GlobalObject>> {
+    let root = root_of(scope);
+    root.global.borrow().clone()
+}
+
+/// Makes `value`, the engine's global object, the one source behind the scope's
+/// global object, and answers that object.
+///
+/// A scope has one global object: a scope that already has one keeps it, and
+/// `value` is released, so a member a script declared in an earlier call is
+/// still there. When the scope has none, the object is made with `value` behind
+/// it and kept by the scope.
+///
+/// # Errors
+///
+/// [`ObjectError::InvalidObject`] when the engine cannot answer for `value`:
+/// the class-name read or the validity question failed.
+pub fn global_object(
+    engine: &Rc<Tjs2Engine>,
+    scope: &SharedGlobals,
+    value: DetachedValue,
+) -> Result<Rc<GlobalObject>, ObjectError> {
+    let root = root_of(scope);
+    let existing = root.global.borrow().clone();
+    if let Some(global) = existing {
+        return Ok(global);
+    }
+    let store = Rc::new(GlobalMembers::new());
+    let fallback = CHandle::with_store(Rc::clone(engine), value, store, &root, false)?;
+    let global = Rc::new(GlobalObject::over(Some(Rc::new(fallback))));
+    root.global.borrow_mut().replace(Rc::clone(&global));
+    Ok(global)
+}
+
+/// Whether a value has to stay on the Rust side of the crossing.
+///
+/// The engine addresses a value it can hold: the scalar kinds, the byte
+/// strings, the null object, and an object that carries an engine handle. An
+/// object of the Rust object model carries none, and an engine anchor's value
+/// is the Rust object behind it, so the engine cannot be handed such a value and
+/// the scope that owns the object keeps it instead. This is the one rule a write
+/// follows, whichever object the write is made on.
+pub fn unaddressable(value: &Variant) -> bool {
+    match value {
+        Variant::Object(closure) => match &closure.object {
+            None => false,
+            Some(object) => object.engine_id().is_none() || object.is_host_proxy(),
+        },
+        Variant::Void
+        | Variant::Integer(_)
+        | Variant::Real(_)
+        | Variant::String(_)
+        | Variant::Octet(_) => false,
+    }
+}
+
 /// An engine object, reached through its retained id.
 ///
 /// The handle owns one retention, shared by its clones and released when the
@@ -302,14 +306,16 @@ pub struct CHandle {
     valid: Rc<Cell<bool>>,
     /// The members the engine cannot hold for this object.
     globals: RefCell<SharedGlobals>,
-    /// The store the object's scope shares; child stores are keyed here.
-    root: SharedGlobals,
+    /// The scope the object belongs to; the stores of its objects are keyed
+    /// there.
+    ///
+    /// The scope owns its global object, and that object owns the handle that
+    /// stands for the engine's global object, so this link is weak: a strong
+    /// one would keep the scope and the object alive for each other.
+    root: Weak<GlobalMembers>,
     /// The Rust object this handle stands in front of, when it is a proxy for
     /// one that crossed into the engine.
     host: Option<Rc<dyn Dispatch>>,
-    /// Whether this handle is the global scope's own handle. Only that handle
-    /// applies the Rust class registry over the engine's global object.
-    global: bool,
     /// The sink a refused engine call reports to.
     log: Option<LogSink>,
 }
@@ -331,15 +337,19 @@ impl CHandle {
     /// The id is not an object the engine can answer for: the class-name read
     /// or the validity question failed.
     pub fn new(engine: Rc<Tjs2Engine>, value: DetachedValue) -> Result<Self, ObjectError> {
-        let globals = Rc::new(GlobalMembers::plain());
+        let globals = Rc::new(GlobalMembers::new());
         let root = Rc::clone(&globals);
-        Self::with_store(engine, value, globals, root, false)
+        Self::with_store(engine, value, globals, &root, true)
     }
 
-    /// The adapter over `value` for the global scope.
+    /// The global object over `value`, the engine's global object, in
+    /// `globals`'s scope.
     ///
-    /// This is the one handle that applies the global store's class registry
-    /// over the engine's global object.
+    /// The object owns its members and class objects, and `value` is the one
+    /// source behind it for a name the object does not hold. It is the object a
+    /// caller that reads the global scope through the handle builds; the object
+    /// a scope's scripts run against is the scope's own ([`scope_global`]), and
+    /// this constructor does not replace it.
     ///
     /// # Errors
     ///
@@ -349,15 +359,14 @@ impl CHandle {
         engine: Rc<Tjs2Engine>,
         value: DetachedValue,
         globals: SharedGlobals,
-    ) -> Result<Self, ObjectError> {
+    ) -> Result<GlobalObject, ObjectError> {
         let root = root_of(&globals);
-        Self::with_store(engine, value, globals, root, true)
+        let store = Rc::new(GlobalMembers::new());
+        let fallback = Self::with_store(engine, value, store, &root, false)?;
+        Ok(GlobalObject::over(Some(Rc::new(fallback))))
     }
 
     /// The adapter over `value`, carrying a non-global object's own members.
-    ///
-    /// The handle consults its store and the engine, never the global scope's
-    /// class registry.
     ///
     /// # Errors
     ///
@@ -369,7 +378,7 @@ impl CHandle {
         globals: SharedGlobals,
     ) -> Result<Self, ObjectError> {
         let root = root_of(&globals);
-        Self::with_store(engine, value, globals, root, false)
+        Self::with_store(engine, value, globals, &root, true)
     }
 
     /// The adapter over `value`, taking the store its object already has in
@@ -382,16 +391,19 @@ impl CHandle {
         let id = value.raw_id();
         let globals =
             store_for(&root, id).unwrap_or_else(|| Rc::new(GlobalMembers::detached_to(&root)));
-        Self::with_store(engine, value, globals, root, false)
+        Self::with_store(engine, value, globals, &root, true)
     }
 
     /// The adapter over `value` with an explicit store.
+    ///
+    /// `anchor` says whether the object may be a Rust object anchored in the
+    /// scope; the handle over the engine's global object is not one.
     fn with_store(
         engine: Rc<Tjs2Engine>,
         value: DetachedValue,
         mut globals: SharedGlobals,
-        root: SharedGlobals,
-        global: bool,
+        root: &SharedGlobals,
+        anchor: bool,
     ) -> Result<Self, ObjectError> {
         let id = value.raw_id();
         let names = engine
@@ -407,7 +419,7 @@ impl CHandle {
         // token, so the later handle finds the same object instead of an
         // empty dictionary.
         let token = if host.is_none()
-            && !global
+            && anchor
             && root.has_hosts()
             && class_names
                 .iter()
@@ -420,8 +432,8 @@ impl CHandle {
         if let Some(token) = token
             && let Some(object) = root.host_by_token(token)
         {
-            if store_for(&root, id).is_none() {
-                globals = child_of(&root, id);
+            if store_for(root, id).is_none() {
+                globals = child_of(root, id);
             }
             globals.set_host(Rc::clone(&object));
             host = Some(object);
@@ -433,11 +445,21 @@ impl CHandle {
             class_names: Rc::new(RefCell::new(class_names)),
             valid: Rc::new(Cell::new(valid)),
             globals: RefCell::new(globals),
-            root,
+            root: Rc::downgrade(root),
             host,
-            global,
             log,
         })
+    }
+
+    /// The scope the object belongs to.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectError::InvalidObject`] when the scope is gone: an object that
+    /// outlives the scope it was read in has nowhere to keep a value the engine
+    /// cannot hold, and no store to publish a child object's members in.
+    fn root(&self) -> Result<SharedGlobals, ObjectError> {
+        self.root.upgrade().ok_or(ObjectError::InvalidObject)
     }
 
     /// This object's store.
@@ -446,34 +468,33 @@ impl CHandle {
     }
 
     /// This object's store, preferring the one its scope already published.
-    fn entry_store(&self) -> SharedGlobals {
+    fn entry_store(&self) -> Result<SharedGlobals, ObjectError> {
+        let root = self.root()?;
         let current = self.store();
-        if Rc::ptr_eq(&current, &self.root) {
-            return current;
+        if Rc::ptr_eq(&current, &root) {
+            return Ok(current);
         }
-        store_for(&self.root, self.id()).unwrap_or(current)
+        Ok(store_for(&root, self.id()).unwrap_or(current))
     }
 
     /// This object's store, publishing a store that was only local to this
     /// handle before its first Rust-owned member.
-    fn member_store(&self) -> SharedGlobals {
+    fn member_store(&self) -> Result<SharedGlobals, ObjectError> {
+        let root = self.root()?;
         let current = self.store();
-        if Rc::ptr_eq(&current, &self.root) {
-            return current;
+        if Rc::ptr_eq(&current, &root) {
+            return Ok(current);
         }
         let id = self.id();
-        if let Some(existing) = store_for(&self.root, id) {
+        if let Some(existing) = store_for(&root, id) {
             if !Rc::ptr_eq(&existing, &current) {
                 *self.globals.borrow_mut() = Rc::clone(&existing);
-                return existing;
+                return Ok(existing);
             }
-            return current;
+            return Ok(current);
         }
-        self.root
-            .children
-            .borrow_mut()
-            .insert(id, Rc::clone(&current));
-        current
+        root.children.borrow_mut().insert(id, Rc::clone(&current));
+        Ok(current)
     }
 
     /// The engine the object belongs to.
@@ -826,25 +847,12 @@ impl Dispatch for CHandle {
         if let Some(host) = &self.host {
             return host.prop_get(name, flags, objthis);
         }
-        let globals = self.entry_store();
+        let globals = self.entry_store()?;
         if let Some(value) = globals.get(name) {
             return Ok(value);
         }
-        if globals.is_removed(name) {
-            return Err(ObjectError::MemberNotFound);
-        }
-        if self.global
-            && let Some(value) = globals.native(name)
-        {
-            return Ok(value);
-        }
-        read_member(
-            &self.engine,
-            self.id(),
-            &name.to_string(),
-            flags,
-            &self.root,
-        )
+        let root = self.root()?;
+        read_member(&self.engine, self.id(), &name.to_string(), flags, &root)
     }
 
     fn prop_set(
@@ -856,44 +864,25 @@ impl Dispatch for CHandle {
     ) -> Result<(), ObjectError> {
         self.live()?;
         if let Some(host) = &self.host {
+            let root = self.root()?;
             host.prop_set(name, flags, value, objthis)?;
-            mirror_member(
-                &self.engine,
-                self.id(),
-                name,
-                value,
-                &self.root,
-                &mut Vec::new(),
-            )?;
+            mirror_member(&self.engine, self.id(), name, value, &root, &mut Vec::new())?;
             return Ok(());
         }
-        let globals = self.entry_store();
-        // A value the engine cannot address lives in the handle's own store,
-        // and so does any write to a name the class registry owns: the store
-        // is then the one view of that name.
-        let unaddressable = match value {
-            Variant::Object(closure) => matches!(
-                &closure.object,
-                Some(object) if object.engine_id().is_none() || object.is_host_proxy()
-            ),
-            _ => false,
-        };
-        if (self.global && globals.is_native(name)) || unaddressable {
-            self.member_store().insert(name.clone(), value.clone());
+        // A value the engine cannot address lives in the handle's own store.
+        if unaddressable(value) {
+            self.member_store()?.insert(name.clone(), value.clone());
             return Ok(());
         }
         let mut keep = Vec::new();
         let crossing = to_value(&self.engine, value, &mut keep)?;
         let member = name.to_string();
-        // The wrapper's own default is plain assignment's flag: a write with
-        // no flag asks for exactly that rule, and a write with a flag asks for
-        // the flag's rule unchanged.
-        let answer = if flags == MemberFlags::NONE {
-            self.engine.set_member(self.id(), &member, &crossing)
-        } else {
-            self.engine
-                .set_member_with_flags(self.id(), &member, flags.bits(), &crossing)
-        };
+        // The write carries the instruction's own flags: a write with no flag
+        // is the plain assignment rule, which refuses a name the object does
+        // not hold, and a write with a flag asks for that flag's rule.
+        let answer = self
+            .engine
+            .set_member_with_flags(self.id(), &member, flags.bits(), &crossing);
         drop(keep);
         match answer {
             Ok(()) => {
@@ -921,15 +910,8 @@ impl Dispatch for CHandle {
             }
             return answer;
         }
-        let globals = self.entry_store();
-        let store = self.member_store();
+        let store = self.member_store()?;
         let stored = store.remove(name).is_some();
-        if self.global && globals.is_native(name) {
-            // The class object is this store's value, so deleting the name is
-            // this store's answer; the engine's copy is not the view.
-            store.mark_removed(name);
-            return Ok(());
-        }
         if stored {
             match self.engine.delete_member(self.id(), &name.to_string()) {
                 Ok(()) => return Ok(()),
@@ -966,18 +948,11 @@ impl Dispatch for CHandle {
             MemberFlags::NONE
         };
         let values = !flags.contains(MemberFlags::ENUM_NO_VALUE);
-        let globals = self.entry_store();
+        let globals = self.entry_store()?;
+        let root = self.root()?;
         let mut extra: BTreeMap<TjsString, Variant> = globals.entries().into_iter().collect();
-        if self.global {
-            for (name, value) in globals.native_entries() {
-                extra.entry(name).or_insert(value);
-            }
-        }
         for name in names {
             let name = TjsString::from(name);
-            if globals.is_removed(&name) {
-                continue;
-            }
             let value = if let Some(value) = extra.remove(&name) {
                 value
             } else if values {
@@ -986,7 +961,7 @@ impl Dispatch for CHandle {
                     self.id(),
                     &name.to_string(),
                     read_flags,
-                    &self.root,
+                    &root,
                 )?
             } else {
                 Variant::Void
@@ -1047,10 +1022,12 @@ impl Dispatch for CHandle {
         if let Some(host) = &self.host {
             return host.rust_member(name);
         }
-        let globals = self.entry_store();
-        globals
-            .get(name)
-            .or_else(|| self.global.then(|| globals.native(name)).flatten())
+        // A handle whose scope is gone has no store left to read; the object's
+        // own call entry reports the refusal it finds.
+        let Ok(globals) = self.entry_store() else {
+            return None;
+        };
+        globals.get(name)
     }
 
     fn is_valid(&self) -> bool {
@@ -1115,7 +1092,7 @@ impl Dispatch for CHandle {
                 return Err(ObjectError::CallNotServed);
             }
         };
-        call_answer(&self.engine, answer, &self.root)
+        call_answer(&self.engine, answer, &self.root()?)
     }
 
     fn create_new(
@@ -1139,7 +1116,7 @@ impl Dispatch for CHandle {
             CallAnswer::Object(object) => Ok(object_value(CHandle::with_root(
                 self.engine.clone(),
                 object,
-                Rc::clone(&self.root),
+                self.root()?,
             )?)),
             CallAnswer::Null | CallAnswer::Scalar(_) => Err(ObjectError::CallNotServed),
         }

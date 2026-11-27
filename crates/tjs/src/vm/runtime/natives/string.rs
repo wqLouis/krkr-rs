@@ -86,10 +86,9 @@ impl StringMember {
 
     /// The member `name` denotes, or `None` when it names no member.
     pub fn lookup(name: &TjsString) -> Option<Self> {
-        let units = name.as_utf16();
         TEXT_MEMBERS
             .iter()
-            .find(|spec| units.iter().copied().eq(spec.name.encode_utf16()))
+            .find(|spec| name.len() == spec.name.len() && name.eq_str(spec.name))
             .map(|spec| spec.member)
     }
 
@@ -165,10 +164,9 @@ impl OctetMember {
 
     /// The member `name` denotes, or `None` when it names no member.
     pub fn lookup(name: &TjsString) -> Option<Self> {
-        let units = name.as_utf16();
         OCTET_MEMBERS
             .iter()
-            .find(|spec| units.iter().copied().eq(spec.name.encode_utf16()))
+            .find(|spec| name.len() == spec.name.len() && name.eq_str(spec.name))
             .map(|spec| spec.member)
     }
 

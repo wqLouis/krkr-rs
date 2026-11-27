@@ -67,6 +67,7 @@ mod plugins_native;
 mod resource;
 mod script;
 mod storage;
+mod streams;
 mod text;
 
 pub use ctx::{CompatCtx, CompatServices};

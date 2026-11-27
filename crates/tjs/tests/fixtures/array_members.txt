@@ -117,6 +117,16 @@ named_survives_assign	String	void
 instanceof_array	Integer	0
 instanceof_object	!raise	
 instanceof_dictionary	Integer	0
+instanceof_array_name	Integer	1
+instanceof_object_name	Integer	1
+instanceof_dictionary_name	Integer	0
+instanceof_string_name	Integer	0
+instanceof_number_name	Integer	0
+instanceof_octet_name	Integer	0
+instanceof_split_name	Integer	1
+instanceof_literal_name	Integer	1
+instanceof_new_name	Integer	1
+instanceof_invalidated	!raise	
 split_text_count	Integer	3
 split_text_first	String	a
 split_text_second	String	b

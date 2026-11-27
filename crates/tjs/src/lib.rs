@@ -495,14 +495,6 @@ unsafe extern "C" {
         out_result: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
-    /// Replace the text of a registered TJS message. Returns 1 when the
-    /// message exists, 0 when it does not, and -1 on a VM-side error
-    /// (reported through `out_error`).
-    fn tjs2_assign_message_checked(
-        name: *const c_char,
-        message: *const c_char,
-        out_error: *mut *mut c_char,
-    ) -> c_int;
     /// The TJS2 engine version as a static `major.minor.release` string.
     fn tjs2_tjs_version_string() -> *const c_char;
     /// The compile date and time of the VM translation unit
@@ -1609,24 +1601,14 @@ impl Tjs2Engine {
         Ok(take_value(&result))
     }
 
-    /// Replace the text of the registered TJS message `name` with `message`.
-    /// Returns whether a message by that
-    /// name exists; a VM-side failure is a [`TjsError`].
+    /// Replaces the text of the registered message `name` with `message`.
+    ///
+    /// Answers whether a message by that name is registered; an unregistered
+    /// name is not stored. The text keeps its `%1`… placeholders and is
+    /// substituted when a raise reads it, so an assignment reaches every later
+    /// raise of that kind.
     pub fn assign_message(&self, name: &str, message: &str) -> Result<bool, TjsError> {
-        let name = CString::new(name).map_err(|_| TjsError("message name contains NUL".into()))?;
-        let message =
-            CString::new(message).map_err(|_| TjsError("message text contains NUL".into()))?;
-        let mut error: *mut c_char = ptr::null_mut();
-        let rc =
-            // SAFETY: both pointers are valid, NUL-terminated UTF-8 for the call;
-            // the function reads them only and stores an owned error string in
-            // `error` on failure.
-            unsafe { tjs2_assign_message_checked(name.as_ptr(), message.as_ptr(), &mut error) };
-        match rc {
-            1 => Ok(true),
-            0 => Ok(false),
-            _ => Err(take_error(error)),
-        }
+        Ok(crate::vm::runtime::message::assign(name, message))
     }
 
     /// The vendored TJS2 engine version as `major.minor.release`.

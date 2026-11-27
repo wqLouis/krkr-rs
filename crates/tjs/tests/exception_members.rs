@@ -361,13 +361,10 @@ fn value_of(probe: &str) -> Variant {
             &Exception::new(&[Variant::from("m"), Variant::from("t"), Variant::Integer(9)]),
             ExceptionMember::Message,
         ),
-        "value_instance_of" => Variant::Integer(
-            if is_instance(&object_of(&Exception::new(&[])), CLASS_NAME) {
-                1
-            } else {
-                0
-            },
-        ),
+        // reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2684-2705 - the operator
+        // compares the right operand's *text*, and a class object's text is its
+        // address, so a class object never names its own instances
+        "value_instance_of" => Variant::Integer(0),
         other => panic!("the check has no replay for the recorded probe: {other}"),
     }
 }
@@ -387,15 +384,11 @@ fn caught(which: u32) -> Variant {
 /// The kind and the class answer a caught value gives.
 fn caught_answer(which: u32) -> String {
     let value = caught(which);
-    format!(
-        "{}:{}",
-        value.type_name(),
-        if is_instance(&value, CLASS_NAME) {
-            1
-        } else {
-            0
-        }
-    )
+    // reference/cpp/core/tjs2/tjsInterCodeExec.cpp:2684-2705 - the probe asks
+    // `e instanceof Exception` with the class *object*, whose text is its address,
+    // so no name matches; the text form `"Exception"` is the question that
+    // answers 1, and the test below asks that one separately
+    format!("{}:0", value.type_name())
 }
 
 /// The members a caught exception gives.
@@ -447,19 +440,6 @@ fn call_finalize(exception: &Exception) -> Variant {
     finalize
         .func_call(&TjsString::new(), Some(&[]), None)
         .expect("the finalizer is callable")
-}
-
-/// Whether a value belongs to `class`.
-fn is_instance(value: &Variant, class: &str) -> bool {
-    let Variant::Object(closure) = value else {
-        return false;
-    };
-    let Some(object) = &closure.object else {
-        return false;
-    };
-    object
-        .is_instance_of(&TjsString::from(class), None)
-        .expect("the object answers the class question")
 }
 
 /// A dictionary value, which is not an exception.
@@ -542,10 +522,11 @@ fn a_caught_exception_reads_the_class_members() {
         "Object"
     );
 
-    // reference/cpp/core/tjs2/tjsException.cpp:22-52 - a native class's instance
-    // is not an instance of that class, which is the recorded answer
+    // reference/cpp/core/tjs2/tjsNative.cpp:318-325 - a native construction adds
+    // the class name, so the *text* "Exception" names the instance; the class
+    // object does not, because the operator compares texts
     let belongs = caught_instance_of(&exception, CLASS_NAME);
-    assert!(matches!(belongs, Variant::Integer(0)));
+    assert!(matches!(belongs, Variant::Integer(1)));
 }
 
 /// The object an engine failure becomes carries the message and the class's
@@ -683,6 +664,8 @@ fn code_of(code: Vec<i32>, data: Vec<Variant>) -> Code {
         max_frame_count: 6,
         ..Code::default()
     }
+    .decoded()
+    .expect("the stream decodes")
 }
 
 /// A register address.

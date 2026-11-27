@@ -27,12 +27,20 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+use super::dictionary::{
+    ClassNames, Container, StructError, container_kind, copy_value, member_error,
+    read_struct_stream, structure_binary, structure_text,
+};
 use super::number::Number;
 use super::object::Dispatch as ObjectHandle;
 use super::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
 use super::octet_pack::{self, PackError};
+use super::stream;
 use super::string::TjsString;
 use super::variant::{Closure, Variant, VariantError};
+
+/// The line break a text save writes after every element.
+const LINE_BREAK: &str = "\r\n";
 
 /// The members the class publishes.
 ///
@@ -237,6 +245,166 @@ impl ArrayMember {
             .iter()
             .find(|spec| spec.member == self)
             .and_then(|spec| spec.min_params)
+    }
+
+    /// Calls the member on `array` with `arguments`.
+    ///
+    /// A member that writes or reads a stream answers with the receiver, which
+    /// the surface cannot hand back: a call is made on a borrowed array and has
+    /// no handle to answer. Those members answer the empty value, and the call
+    /// machinery owns the receiver's answer.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectError::ParameterCount`] when the call gives fewer arguments than
+    /// the member needs, [`ObjectError::CallNotServed`] when the member is a
+    /// property or the operation refused the call, and the operation's own
+    /// failure otherwise. A save or a load that the form refuses reports the
+    /// refusal through the surface's own failure, whose text is not the form's.
+    pub fn call(self, array: &ArrayObject, arguments: &[Variant]) -> Result<Variant, ObjectError> {
+        let Some(required) = self.min_params() else {
+            return Err(ObjectError::NotImplemented);
+        };
+        if arguments.len() < required {
+            return Err(ObjectError::ParameterCount);
+        }
+        match self {
+            Self::Load => {
+                let name = text_argument(Some(&arguments[0]))?;
+                let mode = text_argument(arguments.get(1))?;
+                array.load(&name, &mode).map_err(struct_error)?;
+                Ok(Variant::Void)
+            }
+            Self::LoadStruct => {
+                let name = text_argument(Some(&arguments[0]))?;
+                let mode = text_argument(arguments.get(1))?;
+                array.load_struct(&name, &mode).map_err(struct_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Save => {
+                let name = text_argument(Some(&arguments[0]))?;
+                let mode = text_argument(arguments.get(1))?;
+                array.save(&name, &mode).map_err(struct_error)?;
+                Ok(Variant::Void)
+            }
+            Self::SaveStruct => {
+                let name = text_argument(Some(&arguments[0]))?;
+                let mode = text_argument(arguments.get(1))?;
+                array.save_struct(&name, &mode).map_err(struct_error)?;
+                Ok(Variant::Void)
+            }
+            Self::AssignStruct => {
+                array.assign_struct(&arguments[0]).map_err(struct_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Split => {
+                let purge = arguments.get(3).cloned().unwrap_or(Variant::Void);
+                array
+                    .split(&arguments[0], &arguments[1], &purge)
+                    .map_err(object_error)?;
+                // The member answers the array itself. The surface cannot hand
+                // its receiver back, and the callers that use the member ignore
+                // the answer.
+                Ok(Variant::Void)
+            }
+            Self::Join => {
+                let delimiter = arguments[0]
+                    .to_string()
+                    .map_err(|_| ObjectError::CallNotServed)?;
+                let purge = match arguments.get(2) {
+                    Some(value) => truthy(value).map_err(object_error)?,
+                    None => false,
+                };
+                Ok(Variant::String(
+                    array.join(&delimiter, purge).map_err(object_error)?,
+                ))
+            }
+            Self::Sort => {
+                let order = match arguments.first() {
+                    None | Some(Variant::Void) => SortOrder::Ascending,
+                    Some(Variant::Object(_)) => return Err(ObjectError::CallNotServed),
+                    Some(value) => {
+                        let text = value.to_string().map_err(|_| ObjectError::CallNotServed)?;
+                        let letter = text
+                            .as_utf16()
+                            .first()
+                            .and_then(|unit| char::from_u32(u32::from(*unit)));
+                        SortOrder::from_letter(letter)
+                    }
+                };
+                let stable = match arguments.get(1) {
+                    Some(value) => truthy(value).map_err(object_error)?,
+                    None => false,
+                };
+                array.sort(order, stable).map_err(object_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Reverse => {
+                array.reverse().map_err(object_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Assign => {
+                assign_from(array, &arguments[0])?;
+                Ok(Variant::Void)
+            }
+            Self::Clear => {
+                array.clear().map_err(object_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Erase => {
+                let index = integer_argument(&arguments[0])?;
+                array.erase(index).map_err(object_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Remove => {
+                let all = match arguments.get(1) {
+                    Some(value) => truthy(value).map_err(object_error)?,
+                    None => true,
+                };
+                let removed = array.remove(&arguments[0], all).map_err(object_error)?;
+                let removed = i64::try_from(removed).map_err(|_| ObjectError::CallNotServed)?;
+                Ok(Variant::from(removed))
+            }
+            Self::Insert => {
+                let index = integer_argument(&arguments[0])?;
+                array
+                    .insert(index, arguments[1].clone())
+                    .map_err(object_error)?;
+                Ok(Variant::Void)
+            }
+            Self::Add => {
+                let index = array.append(arguments[0].clone()).map_err(object_error)?;
+                let index = i64::try_from(index).map_err(|_| ObjectError::CallNotServed)?;
+                Ok(Variant::from(index))
+            }
+            Self::Push => {
+                let length = array.push(arguments).map_err(object_error)?;
+                let length = i64::try_from(length).map_err(|_| ObjectError::CallNotServed)?;
+                Ok(Variant::from(length))
+            }
+            Self::Pop => array.pop().map_err(object_error),
+            Self::Shift => array.shift().map_err(object_error),
+            Self::Unshift => {
+                let length = array.unshift(arguments).map_err(object_error)?;
+                let length = i64::try_from(length).map_err(|_| ObjectError::CallNotServed)?;
+                Ok(Variant::from(length))
+            }
+            Self::Find => {
+                let start = match arguments.get(1) {
+                    Some(value) => integer_argument(value)?,
+                    None => 0,
+                };
+                let found = array.find(&arguments[0], start).map_err(object_error)?;
+                Ok(Variant::from(found))
+            }
+            Self::Pack => {
+                let format = arguments[0]
+                    .to_string()
+                    .map_err(|_| ObjectError::CallNotServed)?;
+                array.pack(&format).map_err(object_error)
+            }
+            Self::Count | Self::Length => Err(ObjectError::NotImplemented),
+        }
     }
 }
 
@@ -574,6 +742,201 @@ impl ArrayObject {
         }
     }
 
+    /// Writes the elements to `name` as text, one line per element.
+    ///
+    /// A text, an integer and a real are written as their text; every other
+    /// value writes nothing but still ends its line. The stream is opened with
+    /// `mode` before anything is written, and the mode names the container the
+    /// host writes around the text.
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::Stream`] when the host cannot open the name or the
+    /// stream fails, and [`StructError::Text`] when an element has no text.
+    pub fn save(&self, name: &TjsString, mode: &TjsString) -> Result<(), StructError> {
+        let mut stream = stream::open_text_write(name, mode)?;
+        for index in 0..self.len() {
+            let index = i64::try_from(index).map_err(|_| StructError::LengthOutOfRange)?;
+            let value = self
+                .prop_get_by_num(index, MemberFlags::NONE)
+                .map_err(member_error)?;
+            match &value {
+                Variant::String(_) | Variant::Integer(_) | Variant::Real(_) => {
+                    let text = value.to_string()?;
+                    stream.write(&text)?;
+                }
+                Variant::Void | Variant::Octet(_) | Variant::Object(_) => {}
+            }
+            stream.write(&TjsString::from(LINE_BREAK))?;
+        }
+        Ok(())
+    }
+
+    /// Replaces the elements with the lines of the text `name` holds.
+    ///
+    /// A line ends at a carriage return, a line feed, or a carriage return and
+    /// a line feed; the text after the last terminator is a line when it is not
+    /// empty. Every element the text produces is a text. The stream is opened
+    /// and only then is the array emptied, so a name the host cannot open
+    /// leaves the elements as they were.
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::Stream`] when the host cannot open the name or the
+    /// stream fails, and [`StructError::InvalidObject`] when the array has
+    /// been invalidated.
+    pub fn load(&self, name: &TjsString, mode: &TjsString) -> Result<(), StructError> {
+        let mut stream = stream::open_text_read(name, mode)?;
+        self.clear().map_err(|_| StructError::InvalidObject)?;
+        let text = stream.read_all()?;
+        for line in split_lines(&text) {
+            self.append(line)
+                .map_err(|_| StructError::LengthOutOfRange)?;
+        }
+        Ok(())
+    }
+
+    /// The text a structured save writes for this array.
+    ///
+    /// The text is the array's own, without a file or a stream around it; see
+    /// the dictionary module for the grammar.
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::Members`] and [`StructError::InvalidObject`] when a
+    /// container in the save cannot be walked, and [`StructError::Text`] when
+    /// an object value has no text form.
+    pub fn save_struct_text(&self) -> Result<TjsString, StructError> {
+        structure_text(self, &ClassNames)
+    }
+
+    /// The binary form of this array, its signature included.
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::Members`] and [`StructError::InvalidObject`] when a
+    /// container in the save cannot be walked.
+    pub fn save_struct_binary(&self) -> Result<Vec<u8>, StructError> {
+        structure_binary(self)
+    }
+
+    /// Writes this array to `name` in the form `mode` selects: the binary form
+    /// when the mode holds a `b`, and the text form otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::Stream`] when the host cannot open the name or the stream
+    /// fails, and the form's own failures as [`Self::save_struct_text`] reports
+    /// them.
+    pub fn save_struct(&self, name: &TjsString, mode: &TjsString) -> Result<(), StructError> {
+        if mode.as_utf16().contains(&u16::from(b'b')) {
+            let bytes = self.save_struct_binary()?;
+            let mut stream = stream::open_binary_write(name, mode)?;
+            stream.write(&bytes)?;
+            return Ok(());
+        }
+        let text = self.save_struct_text()?;
+        let mut stream = stream::open_text_write(name, mode)?;
+        stream.write(&text)?;
+        Ok(())
+    }
+
+    /// Replaces the elements with the array `name` holds in the binary form.
+    ///
+    /// The array is emptied before the stream is opened, so a name the host
+    /// cannot open leaves it empty; the elements follow. A body whose root is a
+    /// dictionary is [`StructError::InvalidArgument`], and a body whose root is
+    /// a single value leaves the array as the save found it — emptied.
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::Stream`] when the host cannot open the name or the
+    /// stream fails, [`StructError::InvalidArgument`] when the stream is not
+    /// the binary form or its root is a dictionary, [`StructError::Read`] when
+    /// the body is not one the reader accepts, and [`StructError::InvalidObject`]
+    /// when the array has been invalidated.
+    pub fn load_struct(&self, name: &TjsString, mode: &TjsString) -> Result<(), StructError> {
+        self.clear().map_err(|_| StructError::InvalidObject)?;
+        let value = read_struct_stream(name, mode)?;
+        let Variant::Object(closure) = value else {
+            return Ok(());
+        };
+        let Some(object) = closure.object else {
+            return Ok(());
+        };
+        match container_kind(&*object) {
+            Some(Container::Array) => {
+                let count = object
+                    .prop_get(&TjsString::from("count"), MemberFlags::NONE, None)
+                    .map_err(member_error)?;
+                let count = count
+                    .to_integer()
+                    .map_err(|_| StructError::Members(ObjectError::CallNotServed))?;
+                if count < 0 {
+                    return Err(StructError::Members(ObjectError::CallNotServed));
+                }
+                let count = usize::try_from(count).map_err(|_| StructError::LengthOutOfRange)?;
+                for index in 0..count {
+                    let name = TjsString::from(index.to_string());
+                    let value = object
+                        .prop_get(&name, MemberFlags::NONE, None)
+                        .map_err(member_error)?;
+                    self.append(value)
+                        .map_err(|_| StructError::LengthOutOfRange)?;
+                }
+                Ok(())
+            }
+            Some(Container::Dictionary) => Err(StructError::InvalidArgument),
+            None => Ok(()),
+        }
+    }
+
+    /// Copies `source`'s elements into this array, one deep copy per element,
+    /// and drops the elements it held.
+    ///
+    /// The source must be an array: a dictionary, and any other object, is
+    /// [`StructError::NotAContainer`], and a value that is not an object is
+    /// [`StructError::NullAccess`].
+    ///
+    /// # Errors
+    ///
+    /// [`StructError::NotAContainer`] and [`StructError::NullAccess`] for a
+    /// source this member does not take, and the copy's own failures as
+    /// [`super::dictionary::copy_value`] reports them.
+    pub fn assign_struct(&self, source: &Variant) -> Result<(), StructError> {
+        let Variant::Object(closure) = source else {
+            return Err(StructError::NullAccess);
+        };
+        let Some(object) = closure.object.as_deref() else {
+            return Err(StructError::NullAccess);
+        };
+        if container_kind(object) != Some(Container::Array) {
+            return Err(StructError::NotAContainer);
+        }
+        self.clear().map_err(|_| StructError::InvalidObject)?;
+        let count = object
+            .prop_get(&TjsString::from("count"), MemberFlags::NONE, None)
+            .map_err(member_error)?;
+        let count = count
+            .to_integer()
+            .map_err(|_| StructError::Members(ObjectError::CallNotServed))?;
+        if count < 0 {
+            return Err(StructError::Members(ObjectError::CallNotServed));
+        }
+        let count = usize::try_from(count).map_err(|_| StructError::LengthOutOfRange)?;
+        let mut stack = vec![super::dictionary::identity(object)];
+        for index in 0..count {
+            let name = TjsString::from(index.to_string());
+            let value = object
+                .prop_get(&name, MemberFlags::NONE, None)
+                .map_err(member_error)?;
+            let copied = copy_value(&value, &mut stack)?;
+            self.append(copied)
+                .map_err(|_| StructError::LengthOutOfRange)?;
+        }
+        Ok(())
+    }
+
     /// Reads the element at `index`.
     ///
     /// A negative index counts from the end. A position past the end, in either
@@ -841,9 +1204,7 @@ impl Dispatch for ArrayObject {
         class: &TjsString,
         objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
-        self.check_valid()?;
-        let _ = (class, objthis);
-        Ok(false)
+        self.members.is_instance_of(class, objthis)
     }
 
     fn class_names(&self) -> Vec<TjsString> {
@@ -866,29 +1227,36 @@ impl Dispatch for ArrayObject {
         true
     }
 
+    fn func_member(
+        &self,
+        name: &TjsString,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Option<Result<Variant, ObjectError>> {
+        let stored = self.members.func_member(name, objthis);
+        if !matches!(&stored, Some(Err(ObjectError::MemberNotFound))) {
+            return stored;
+        }
+        match ArrayMember::lookup(name) {
+            Some(ArrayMember::Count | ArrayMember::Length) => {
+                Some(Err(ObjectError::NotImplemented))
+            }
+            Some(_) => None,
+            None => stored,
+        }
+    }
+
     fn func_call(
         &self,
         name: &TjsString,
         argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.check_valid()?;
-        let Some(ArrayMember::Split) = ArrayMember::lookup(name) else {
-            return Err(ObjectError::CallNotServed);
-        };
-        let required = ArrayMember::Split
-            .min_params()
-            .ok_or(ObjectError::CallNotServed)?;
-        let argv = argv.unwrap_or(&[]);
-        if argv.len() < required {
-            return Err(ObjectError::CallNotServed);
+        let arguments = argv.unwrap_or(&[]);
+        match ArrayMember::lookup(name) {
+            Some(member) => member.call(self, arguments),
+            None => self.members.func_call(name, argv, objthis),
         }
-        let purge = argv.get(3).cloned().unwrap_or(Variant::Void);
-        self.split(&argv[0], &argv[1], &purge)
-            .map_err(object_error)?;
-        // The member answers the array itself. The surface cannot hand its
-        // receiver back, and the callers that use the member ignore the answer.
-        Ok(Variant::Void)
     }
 }
 
@@ -905,6 +1273,116 @@ fn object_error(error: ArrayError) -> ObjectError {
         | ArrayError::Convert(_)
         | ArrayError::Pack(_) => ObjectError::CallNotServed,
     }
+}
+
+/// The integer a call's argument is read as.
+fn integer_argument(value: &Variant) -> Result<i64, ObjectError> {
+    value.to_integer().map_err(|_| ObjectError::CallNotServed)
+}
+
+/// The text a call's name or mode argument is read as.
+///
+/// An argument that is not given, or that holds the empty value, is the empty
+/// text; every value that has a text form is that text, which is how a number
+/// can name a file. A byte string has no text form, and neither does a value
+/// the language refuses to convert.
+fn text_argument(value: Option<&Variant>) -> Result<TjsString, ObjectError> {
+    match value {
+        None | Some(Variant::Void) => Ok(TjsString::new()),
+        Some(value) => value.to_string().map_err(|_| ObjectError::CallNotServed),
+    }
+}
+
+/// Maps the structured form's failure onto the dispatch surface.
+fn struct_error(_error: StructError) -> ObjectError {
+    ObjectError::CallNotServed
+}
+
+/// The lines of a text, as a text save reads them back.
+///
+/// A line ends at a carriage return, a line feed, or a carriage return and a
+/// line feed; the text after the last terminator is a line when it is not
+/// empty, and a text that holds nothing produces no line at all.
+fn split_lines(text: &TjsString) -> Vec<Variant> {
+    let units = text.as_utf16();
+    let carriage_return = u16::from(b'\r');
+    let line_feed = u16::from(b'\n');
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut index = 0usize;
+    while index < units.len() {
+        let unit = units[index];
+        if unit != carriage_return && unit != line_feed {
+            index += 1;
+            continue;
+        }
+        lines.push(Variant::String(TjsString::from(&units[start..index])));
+        index += 1;
+        if unit == carriage_return && index < units.len() && units[index] == line_feed {
+            index += 1;
+        }
+        start = index;
+    }
+    if start < units.len() {
+        lines.push(Variant::String(TjsString::from(&units[start..])));
+    }
+    lines
+}
+
+/// Replaces `array`'s elements with `source`'s, the way the `assign` member
+/// does.
+///
+/// An array contributes its elements, and any other object contributes its
+/// non-hidden members as name and value pairs. The target is cleared before the
+/// source is read, so an array assigned from itself ends empty.
+fn assign_from(array: &ArrayObject, source: &Variant) -> Result<(), ObjectError> {
+    let Variant::Object(closure) = source else {
+        return Err(ObjectError::CallNotServed);
+    };
+    let Some(object) = &closure.object else {
+        return Err(ObjectError::CallNotServed);
+    };
+    array.clear().map_err(object_error)?;
+    let receiver = closure.objthis.as_deref().or(Some(object.as_ref()));
+    let array_class = TjsString::from("Array");
+    if object.class_names().iter().any(|name| name == &array_class) {
+        let count = object.prop_get(&TjsString::from("count"), MemberFlags::NONE, receiver)?;
+        let count = count.to_integer().map_err(|_| ObjectError::CallNotServed)?;
+        if count < 0 {
+            return Err(ObjectError::CallNotServed);
+        }
+        let count = usize::try_from(count).map_err(|_| ObjectError::CallNotServed)?;
+        for index in 0..count {
+            let index = i64::try_from(index).map_err(|_| ObjectError::CallNotServed)?;
+            let value = object.prop_get_by_num(index, MemberFlags::NONE, receiver)?;
+            array.append(value).map_err(object_error)?;
+        }
+        return Ok(());
+    }
+    let mut failure = None;
+    object.enum_members(MemberFlags::IGNORE_PROPERTY, &mut |name, flags, value| {
+        if flags & MemberFlags::HIDDEN.bits() != 0 {
+            return true;
+        }
+        let pushed = (|| -> Result<(), ObjectError> {
+            array
+                .append(Variant::String(name.clone()))
+                .map_err(object_error)?;
+            array.append(value.clone()).map_err(object_error)?;
+            Ok(())
+        })();
+        match pushed {
+            Ok(()) => true,
+            Err(error) => {
+                failure = Some(error);
+                false
+            }
+        }
+    })?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// The boolean a purge flag's value reads as.

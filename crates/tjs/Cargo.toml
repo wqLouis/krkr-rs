@@ -8,3 +8,9 @@ links = "tjs2"
 
 [dependencies]
 thiserror = "2"
+# The `RegExp` class's engine: Perl-compatible syntax with backreferences and
+# lookaround over the UTF-16 text a script holds. Pure Rust, so the class keeps
+# no C library in the build; `regex` alone cannot express a backreference or a
+# lookaround, and the Oniguruma mode supplies the dialect the patterns are
+# written in.
+fancy-regex = "0.20.2"

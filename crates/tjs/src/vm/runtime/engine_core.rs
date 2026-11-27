@@ -41,9 +41,10 @@ use std::fmt;
 use std::rc::Rc;
 
 use super::exec::build::{Block, BuildError};
-use super::exec::{Fault, Machine, Operator};
-use super::natives::registry::NativeRegistry;
-use super::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
+use super::exec::throw::Unwind;
+use super::exec::{Machine, Operator};
+use super::global::GlobalObject;
+use super::object::{Dispatch, MemberFlags, ObjectError};
 use super::retained::{RetainError, RetainedId, RetainedTable};
 use super::string::TjsString;
 use super::variant::Variant;
@@ -70,7 +71,7 @@ pub enum CoreError {
 
     /// The code raised, or the value it named cannot be run.
     #[error(transparent)]
-    Run(#[from] Fault),
+    Run(#[from] Unwind),
 
     /// The object surface refused the operation.
     #[error(transparent)]
@@ -107,206 +108,6 @@ impl Operation {
             Self::Increment => "inc",
             Self::Decrement => "dec",
         }
-    }
-}
-
-/// The engine's global object.
-///
-/// The members a script and the engine's own code declare live in a
-/// [`CustomObject`]; the class names live in the registry in front of it. A
-/// script that writes a class name shadows it, and one that deletes it leaves the
-/// name absent — the registry does not come back through a deletion.
-pub struct GlobalObject {
-    /// The declared members.
-    members: CustomObject,
-    /// The class objects the global publishes.
-    natives: NativeRegistry,
-    /// The class names a script deleted from the global.
-    removed: RefCell<Vec<TjsString>>,
-}
-
-impl GlobalObject {
-    /// A global with the registry's classes and no declared member.
-    pub fn new() -> Self {
-        Self {
-            members: CustomObject::new(Vec::new()),
-            natives: NativeRegistry::new(),
-            removed: RefCell::new(Vec::new()),
-        }
-    }
-
-    /// The class value `name` denotes, when the name has not been deleted.
-    fn published(&self, name: &TjsString) -> Option<Variant> {
-        if !self.is_published(name) {
-            return None;
-        }
-        self.natives.get(name)
-    }
-
-    /// Whether the registry publishes the name and the script has not deleted
-    /// it.
-    fn is_published(&self, name: &TjsString) -> bool {
-        !self.removed.borrow().contains(name) && self.natives.contains(name)
-    }
-
-    /// The class names the global publishes, with their class objects.
-    ///
-    /// # Errors
-    ///
-    /// [`ObjectError::CallNotServed`] when a name the registry lists does not
-    /// resolve, which its own key list makes impossible; the walk reports it
-    /// rather than leaving the name out.
-    fn published_entries(
-        &self,
-        flags: MemberFlags,
-    ) -> Result<Vec<(TjsString, Variant)>, ObjectError> {
-        let removed = self.removed.borrow();
-        let mut entries = Vec::new();
-        for published in self.natives.names() {
-            let name = TjsString::from(published);
-            if removed.contains(&name) {
-                continue;
-            }
-            let value = if flags.contains(MemberFlags::ENUM_NO_VALUE) {
-                Variant::Void
-            } else {
-                match self.natives.get(&name) {
-                    Some(value) => value,
-                    None => return Err(ObjectError::CallNotServed),
-                }
-            };
-            entries.push((name, value));
-        }
-        Ok(entries)
-    }
-}
-
-impl Default for GlobalObject {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Dispatch for GlobalObject {
-    fn prop_get(
-        &self,
-        name: &TjsString,
-        flags: MemberFlags,
-        objthis: Option<&dyn Dispatch>,
-    ) -> Result<Variant, ObjectError> {
-        match self.members.prop_get(name, flags, objthis) {
-            Ok(value) => Ok(value),
-            // a name the object does not hold is the registry's, unless the
-            // script deleted it
-            Err(ObjectError::MemberNotFound | ObjectError::MemberMustExist) => {
-                if let Some(value) = self.published(name) {
-                    return Ok(value);
-                }
-                if flags.contains(MemberFlags::MUST_EXIST) {
-                    return Err(ObjectError::MemberMustExist);
-                }
-                Err(ObjectError::MemberNotFound)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    fn prop_set(
-        &self,
-        name: &TjsString,
-        flags: MemberFlags,
-        value: &Variant,
-        objthis: Option<&dyn Dispatch>,
-    ) -> Result<(), ObjectError> {
-        // a published class name exists at the global, so a write that requires
-        // the member is served: the write creates the member that shadows it
-        if flags.contains(MemberFlags::MUST_EXIST) && self.is_published(name) {
-            let flags = MemberFlags::from_bits(
-                flags.bits() & !MemberFlags::MUST_EXIST.bits() | MemberFlags::ENSURE.bits(),
-            );
-            return self.members.prop_set(name, flags, value, objthis);
-        }
-        self.members.prop_set(name, flags, value, objthis)
-    }
-
-    fn delete_member(
-        &self,
-        name: &TjsString,
-        flags: MemberFlags,
-        objthis: Option<&dyn Dispatch>,
-    ) -> Result<(), ObjectError> {
-        if self.is_published(name) {
-            self.removed.borrow_mut().push(name.clone());
-            return match self.members.delete_member(name, flags, objthis) {
-                // the class name was the member, and it is gone: nothing the
-                // members hold has to be removed as well
-                Ok(()) | Err(ObjectError::MemberNotFound) => Ok(()),
-                Err(error) => Err(error),
-            };
-        }
-        self.members.delete_member(name, flags, objthis)
-    }
-
-    fn enum_members(
-        &self,
-        flags: MemberFlags,
-        callback: &mut dyn FnMut(&TjsString, u32, &Variant) -> bool,
-    ) -> Result<(), ObjectError> {
-        let mut seen: Vec<TjsString> = Vec::new();
-        let mut stopped = false;
-        self.members
-            .enum_members(flags, &mut |name, member_flags, value| {
-                seen.push(name.clone());
-                let keep = callback(name, member_flags, value);
-                stopped = !keep;
-                keep
-            })?;
-        if stopped {
-            return Ok(());
-        }
-        for (name, value) in self.published_entries(flags)? {
-            if seen.contains(&name) {
-                continue;
-            }
-            if !callback(&name, 0, &value) {
-                return Ok(());
-            }
-        }
-        Ok(())
-    }
-
-    fn is_instance_of(
-        &self,
-        class: &TjsString,
-        objthis: Option<&dyn Dispatch>,
-    ) -> Result<bool, ObjectError> {
-        self.members.is_instance_of(class, objthis)
-    }
-
-    fn class_names(&self) -> Vec<TjsString> {
-        self.members.class_names()
-    }
-
-    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
-        self.members.add_class_name(name)
-    }
-
-    fn is_valid(&self) -> bool {
-        self.members.is_valid()
-    }
-
-    fn invalidate(&self) -> bool {
-        self.members.invalidate()
-    }
-}
-
-impl fmt::Debug for GlobalObject {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GlobalObject")
-            .field("members", &self.members.len())
-            .field("natives", &self.natives.names().count())
-            .finish()
     }
 }
 
@@ -400,7 +201,7 @@ impl EngineCore {
         let mut machine = self.machine();
         machine
             .run_context_traced(&top_level, None, &[])
-            .map_err(|unwind| CoreError::Run(unwind.fault()))
+            .map_err(CoreError::Run)
     }
 
     /// The block `source` compiles to, from the cache when it is there.
@@ -477,7 +278,8 @@ impl EngineCore {
     ///
     /// # Errors
     ///
-    /// [`RetainError::Stale`] when the id names no held value.
+    /// [`CoreError::Retained`] with [`RetainError::Stale`] when the id names no
+    /// held value.
     pub fn value(&self, id: RetainedId) -> Result<Variant, CoreError> {
         let value = self.retained.borrow().value(id)?.clone();
         Ok(value)
@@ -502,17 +304,29 @@ impl EngineCore {
 
     /// Reads the member `name` of the object `id` names.
     ///
-    /// A member that is not there is [`ObjectError::MemberNotFound`], and a
-    /// member that holds nothing is the empty variant: the two are different
-    /// answers and the caller sees which it got.
+    /// `None` is a member that is not there, and `Some` is the value it holds —
+    /// the empty value included, because a member that holds nothing is still a
+    /// member. The read asks for the member it names, so an object that answers
+    /// an absent name with an empty value still reports the absence instead of
+    /// hiding it.
     ///
     /// # Errors
     ///
     /// [`CoreError::Retained`] when the id names no object, and
     /// [`CoreError::Object`] when the read is refused.
-    pub fn member_read(&self, id: RetainedId, name: &TjsString) -> Result<Variant, CoreError> {
+    pub fn member_read(
+        &self,
+        id: RetainedId,
+        name: &TjsString,
+    ) -> Result<Option<Variant>, CoreError> {
         let (object, objthis) = self.object(id)?;
-        Ok(object.prop_get(name, MemberFlags::NONE, objthis.as_deref())?)
+        match object.prop_get(name, MemberFlags::MUST_EXIST, objthis.as_deref()) {
+            Ok(value) => Ok(Some(value)),
+            // the member is not there, which is the read's answer and not a
+            // failure of the object
+            Err(ObjectError::MemberMustExist | ObjectError::MemberNotFound) => Ok(None),
+            Err(error) => Err(CoreError::Object(error)),
+        }
     }
 
     /// Writes `value` to the member `name` of the object `id` names, creating
@@ -587,11 +401,7 @@ impl EngineCore {
     ///
     /// [`CoreError::Retained`] when the id names no object, and
     /// [`CoreError::Object`] when the question is refused.
-    pub fn is_instance_of(
-        &self,
-        id: RetainedId,
-        class: &TjsString,
-    ) -> Result<bool, CoreError> {
+    pub fn is_instance_of(&self, id: RetainedId, class: &TjsString) -> Result<bool, CoreError> {
         let (object, objthis) = self.object(id)?;
         Ok(object.is_instance_of(class, objthis.as_deref())?)
     }
@@ -611,18 +421,15 @@ impl EngineCore {
     ///
     /// A value whose call is code runs it in this engine's scope, with the
     /// receiver the value carries; any other value is invoked through the object
-    /// model. A value that is not an object, and the null object, are not
-    /// callable.
+    /// model. A value that carries no receiver is called with itself as one,
+    /// which is the rule a call handed no receiver follows. A value that is not
+    /// an object, and the null object, are not callable.
     ///
     /// # Errors
     ///
     /// [`CoreError::Retained`] when the id names no held value, and
     /// [`CoreError::Run`] when the call raises or the value cannot be invoked.
-    pub fn call_value(
-        &self,
-        id: RetainedId,
-        args: &[Variant],
-    ) -> Result<Variant, CoreError> {
+    pub fn call_value(&self, id: RetainedId, args: &[Variant]) -> Result<Variant, CoreError> {
         let closure = match self.value(id)? {
             Variant::Object(closure) => closure,
             _ => return Err(not_callable()),
@@ -630,7 +437,7 @@ impl EngineCore {
         let Some(object) = closure.object else {
             return Err(not_callable());
         };
-        let objthis = closure.objthis;
+        let receiver = closure.objthis.or_else(|| Some(Rc::clone(&object)));
         if let Some(context) = object.context() {
             // a property's context is not callable: its call is the member the
             // property stands for, and the object model serves that
@@ -639,10 +446,10 @@ impl EngineCore {
             }
             return self
                 .machine()
-                .run_context(context, objthis, args)
+                .run_context(context, receiver, args)
                 .map_err(CoreError::Run);
         }
-        Ok(object.func_call(&TjsString::new(), Some(args), objthis.as_deref())?)
+        Ok(object.func_call(&TjsString::new(), Some(args), receiver.as_deref())?)
     }
 
     /// Constructs a new object through the value `id` names, and keeps it for
@@ -654,16 +461,15 @@ impl EngineCore {
     /// [`CoreError::Run`] when a context is named instead of a class, and
     /// [`CoreError::Object`], [`CoreError::NoObject`] when the construction is
     /// refused or answers no object.
-    pub fn create_new(
-        &self,
-        id: RetainedId,
-        args: &[Variant],
-    ) -> Result<RetainedId, CoreError> {
+    pub fn create_new(&self, id: RetainedId, args: &[Variant]) -> Result<RetainedId, CoreError> {
         let (object, objthis) = self.object(id)?;
-        if object.context().is_some() {
-            // a context is not a class a script constructs: construction would
-            // run its code against an object it made, which is not a call
-            return Err(not_callable());
+        // a class constructs by running its own code in a new object, which is a
+        // different entry from a call of its code
+        if let Some(context) = object.context() {
+            let answer = context
+                .construct(&self.machine(), args)
+                .map_err(CoreError::Run)?;
+            return Ok(self.retain(answer));
         }
         let answer = object.create_new(&TjsString::new(), Some(args), objthis.as_deref())?;
         let is_object = matches!(&answer, Variant::Object(closure) if closure.object.is_some());
@@ -697,7 +503,10 @@ impl EngineCore {
     ) -> Result<Variant, CoreError> {
         let (object, objthis) = self.object(id)?;
         let objthis = objthis.as_deref();
-        let name = name.cloned().unwrap_or_default();
+        let name = match name {
+            Some(name) => name.clone(),
+            None => TjsString::new(),
+        };
         let served = object.operation(&TjsString::from(operation.name()), right, objthis)?;
         if served {
             return Ok(object.prop_get(&name, MemberFlags::IGNORE_PROPERTY, objthis)?);
@@ -735,7 +544,7 @@ impl fmt::Debug for EngineCore {
 /// The language reports it as the call's own failure rather than as a refusal of
 /// the object surface, so it is the failure a script sees.
 fn not_callable() -> CoreError {
-    CoreError::Run(Fault::Raised(super::exec::Raise::NotCallable {
-        name: TjsString::new(),
-    }))
+    CoreError::Run(super::exec::throw::Unwind::raised(
+        super::exec::Raise::NotCallable,
+    ))
 }

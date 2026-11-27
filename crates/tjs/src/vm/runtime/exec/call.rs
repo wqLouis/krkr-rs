@@ -65,37 +65,56 @@
 use std::rc::Rc;
 
 use crate::vm::codegen::context::ContextType;
-use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::natives::string::{OctetError, OctetMember, StringError, StringMember};
 use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
+use crate::vm::runtime::octet_pack::PackError;
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
 
 use super::frame::{Code, Frame};
+use super::instruction::{Argument, Arguments, Call, Name, Slot};
 use super::member::member_not_found;
+use super::throw::Unwind;
 use super::{ContextObject, Fault, Machine, Raise};
-
-/// The flag a call instruction writes before an argument that passes one
-/// register: the engine's `fatNormal`.
-const FLAG_NORMAL: i32 = 0;
-
-/// The flag that splices an array's elements: the engine's `fatExpand`.
-const FLAG_EXPAND: i32 = 1;
-
-/// The flag that splices the caller's surplus arguments: the engine's
-/// `fatUnnamedExpand`.
-const FLAG_UNNAMED_EXPAND: i32 = 2;
 
 /// The member an array answers its length with.
 const ARRAY_COUNT: &str = "count";
 
+/// The text a declared member without a call implementation raises.
+const NOT_IMPLEMENTED: &str = "Called method is not implemented";
+
 /// The class name an array carries.
 const ARRAY_CLASS: &str = "Array";
 
-/// Whether an opcode is one of the call instructions.
-pub fn handles(opcode: i32) -> bool {
-    matches!(opcode, vm::CALL | vm::CALLD | vm::CALLI | vm::NEW)
+/// The argument lists a call builds its argument list in.
+///
+/// A call takes a list and gives it back when it returns, so a call that repeats
+/// reuses one allocation. The stack is here for the same reason the frame's page
+/// stack is: a nested call needs a list of its own while the caller's is still in
+/// use, and the spread form of the call builds its list where it stands.
+#[derive(Debug, Default)]
+pub struct ArgumentStack {
+    /// The lists that are free to be handed out.
+    lists: Vec<Vec<Variant>>,
+}
+
+impl ArgumentStack {
+    /// A stack with no list.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A list to build a call's arguments in.
+    pub(super) fn take(&mut self) -> Vec<Variant> {
+        self.lists.pop().unwrap_or_default()
+    }
+
+    /// Takes a list back, emptied for the next call.
+    pub(super) fn give(&mut self, mut list: Vec<Variant>) {
+        list.clear();
+        self.lists.push(list);
+    }
 }
 
 /// Executes a call instruction.
@@ -107,61 +126,54 @@ pub fn execute(
     code: &Code,
     frame: &mut Frame,
     argv: &[Variant],
-    ip: usize,
-    opcode: i32,
-) -> Result<(), Fault> {
-    let result = operand(code, ip, 1)?;
-    let callee = operand(code, ip, 2)?;
-    // the member's name is the third operand of the two member forms, and the
-    // argument list starts after it
-    let (name, list) = match opcode {
-        vm::CALL | vm::NEW => (None, 3),
-        vm::CALLD => (Some(text_of_constant(code, ip)?), 4),
-        vm::CALLI => (Some(text_of_register(code, frame, ip)?), 4),
-        _ => return Err(Fault::Broken("a call instruction that is not one")),
+    call: &Call,
+) -> Result<(), Unwind> {
+    let mut written = machine.take_argument_list();
+    let answer = dispatch(machine, code, frame, argv, call, &mut written);
+    machine.give_argument_list(written);
+    answer
+}
+
+/// Executes one call, with `written` as the list a written argument list is
+/// built in.
+fn dispatch(
+    machine: &Machine,
+    code: &Code,
+    frame: &mut Frame,
+    argv: &[Variant],
+    call: &Call,
+    written: &mut Vec<Variant>,
+) -> Result<(), Unwind> {
+    // the member's name comes before the argument list, and a name that does not
+    // read as text is the conversion's failure rather than the callee's
+    let name = match call.named {
+        Name::None => None,
+        Name::Constant(index) => Some(text_of(code.value(index))?),
+        Name::Register(slot) => Some(text_of(frame.slot(slot))?),
     };
-    let arguments = list_of(code, frame, argv, ip, list)?;
-    let value = frame.reg(callee)?.clone();
+    let arguments = arguments_of(code, frame, argv, call.arguments, written)?;
+    let value = frame.slot(call.callee);
     // a form that names no member passes the empty name
-    let empty = TjsString::new();
-    let named = name.as_ref().unwrap_or(&empty);
+    let named = name.as_ref().unwrap_or(machine.empty_name());
     // the two member forms divert a text and a byte string to their own surface
-    let diverted = match (opcode, &value) {
-        (vm::CALLD | vm::CALLI, Variant::String(text)) => {
-            Some(string_call(text, named, &arguments)?)
-        }
-        (vm::CALLD | vm::CALLI, Variant::Octet(octet)) => {
-            Some(octet_call(octet, named, &arguments)?)
-        }
+    let diverted = match (&name, value) {
+        (Some(_), Variant::String(text)) => Some(string_call(text, named, arguments)?),
+        (Some(_), Variant::Octet(octet)) => Some(octet_call(octet, named, arguments)?),
         _ => None,
     };
     let answer = match diverted {
         Some(answer) => answer,
-        None => object_call(machine, opcode, &value, named, &arguments, frame.receiver())?,
+        None => call_value(
+            machine,
+            value,
+            named,
+            arguments,
+            frame.receiver(),
+            call.construct,
+        )?,
     };
-    if result != 0 {
-        frame.set(result, answer)?;
-    }
+    frame.store(call.result, answer);
     Ok(())
-}
-
-/// The answer a value gives a call or a construction.
-fn object_call(
-    machine: &Machine,
-    opcode: i32,
-    value: &Variant,
-    named: &TjsString,
-    arguments: &[Variant],
-    frame_receiver: Option<Rc<dyn Dispatch>>,
-) -> Result<Variant, Fault> {
-    call_value(
-        machine,
-        value,
-        named,
-        arguments,
-        frame_receiver,
-        opcode == vm::NEW,
-    )
 }
 
 /// The answer a value gives a call, with `receiver` handed over when the value
@@ -173,7 +185,7 @@ fn call_value(
     arguments: &[Variant],
     receiver: Option<Rc<dyn Dispatch>>,
     construct: bool,
-) -> Result<Variant, Fault> {
+) -> Result<Variant, Unwind> {
     let closure = as_closure(value)?;
     let object = closure.object.clone();
     // the receiver the callee is handed: the value's own, else the one the call
@@ -184,25 +196,38 @@ fn call_value(
     };
     let holder = match &object {
         Some(holder) => holder.clone(),
-        None => return Err(not_callable(Some(named))),
+        None => return Err(not_callable()),
     };
     // a member the engine cannot hold lives on the handle itself, and a named
     // call reaches it before the engine's own member surface
     if !named.is_empty()
         && let Some(member) = holder.rust_member(named)
     {
-        let none = TjsString::new();
-        return call_value(machine, &member, &none, arguments, receiver, construct);
+        let none = machine.empty_name();
+        return call_value(machine, &member, none, arguments, receiver, construct);
     }
     // a value whose call is code is run by the machine, which is the only part
     // that has a frame to run it in
     if let Some(context) = holder.context() {
         if construct {
-            // a context is not a class a script constructs: construction would
-            // run its code with an object it makes, which is not a call
-            return Err(not_callable(Some(named)));
+            // a construction makes an object and runs the class's code in it,
+            // which is not a call of the code
+            return context.construct(machine, arguments);
         }
         return script_call(machine, context, &holder, named, arguments, receiver);
+    }
+    // an object that answers a named call from its members hands the member
+    // value over here, because a call that reaches code needs this machine
+    if !construct
+        && !named.is_empty()
+        && let Some(member) = holder.func_member(named, receiver.as_deref())
+    {
+        let member = member.map_err(|error| lookup_fault(error, named))?;
+        if !matches!(&member, Variant::Object(_)) {
+            return Err(not_callable());
+        }
+        let none = machine.empty_name();
+        return call_value(machine, &member, none, arguments, receiver, construct);
     }
     let called = if construct {
         holder.create_new(named, Some(arguments), receiver.as_deref())
@@ -225,13 +250,13 @@ fn script_call(
     named: &TjsString,
     arguments: &[Variant],
     receiver: Option<Rc<dyn Dispatch>>,
-) -> Result<Variant, Fault> {
+) -> Result<Variant, Unwind> {
     // a property's context is not callable: the engine answers the invalid type
     if context.kind() == ContextType::Property {
-        return Err(not_callable(Some(named)));
+        return Err(not_callable());
     }
     if named.is_empty() {
-        return machine.call_context(context, receiver, arguments);
+        return machine.call_context_traced(context, receiver, arguments);
     }
     // the receiver a named call works on: the one the call hands over, and the
     // object the call was made on when it hands over none
@@ -244,8 +269,8 @@ fn script_call(
         .map_err(|error| lookup_fault(error, named))?;
     // the member is called with no name of its own, which is what the engine's
     // base object does once the lookup has answered
-    let none = TjsString::new();
-    call_value(machine, &member, &none, arguments, receiver, false)
+    let none = machine.empty_name();
+    call_value(machine, &member, none, arguments, receiver, false)
 }
 
 /// The answer a text gives a member call.
@@ -256,125 +281,97 @@ fn string_call(
     text: &TjsString,
     name: &TjsString,
     arguments: &[Variant],
-) -> Result<Variant, Fault> {
+) -> Result<Variant, Unwind> {
     let member = StringMember::lookup(name).ok_or_else(|| member_not_found(name))?;
     member
         .call(text, arguments)
-        .map_err(|error| string_fault(error, name, arguments))
+        .map_err(|error| string_fault(error, arguments))
 }
 
 /// The raise a text member's failure becomes.
 ///
-/// The two failures of a member's own rule — a count it does not accept and a
-/// format string that names no field — travel as the call not being served, and
-/// the raise names the member the call named.
-fn string_fault(error: StringError, name: &TjsString, arguments: &[Variant]) -> Fault {
+/// The failures of a member's own rule are the engine's own messages: a count it
+/// does not accept, a format string it cannot read, and a value it cannot
+/// convert.
+fn string_fault(error: StringError, arguments: &[Variant]) -> Unwind {
     match error {
-        StringError::ParameterCount { .. } | StringError::FormatString => {
-            Fault::Raised(Raise::NotCallable { name: name.clone() })
-        }
+        StringError::ParameterCount { .. } => Raise::ParameterCount.into(),
+        StringError::FormatString => Raise::FormatString.into(),
         StringError::Convert { parameter, error } => {
             let value = arguments.get(parameter).cloned().unwrap_or(Variant::Void);
             super::op::refused_conversion(error, &value)
         }
-        StringError::LengthOutOfRange => Fault::Raised(Raise::RangeError),
+        StringError::LengthOutOfRange => Raise::RangeError.into(),
     }
 }
 
 /// The answer a byte string gives a member call.
-fn octet_call(octet: &Octet, name: &TjsString, arguments: &[Variant]) -> Result<Variant, Fault> {
+fn octet_call(octet: &Octet, name: &TjsString, arguments: &[Variant]) -> Result<Variant, Unwind> {
     let member = OctetMember::lookup(name).ok_or_else(|| member_not_found(name))?;
     member
         .call(octet, arguments)
-        .map_err(|error| octet_fault(error, name, arguments))
+        .map_err(|error| octet_fault(error, arguments))
 }
 
 /// The raise a byte-string member's failure becomes.
 ///
 /// The format is read as a text, so a parameter of another kind is a conversion
-/// failure. The count the member does not accept and the format's own refusal
-/// travel as the call not being served, and the raise names the member.
-fn octet_fault(error: OctetError, name: &TjsString, arguments: &[Variant]) -> Fault {
+/// failure, and a template the pack rule cannot read names its own message: the
+/// engine's template failures are one message per kind of character it did not
+/// read.
+fn octet_fault(error: OctetError, arguments: &[Variant]) -> Unwind {
     match error {
         OctetError::InvalidParameter { parameter } => {
             let value = arguments.get(parameter).cloned().unwrap_or(Variant::Void);
-            Fault::Raised(Raise::Convert {
-                value: Box::new(value),
-                to: "String",
-            })
+            Unwind::raised(Raise::Convert { to: "String" }).with_value(&value)
         }
-        OctetError::ParameterCount { .. } | OctetError::Pack(_) | OctetError::Array(_) => {
-            Fault::Raised(Raise::NotCallable { name: name.clone() })
-        }
+        OctetError::ParameterCount { .. } => Raise::ParameterCount.into(),
+        OctetError::Pack(PackError::UnknownTemplate) => Raise::UnknownPackTemplate.into(),
+        OctetError::Pack(PackError::BitString) => Raise::UnknownBitString.into(),
+        OctetError::Pack(PackError::HexString) => Raise::UnknownHexString.into(),
+        OctetError::Pack(_) | OctetError::Array(_) => Raise::NotCallable.into(),
     }
 }
 
 /// The arguments a call hands its callee, in the order the instruction writes
 /// them.
-fn list_of(
+///
+/// A call that passes its caller's list through reads that list where it lies,
+/// so nothing is copied; a written list is built in `written`, which the call
+/// gives back when it returns.
+fn arguments_of<'a>(
     code: &Code,
-    frame: &mut Frame,
-    argv: &[Variant],
-    ip: usize,
-    start: usize,
-) -> Result<Vec<Variant>, Fault> {
-    let count = operand(code, ip, start)?;
-    if count == -1 {
+    frame: &Frame,
+    argv: &'a [Variant],
+    list: Arguments,
+    written: &'a mut Vec<Variant>,
+) -> Result<&'a [Variant], Unwind> {
+    let (start, count, spliced) = match list {
         // the caller's own list, unchanged
-        return Ok(argv.to_vec());
-    }
-    if count != -2 {
-        if count < 0 {
-            return Err(Fault::Broken(
-                "an argument count is neither a list nor a marker",
-            ));
-        }
-        let count = usize::try_from(count)
-            .map_err(|_| Fault::Broken("an argument count is out of range"))?;
-        let mut arguments = Vec::with_capacity(count);
-        for position in 0..count {
-            let slot = start
-                .checked_add(1)
-                .and_then(|slot| slot.checked_add(position))
-                .ok_or(Fault::Broken("an argument list is too long"))?;
-            let value = frame.reg(operand(code, ip, slot)?)?.clone();
-            arguments.push(value);
-        }
-        return Ok(arguments);
-    }
-    let pairs = operand(code, ip, start + 1)?;
-    if pairs < 0 {
-        return Err(Fault::Broken(
-            "an expanded argument list names a negative pair count",
-        ));
-    }
-    let pairs = usize::try_from(pairs)
-        .map_err(|_| Fault::Broken("an expanded argument list is too long"))?;
-    let mut arguments = Vec::new();
-    for pair in 0..pairs {
-        let slot = start + 2 + pair * 2;
-        let flag = operand(code, ip, slot)?;
-        let register = operand(code, ip, slot + 1)?;
-        match flag {
-            FLAG_NORMAL => arguments.push(frame.reg(register)?.clone()),
-            FLAG_EXPAND => splice_array(&mut arguments, frame, register)?,
-            FLAG_UNNAMED_EXPAND => splice_caller(&mut arguments, argv, code),
-            _ => {
-                return Err(Fault::Broken(
-                    "an argument flag is neither normal nor an expansion",
-                ));
-            }
+        Arguments::Caller => return Ok(argv),
+        Arguments::Listed { start, count } => (start, count, false),
+        Arguments::Expanded { start, count } => (start, count, true),
+    };
+    let entries = code.stream.entries(start, count)?;
+    written.reserve(entries.len());
+    for entry in entries {
+        match (spliced, *entry) {
+            (_, Argument::Value(slot)) => written.push(frame.slot(slot).clone()),
+            (true, Argument::Expand(slot)) => splice_array(written, frame, slot)?,
+            (true, Argument::ExpandCaller) => splice_caller(written, argv, code),
+            // a listed list is a list of registers and nothing else
+            (false, _) => return Err(Fault::Broken("a listed argument is not a register").into()),
         }
     }
-    Ok(arguments)
+    Ok(written)
 }
 
 /// Splices the elements of the array a register holds.
 ///
 /// A value that is not an array is refused, because the expansion names the
 /// array it expands rather than answering an empty list.
-fn splice_array(arguments: &mut Vec<Variant>, frame: &Frame, register: i32) -> Result<(), Fault> {
-    let value = frame.reg(register)?.clone();
+fn splice_array(arguments: &mut Vec<Variant>, frame: &Frame, slot: Slot) -> Result<(), Unwind> {
+    let value = frame.slot(slot).clone();
     let closure = as_closure(&value)?;
     let object = closure
         .object
@@ -420,32 +417,18 @@ fn splice_caller(arguments: &mut Vec<Variant>, argv: &[Variant], code: &Code) {
     }
 }
 
-/// The name a direct member call names.
-fn text_of_constant(code: &Code, ip: usize) -> Result<TjsString, Fault> {
-    let slot = operand(code, ip, 3)?;
-    let value = code.constant(slot)?;
-    value
-        .to_string()
-        .map_err(|error| super::op::refused_conversion(error, value))
-}
-
-/// The name an indirect member call names.
-fn text_of_register(code: &Code, frame: &Frame, ip: usize) -> Result<TjsString, Fault> {
-    let address = operand(code, ip, 3)?;
-    let value = frame.reg(address)?;
+/// The name a member call names, as text.
+fn text_of(value: &Variant) -> Result<TjsString, Unwind> {
     value
         .to_string()
         .map_err(|error| super::op::refused_conversion(error, value))
 }
 
 /// The object a call reaches.
-fn as_closure(value: &Variant) -> Result<&Closure, Fault> {
+fn as_closure(value: &Variant) -> Result<&Closure, Unwind> {
     match value {
         Variant::Object(closure) => Ok(closure),
-        _ => Err(Fault::Raised(Raise::Convert {
-            value: Box::new(value.clone()),
-            to: "Object",
-        })),
+        _ => Err(Unwind::raised(Raise::Convert { to: "Object" }).with_value(value)),
     }
 }
 
@@ -454,24 +437,26 @@ fn as_closure(value: &Variant) -> Result<&Closure, Fault> {
 /// A value that cannot serve a call is not a failure of the object surface but
 /// the language's own "this is not callable", so it travels as a raise a script
 /// can catch rather than as a refusal the caller cannot see.
-fn call_fault(error: ObjectError, name: Option<&TjsString>, callee: &Variant) -> Fault {
+fn call_fault(error: ObjectError, name: Option<&TjsString>, callee: &Variant) -> Unwind {
     match error {
-        ObjectError::CallNotServed => Fault::Raised(Raise::NotCallable {
-            name: name.cloned().unwrap_or_default(),
-        }),
-        ObjectError::InvalidObject => Fault::Raised(Raise::Convert {
-            value: Box::new(callee.clone()),
-            to: "Object",
-        }),
-        other => Fault::Object(other),
+        ObjectError::CallNotServed => Raise::NotCallable.into(),
+        ObjectError::ParameterCount => Raise::ParameterCount.into(),
+        ObjectError::NotImplemented => {
+            Unwind::raised(Raise::ScriptError).with_text(TjsString::from(NOT_IMPLEMENTED))
+        }
+        ObjectError::MemberNotFound | ObjectError::MemberMustExist => match name {
+            Some(name) => member_not_found(name),
+            None => Unwind::from(error),
+        },
+        ObjectError::InvalidObject => {
+            Unwind::raised(Raise::Convert { to: "Object" }).with_value(callee)
+        }
     }
 }
 
 /// The raise for a value that names no object to call.
-fn not_callable(name: Option<&TjsString>) -> Fault {
-    Fault::Raised(Raise::NotCallable {
-        name: name.cloned().unwrap_or_default(),
-    })
+fn not_callable() -> Unwind {
+    Raise::NotCallable.into()
 }
 
 /// The raise a name a call reaches answers when the lookup fails.
@@ -479,29 +464,27 @@ fn not_callable(name: Option<&TjsString>) -> Fault {
 /// A name the callee does not hold is the language's own failure, which a script
 /// can catch, and the message names the member; any other failure of the object
 /// is the object's own.
-fn lookup_fault(error: ObjectError, name: &TjsString) -> Fault {
+fn lookup_fault(error: ObjectError, name: &TjsString) -> Unwind {
     match error {
         ObjectError::MemberNotFound => member_not_found(name),
-        other => Fault::Object(other),
+        // a name the object declares as a property has no call implementation,
+        // which the engine raises rather than failing the machine
+        ObjectError::NotImplemented => {
+            Unwind::raised(Raise::ScriptError).with_text(TjsString::from(NOT_IMPLEMENTED))
+        }
+        other => Unwind::from(other),
     }
 }
 
 /// The raise for an expansion whose value is not an array.
-fn not_an_array(value: &Variant) -> Fault {
-    Fault::Raised(Raise::Convert {
-        value: Box::new(value.clone()),
-        to: "Array",
-    })
-}
-
-/// The `slot`-th operand of the instruction at `ip`.
-fn operand(code: &Code, ip: usize, slot: usize) -> Result<i32, Fault> {
-    super::operand(&code.code, ip, slot)
+fn not_an_array(value: &Variant) -> Unwind {
+    Unwind::raised(Raise::Convert { to: "Array" }).with_value(value)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::codegen::opcode::vm;
     use crate::vm::runtime::array::ArrayObject;
     use crate::vm::runtime::object::{CustomObject, Dispatch};
     use std::cell::RefCell;
@@ -679,6 +662,8 @@ mod tests {
             max_frame_count: 8,
             ..Code::default()
         }
+        .decoded()
+        .expect("the stream decodes")
     }
 
     /// A stream that stores the value at `%1` and answers what `op` stores in
@@ -696,7 +681,7 @@ mod tests {
         code: &Code,
         this: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
-    ) -> Result<Variant, Fault> {
+    ) -> Result<Variant, Unwind> {
         super::super::Machine::new().run(code, this, argv)
     }
 
@@ -928,7 +913,9 @@ mod tests {
             max_frame_count: 8,
             func_decl_unnamed_arg_array_base: 1,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let argv = [
             Variant::Integer(11),
             Variant::Integer(12),
@@ -980,11 +967,13 @@ mod tests {
             variable_reserve_count: 2,
             max_frame_count: 8,
             ..Code::default()
-        };
+        }
+        .decoded()
+        .expect("the stream decodes");
         let answer = run(&code, None, &[]);
         assert!(matches!(
             answer,
-            Err(Fault::Raised(Raise::Convert { to: "Array", .. }))
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::Convert { to: "Array" })
         ));
     }
 
@@ -1000,7 +989,7 @@ mod tests {
         let answer = run(&code, None, &[]);
         assert!(matches!(
             answer,
-            Err(Fault::Raised(Raise::NotCallable { .. }))
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::NotCallable)
         ));
     }
 
@@ -1050,18 +1039,20 @@ mod tests {
         let code = member_call(Variant::String(TjsString::from("abc")), "length", &[]);
         assert!(matches!(
             run(&code, None, &[]),
-            Err(Fault::Raised(Raise::MemberNotFound { .. }))
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::MemberNotFound)
         ));
     }
 
-    /// A text member's own count decides whether the call is served
-    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2304-2312`).
+    /// A text member's own count decides whether the call is served, and a count
+    /// it does not accept is the engine's argument-count message
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2304-2312`,
+    /// `reference/krkr2/cpp/core/tjs2/tjsError.cpp:272-273`).
     #[test]
     fn a_text_member_with_a_count_it_does_not_accept_raises() {
         let code = member_call(Variant::String(TjsString::from("abc")), "charAt", &[]);
         assert!(matches!(
             run(&code, None, &[]),
-            Err(Fault::Raised(Raise::NotCallable { .. }))
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::ParameterCount)
         ));
     }
 
@@ -1099,7 +1090,7 @@ mod tests {
         );
         assert!(matches!(
             run(&code, None, &[]),
-            Err(Fault::Raised(Raise::MemberNotFound { .. }))
+            Err(unwind) if unwind.fault() == Fault::Raised(Raise::MemberNotFound)
         ));
     }
 
@@ -1117,7 +1108,7 @@ mod tests {
             assert!(
                 matches!(
                     run(&code, None, &[]),
-                    Err(Fault::Raised(Raise::Convert { to: "Object", .. }))
+                    Err(unwind) if unwind.fault() == Fault::Raised(Raise::Convert { to: "Object" })
                 ),
                 "the instruction {opcode} diverted"
             );
@@ -1147,6 +1138,8 @@ mod tests {
             func_decl_arg_count: 1,
             ..Code::default()
         }
+        .decoded()
+        .expect("the stream decodes")
     }
 
     /// A script context is code: an unnamed call runs its body with the receiver
@@ -1220,7 +1213,9 @@ mod tests {
                 variable_reserve_count: 2,
                 max_frame_count: 1,
                 ..Code::default()
-            },
+            }
+            .decoded()
+            .expect("the stream decodes"),
             ContextType::Function,
             "m",
         ));
@@ -1291,12 +1286,12 @@ mod tests {
                 Variant::String(TjsString::from("nope")),
             ],
         );
+        let Err(unwind) = run(&code, None, &[]) else {
+            panic!("a missing member does not answer");
+        };
+        assert_eq!(unwind.fault(), Fault::Raised(Raise::MemberNotFound));
         assert!(
-            matches!(
-                run(&code, None, &[]),
-                Err(Fault::Raised(Raise::MemberNotFound { name }))
-                    if name == TjsString::from("nope")
-            ),
+            crate::vm::runtime::exec::throw::message_of(&unwind).contains("nope"),
             "the missing member raises its own name"
         );
     }
@@ -1320,7 +1315,7 @@ mod tests {
         assert!(
             matches!(
                 run(&code, None, &[]),
-                Err(Fault::Raised(Raise::NotCallable { .. }))
+                Err(unwind) if unwind.fault() == Fault::Raised(Raise::NotCallable)
             ),
             "a property is not a function"
         );
@@ -1380,15 +1375,5 @@ mod tests {
         let (called, name, _, _) = callee.seen();
         assert_eq!(called, 1, "the member value was called once");
         assert_eq!(name, "", "a member is called with no name of its own");
-    }
-
-    /// The four opcodes are the ones handled, and no others.
-    #[test]
-    fn the_four_instructions_are_the_ones_handled() {
-        for opcode in [vm::CALL, vm::CALLD, vm::CALLI, vm::NEW] {
-            assert!(handles(opcode));
-        }
-        assert!(!handles(vm::GPD));
-        assert!(!handles(vm::NOP));
     }
 }

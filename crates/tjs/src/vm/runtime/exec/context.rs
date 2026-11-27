@@ -40,21 +40,35 @@
 //! code needs a frame, the receiver as a value, and the machine that runs it.
 //! [`Dispatch::context`] is how the caller finds the context it asks about, and
 //! the machine runs the body — an unnamed call with the receiver the call hands
-//! over, and a named call as the member the name reaches. This module therefore
-//! answers no call at all, and its surface is the member store and the class
+//! over, and a named call as the member the name reaches. A construction is the
+//! machine's as well: it makes the object, runs the code in it and answers the
+//! object, which is what [`ContextObject::construct`] is. This module therefore
+//! runs no code itself, and its own surface is the member store and the class
 //! names.
+//!
+//! # The construction
+//!
+//! A class is what a construction makes an object of, so [`ContextObject::construct`]
+//! is the one entry a `new` takes on a context. The object it makes is the
+//! instance: the class's own code runs in it, which is what gives it the class
+//! names, the members the class carries and the values of the class's body, and
+//! the member the class is named after then runs in it as the constructor. A
+//! context that is not a class is not a constructor, and answers the refusal a
+//! value that cannot be constructed answers.
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 
 use crate::vm::codegen::context::ContextType;
-use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
 
 use super::Fault;
+use super::Machine;
 use super::frame::{Code, Frame};
+use super::instruction::Slot;
+use super::throw::Unwind;
 
 /// The member flags a published member carries: it is created when absent, and
 /// it is written through rather than through its property.
@@ -65,93 +79,72 @@ fn publish_flags() -> MemberFlags {
     MemberFlags::ENSURE | MemberFlags::IGNORE_PROPERTY
 }
 
-/// Whether an opcode is one of the four context instructions.
-pub fn handles(opcode: i32) -> bool {
-    matches!(opcode, vm::CHGTHIS | vm::GLOBAL | vm::ADDCI | vm::REGMEMBER)
+/// `%d = global`: the machine's global object, as a value.
+pub fn global(
+    frame: &mut Frame,
+    global: Option<&Rc<dyn Dispatch>>,
+    dst: Slot,
+) -> Result<(), Unwind> {
+    let object = match global {
+        Some(global) => global.clone(),
+        None => return Err(Fault::Broken("the machine has no global object to name").into()),
+    };
+    let value = Variant::Object(Closure {
+        object: Some(object.clone()),
+        objthis: Some(object),
+    });
+    frame.store(dst, value);
+    Ok(())
 }
 
-/// Executes a context instruction.
-///
-/// `context` is the object of the context being executed, which is what
-/// `REGMEMBER` publishes and what a class's own name is read from.
-pub fn execute(
-    code: &Code,
-    frame: &mut Frame,
-    context: Option<&ContextObject>,
-    global: Option<&Rc<dyn Dispatch>>,
-    ip: usize,
-    opcode: i32,
-) -> Result<(), Fault> {
-    match opcode {
-        vm::GLOBAL => {
-            let address = operand(code, ip, 1)?;
-            let object = match global {
-                Some(global) => global.clone(),
-                None => return Err(Fault::Broken("the machine has no global object to name")),
-            };
-            let value = Variant::Object(Closure {
-                object: Some(object.clone()),
-                objthis: Some(object),
+/// `%t`: the object a register holds, with the receiver another register names.
+pub fn change_this(frame: &mut Frame, target: Slot, receiver: Slot) -> Result<(), Unwind> {
+    let new = match frame.slot(receiver) {
+        Variant::Object(closure) => closure.object.clone(),
+        _ => None,
+    };
+    let value = frame.slot(target).clone();
+    match &value {
+        Variant::Object(closure) => {
+            let rebound = Variant::Object(Closure {
+                object: closure.object.clone(),
+                objthis: new,
             });
-            frame.set(address, value)
+            frame.store(target, rebound);
+            Ok(())
         }
-        vm::CHGTHIS => {
-            let target = operand(code, ip, 1)?;
-            let receiver = operand(code, ip, 2)?;
-            let new = match frame.reg(receiver)? {
-                Variant::Object(closure) => closure.object.clone(),
-                _ => None,
-            };
-            let value = frame.reg(target)?.clone();
-            match &value {
-                Variant::Object(closure) => {
-                    let rebound = Variant::Object(Closure {
-                        object: closure.object.clone(),
-                        objthis: new,
-                    });
-                    frame.set(target, rebound)
-                }
-                _ => Err(Fault::Raised(super::Raise::Convert {
-                    value: Box::new(value.clone()),
-                    to: "Object",
-                })),
-            }
+        _ => Err(Unwind::raised(super::Raise::Convert { to: "Object" }).with_value(&value)),
+    }
+}
+
+/// `%t.addClassName(%n)`: the class name a register holds is added to the object
+/// another register holds.
+pub fn add_class_name(frame: &mut Frame, target: Slot, name: Slot) -> Result<(), Unwind> {
+    let value = frame.slot(name).clone();
+    let named = frame.slot(target).clone();
+    let object = match &named {
+        Variant::Object(closure) => closure.object.clone(),
+        _ => None,
+    };
+    let object = match object {
+        Some(object) => object,
+        None => {
+            return Err(Unwind::raised(super::Raise::Convert { to: "Object" }).with_value(&named));
         }
-        vm::REGMEMBER => {
-            let Some(context) = context else {
-                return Err(Fault::Broken(
-                    "a member registration runs with no context object",
-                ));
-            };
-            publish(context, frame)
-        }
-        vm::ADDCI => {
-            let target = operand(code, ip, 1)?;
-            let value = frame.reg(operand(code, ip, 2)?)?.clone();
-            let named = frame.reg(target)?.clone();
-            let object = match &named {
-                Variant::Object(closure) => closure.object.clone(),
-                _ => None,
-            };
-            let object = match object {
-                Some(object) => object,
-                None => {
-                    return Err(Fault::Raised(super::Raise::Convert {
-                        value: Box::new(named),
-                        to: "Object",
-                    }));
-                }
-            };
-            // a value with no text names the empty class, which is what the
-            // engine's null string becomes
-            // a value with no text names the empty class, which is what the
-            // engine's null string becomes
-            let name = value
-                .to_string()
-                .unwrap_or_else(|_no_text| TjsString::new());
-            object.add_class_name(&name).map_err(Fault::from)
-        }
-        _ => Err(Fault::Broken("a context instruction that is not one")),
+    };
+    // a value with no text names the empty class, which is what the engine's
+    // null string becomes
+    let name = value
+        .to_string()
+        .unwrap_or_else(|_no_text| TjsString::new());
+    object.add_class_name(&name).map_err(Unwind::from)
+}
+
+/// Publishes the context's members onto the frame's receiver.
+pub fn publish_members(context: Option<&ContextObject>, frame: &mut Frame) -> Result<(), Unwind> {
+    match context {
+        Some(context) => publish(context, frame),
+        None => Err(Fault::Broken("a member registration runs with no context object").into()),
     }
 }
 
@@ -161,13 +154,13 @@ pub fn execute(
 /// whose value is an object has its receiver rebound to the destination, so a
 /// class's functions become the instance's methods. The walk ignores properties:
 /// it publishes the values, not what a property would answer.
-fn publish(context: &ContextObject, frame: &mut Frame) -> Result<(), Fault> {
+fn publish(context: &ContextObject, frame: &mut Frame) -> Result<(), Unwind> {
     let destination = match frame.receiver() {
         Some(destination) => destination,
         None => {
-            return Err(Fault::Broken(
-                "a member registration names no object to publish onto",
-            ));
+            return Err(
+                Fault::Broken("a member registration names no object to publish onto").into(),
+            );
         }
     };
     let mut failure = None;
@@ -188,9 +181,9 @@ fn publish(context: &ContextObject, frame: &mut Frame) -> Result<(), Fault> {
                 }
             }
         })
-        .map_err(Fault::from)?;
+        .map_err(Unwind::from)?;
     match failure {
-        Some(error) => Err(Fault::from(error)),
+        Some(error) => Err(Unwind::from(error)),
         None => Ok(()),
     }
 }
@@ -279,6 +272,47 @@ impl ContextObject {
         &self.members
     }
 
+    /// Constructs an instance of this class.
+    ///
+    /// A class constructs in three steps: it makes an object, runs its own code
+    /// in it, and calls the member it is named after in that object. The code is
+    /// what gives the object the class names it answers to, publishes the members
+    /// the class carries and runs the statements of the class's body; the member
+    /// the class is named after is the constructor, and it runs with the new
+    /// object as its `this`. The answer is the object the class made, whatever
+    /// the constructor answered.
+    ///
+    /// # Errors
+    ///
+    /// The refusal for a value that is not a class, and any raise the class's own
+    /// code or its constructor made.
+    pub fn construct(&self, machine: &Machine, argv: &[Variant]) -> Result<Variant, Unwind> {
+        if self.kind != ContextType::Class {
+            return Err(super::Raise::NotCallable.into());
+        }
+        let instance: Rc<dyn Dispatch> = Rc::new(CustomObject::new(Vec::new()));
+        // the class's own code, in the object it made: the class names, the
+        // members the class carries, and the statements of its body
+        machine.call_context(self, Some(instance.clone()), &[])?;
+        // the constructor is the member the class is named after, and it runs in
+        // the object the class made
+        match self.prop_get(
+            self.name(),
+            MemberFlags::IGNORE_PROPERTY,
+            Some(instance.as_ref()),
+        ) {
+            Ok(constructor) => call_constructor(machine, &constructor, &instance, argv)?,
+            // a class that declares no constructor is constructible: the object
+            // is made, and there is no code left to run
+            Err(ObjectError::MemberNotFound) => {}
+            Err(error) => return Err(error.into()),
+        }
+        Ok(Variant::Object(Closure {
+            object: Some(instance.clone()),
+            objthis: Some(instance),
+        }))
+    }
+
     /// The context a lookup of this one's members continues into.
     ///
     /// Only a class and the proxy that holds a class's super class continue into
@@ -356,7 +390,7 @@ impl Dispatch for ContextObject {
         class: &TjsString,
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
-        if class == &TjsString::from("Object") {
+        if class.eq_str("Object") {
             return Ok(true);
         }
         Ok(self.chain().iter().any(|name| name == class))
@@ -398,14 +432,46 @@ impl std::fmt::Debug for ContextObject {
     }
 }
 
-/// The `slot`-th operand of the instruction at `ip`.
-fn operand(code: &Code, ip: usize, slot: usize) -> Result<i32, Fault> {
-    super::operand(&code.code, ip, slot)
+/// Calls the constructor of a construction in the object the construction made.
+///
+/// The answer is dropped, because a construction answers the object it made and
+/// not what its constructor answered. A value that carries no code carries no
+/// constructor body either, so a member that is not a function is not a failure
+/// of the construction. A raise out of the constructor's own code does travel:
+/// it is the code's failure and not the reach's.
+fn call_constructor(
+    machine: &Machine,
+    constructor: &Variant,
+    instance: &Rc<dyn Dispatch>,
+    argv: &[Variant],
+) -> Result<(), Unwind> {
+    let Variant::Object(closure) = constructor else {
+        return Ok(());
+    };
+    let Some(object) = &closure.object else {
+        return Ok(());
+    };
+    let Some(context) = object.context() else {
+        return Ok(());
+    };
+    // a property is not code a call runs: a read of it is the value it stands for
+    if context.kind() == ContextType::Property {
+        return Ok(());
+    }
+    let receiver = closure
+        .objthis
+        .clone()
+        .unwrap_or_else(|| Rc::clone(instance));
+    // running the constructor is the construction's, and its answer is not
+    machine
+        .call_context(context, Some(receiver), argv)
+        .map(|_answer| ())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::codegen::opcode::vm;
 
     fn text(value: &str) -> TjsString {
         TjsString::from(value)
@@ -431,6 +497,8 @@ mod tests {
             max_frame_count: 4,
             ..Code::default()
         }
+        .decoded()
+        .expect("the stream decodes")
     }
 
     /// A context answers the members it publishes
@@ -605,7 +673,7 @@ mod tests {
         let mut machine = super::super::Machine::new();
         assert!(matches!(
             machine.run(&code, None, &[]),
-            Err(Fault::Broken(_))
+            Err(unwind) if unwind.fault() == Fault::Broken("the machine has no global object to name")
         ));
     }
 
@@ -662,7 +730,9 @@ mod tests {
                 code: vec![vm::REGMEMBER, vm::RET],
                 variable_reserve_count: 2,
                 ..Code::default()
-            },
+            }
+            .decoded()
+            .expect("the stream decodes"),
             ContextType::Class,
             "C",
         ));
@@ -702,7 +772,9 @@ mod tests {
                 code: vec![vm::REGMEMBER, vm::RET],
                 variable_reserve_count: 2,
                 ..Code::default()
-            },
+            }
+            .decoded()
+            .expect("the stream decodes"),
             ContextType::Class,
             "C",
         ));
@@ -784,15 +856,5 @@ mod tests {
             vec!["Child".to_string(), "Alias".to_string(), "Base".to_string()]
         );
         assert_eq!(child.is_instance_of(&text("Alias"), None), Ok(true));
-    }
-
-    /// The four opcodes are the ones handled, and no others.
-    #[test]
-    fn the_four_instructions_are_the_ones_handled() {
-        for opcode in [vm::CHGTHIS, vm::GLOBAL, vm::ADDCI, vm::REGMEMBER] {
-            assert!(handles(opcode));
-        }
-        assert!(!handles(vm::CALL));
-        assert!(!handles(vm::NOP));
     }
 }

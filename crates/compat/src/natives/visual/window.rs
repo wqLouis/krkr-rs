@@ -347,7 +347,7 @@ extern "C" fn window_ctor(
     // reached when that member's `new` raises (e.g. a host removed the
     // member). A failed constructor destroys the half-built instance, so
     // `window_destroy` still removes the scene window and its registry entry.
-    match ScriptScope::new(resolved.engine(), &ctx).eval(
+    match ScriptScope::new(resolved.engine(), &ctx).evaluate(
         "new Window.BasicDrawDevice()",
         "Window",
         ScriptOptions::default(),
@@ -2235,7 +2235,7 @@ extern "C" fn window_menu_get(
         // `TVPCreateMenuItemObject(objthis)`: the first argument is the action
         // owner and the second is the window (reference
         // `reference/cpp/core/visual/MenuItemIntf.cpp:559-573`).
-        let object = match ScriptScope::new(host, &ctx).eval(
+        let object = match ScriptScope::new(host, &ctx).evaluate(
             "new MenuItem(this, this)",
             "Window.menu",
             ScriptOptions {

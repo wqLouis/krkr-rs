@@ -37,6 +37,10 @@ use super::number::{self, Number, NumberError};
 pub struct TjsString {
     /// The code units, shared between the values that hold the same text.
     units: Arc<[u16]>,
+    /// The member hash of the units, computed with them: the units are
+    /// immutable, so the value is a property of the text and every value that
+    /// shares the units shares the hash.
+    hash: u32,
 }
 
 impl TjsString {
@@ -54,9 +58,7 @@ impl TjsString {
             .iter()
             .position(|&unit| unit == 0)
             .unwrap_or(units.len());
-        Self {
-            units: Arc::from_iter(units[..end].iter().copied()),
-        }
+        Self::from_shared(Arc::from_iter(units[..end].iter().copied()))
     }
 
     /// The string of the given code units, cut at the first zero, taking the
@@ -68,9 +70,13 @@ impl TjsString {
         if let Some(end) = units.iter().position(|&unit| unit == 0) {
             units.truncate(end);
         }
-        Self {
-            units: Arc::from(units),
-        }
+        Self::from_shared(Arc::from(units))
+    }
+
+    /// The value of units the caller already owns.
+    fn from_shared(units: Arc<[u16]>) -> Self {
+        let hash = hash_units(&units);
+        Self { units, hash }
     }
 
     /// The number of code units.
@@ -88,6 +94,32 @@ impl TjsString {
         &self.units
     }
 
+    /// Whether the value is the text `text`, compared by code unit.
+    ///
+    /// A constant written as UTF-8 is compared with the value's units
+    /// directly, so a member lookup does not encode the constant again.
+    pub fn eq_str(&self, text: &str) -> bool {
+        let bytes = text.as_bytes();
+        if text.is_ascii() {
+            return self.units.len() == bytes.len()
+                && self
+                    .units
+                    .iter()
+                    .zip(bytes)
+                    .all(|(&unit, &byte)| unit == u16::from(byte));
+        }
+        let mut units = self.units.iter().copied();
+        for character in text.chars() {
+            let mut encoded = [0u16; 2];
+            for &unit in character.encode_utf16(&mut encoded).iter() {
+                if units.next() != Some(unit) {
+                    return false;
+                }
+            }
+        }
+        units.next().is_none()
+    }
+
     /// The text with the text of `other` after it.
     pub fn concat(&self, other: &Self) -> Self {
         if other.is_empty() {
@@ -98,29 +130,39 @@ impl TjsString {
         }
         // neither text holds a zero, so the joined text does not either, and
         // the length is known: the joined text is written once
-        Self {
-            units: Arc::from_iter(self.units.iter().chain(other.units.iter()).copied()),
-        }
+        Self::from_shared(Arc::from_iter(
+            self.units.iter().chain(other.units.iter()).copied(),
+        ))
     }
 
     /// The hash an object's member table buckets this text by.
     ///
     /// The value is the one an object's member lookup computes: a hash over
     /// the code units, and zero for the empty value.
+    #[inline]
     pub fn member_hash(&self) -> u32 {
-        if self.units.is_empty() {
-            return 0;
+        self.hash
+    }
+
+    /// The decimal text of an integer, written into a stack buffer.
+    fn from_integer(value: i64) -> Self {
+        let negative = value < 0;
+        let mut magnitude = value.unsigned_abs();
+        let mut buffer = [0u16; 20];
+        let mut at = buffer.len();
+        loop {
+            at -= 1;
+            buffer[at] = u16::from(b'0') + (magnitude % 10) as u16;
+            magnitude /= 10;
+            if magnitude == 0 {
+                break;
+            }
         }
-        let mut hash: u32 = 0;
-        for &unit in self.units.iter() {
-            hash = hash.wrapping_add(u32::from(unit));
-            hash = hash.wrapping_add(hash.wrapping_shl(10));
-            hash ^= hash >> 6;
+        if negative {
+            at -= 1;
+            buffer[at] = u16::from(b'-');
         }
-        hash = hash.wrapping_add(hash.wrapping_shl(3));
-        hash ^= hash >> 11;
-        hash = hash.wrapping_add(hash.wrapping_shl(15));
-        if hash == 0 { u32::MAX } else { hash }
+        Self::from_units(&buffer[at..])
     }
 
     /// The text as a script's escape rules write it.
@@ -217,9 +259,9 @@ impl From<&str> for TjsString {
             .position(|&byte| byte == 0 || !byte.is_ascii())
             .unwrap_or(text.len());
         if end == text.len() || text.as_bytes()[end] == 0 {
-            return Self {
-                units: Arc::from_iter(text.as_bytes()[..end].iter().copied().map(u16::from)),
-            };
+            return Self::from_shared(Arc::from_iter(
+                text.as_bytes()[..end].iter().copied().map(u16::from),
+            ));
         }
         // a character of four bytes is two code units and every other
         // character is no wider than the bytes it takes, so the byte length
@@ -230,9 +272,7 @@ impl From<&str> for TjsString {
         };
         let mut units: Vec<u16> = Vec::with_capacity(text.len());
         units.extend(text.encode_utf16());
-        Self {
-            units: Arc::from_iter(units.iter().copied()),
-        }
+        Self::from_shared(Arc::from_iter(units.iter().copied()))
     }
 }
 
@@ -256,13 +296,16 @@ impl From<Vec<u16>> for TjsString {
 
 impl From<&Number> for TjsString {
     fn from(number: &Number) -> Self {
-        Self::from(number.to_string())
+        match number {
+            Number::Integer(value) => Self::from_integer(*value),
+            Number::Real(_) => Self::from(number.to_string()),
+        }
     }
 }
 
 impl PartialEq for TjsString {
     fn eq(&self, other: &Self) -> bool {
-        self.units == other.units
+        self.as_utf16() == other.as_utf16()
     }
 }
 
@@ -311,6 +354,23 @@ impl fmt::Debug for TjsString {
         }
         formatter.write_str("\"")
     }
+}
+
+/// The member hash of a sequence of code units.
+fn hash_units(units: &[u16]) -> u32 {
+    if units.is_empty() {
+        return 0;
+    }
+    let mut hash: u32 = 0;
+    for &unit in units {
+        hash = hash.wrapping_add(u32::from(unit));
+        hash = hash.wrapping_add(hash.wrapping_shl(10));
+        hash ^= hash >> 6;
+    }
+    hash = hash.wrapping_add(hash.wrapping_shl(3));
+    hash ^= hash >> 11;
+    hash = hash.wrapping_add(hash.wrapping_shl(15));
+    if hash == 0 { u32::MAX } else { hash }
 }
 
 /// The escape a named control code unit is written as, if it has one.
@@ -399,6 +459,40 @@ mod tests {
         assert_eq!(TjsString::from("a").member_hash(), 3_392_050_242);
         assert_eq!(TjsString::from("abc").member_hash(), 3_977_453_403);
         assert_eq!(TjsString::from("length").member_hash(), 2_508_072_249);
+    }
+
+    // reference/cpp/core/tjs2/tjsVariantString.cpp:500-516
+    #[test]
+    fn a_utf8_constant_compares_with_the_same_units() {
+        let outside_the_basic_plane = TjsString::from("\u{29e3d}");
+        assert!(outside_the_basic_plane.eq_str("\u{29e3d}"));
+        assert!(!outside_the_basic_plane.eq_str("\u{29e3e}"));
+        assert!(!outside_the_basic_plane.eq_str(""));
+        assert!(TjsString::new().eq_str(""));
+        assert!(!TjsString::new().eq_str("a"));
+        assert!(TjsString::from("length").eq_str("length"));
+        assert!(!TjsString::from("length").eq_str("lengths"));
+    }
+
+    // reference/cpp/core/tjs2/tjsHashSearch.h:57-78
+    #[test]
+    fn the_hash_and_the_units_agree() {
+        let from_text = TjsString::from("\u{29e3d}");
+        let from_units = TjsString::from(vec![0xd867u16, 0xde3d]);
+        assert_eq!(from_text, from_units);
+        assert_eq!(from_text.member_hash(), from_units.member_hash());
+        assert_ne!(from_text.member_hash(), TjsString::new().member_hash());
+    }
+
+    // reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:213-216
+    #[test]
+    fn an_integer_writes_its_decimal_units() {
+        for value in [0, 1, -1, 12, -12, i64::MAX, i64::MIN] {
+            assert_eq!(
+                TjsString::from(&Number::Integer(value)),
+                TjsString::from(value.to_string())
+            );
+        }
     }
 
     // reference/cpp/core/tjs2/tjsHashSearch.h:57-78

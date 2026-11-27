@@ -3,38 +3,37 @@
 //! The entries below are the ones a host calls instead of the engine's own
 //! execute and evaluate entries: each compiles the text with the front end,
 //! builds the block the image describes, and runs the block's top-level
-//! context against the engine's global object. The object that context
-//! reaches is a [`CHandle`], so a script that creates an engine object, reads
-//! its members and calls it is running in the Rust executor while the values
-//! are still the engine's.
+//! context against the scope's global object. The object that context reaches
+//! is the scope's [`GlobalObject`](crate::vm::runtime::global::GlobalObject), so
+//! a script that creates an engine object, reads its members and calls it is
+//! running in the Rust executor while the values are still the engine's.
 //!
 //! # The receiver and the global
 //!
-//! The top-level call's receiver is the engine's global object itself, which is
-//! also the machine's global. A top-level script runs in the global scope, so a
-//! `var` the script declares and a `function` it declares are both properties
-//! of that one object and outlive the call. The block's top-level context is
-//! the code's own structure; it does not receive the script's members. A caller
-//! that supplies a context runs the same top-level context with that object as
-//! its receiver, which is the execution context the compatibility surface
-//! exposes.
+//! The top-level call's receiver is the scope's global object, which is also the
+//! machine's global. A top-level script runs in the global scope, so a `var` the
+//! script declares and a `function` it declares are both members of that one
+//! object and outlive the call. The block's top-level context is the code's own
+//! structure; it does not receive the script's members. A caller that supplies a
+//! context runs the same top-level context with that object as its receiver,
+//! which is the execution context the compatibility surface exposes.
 //!
-//! # Why every handle carries a store
+//! # The global object and the engine's
 //!
-//! The engine's global can hold a scalar, an octet and an engine object, but it
-//! cannot hold a context object of the Rust object model. A declared function is
-//! exactly such an object. Every handle therefore carries a
-//! [`GlobalMembers`] store: a write of a Rust-owned object stays there, while
-//! every value the engine can hold is written to the engine's object. A read
-//! checks the store first and then the engine, so the script sees one object in
-//! both cases. The global store is shared across calls, and a context store is
-//! keyed by the context object's retained id in that same scope, which is what
-//! keeps a function declared by one script callable by the next in either one.
+//! The scope keeps one global object, so a member one call declares is there
+//! for the next: the object owns the members and the class objects and asks the
+//! engine's global object as one source for a name it does not hold, which is
+//! where the resolution order is written ([`crate::vm::runtime::global`]). A
+//! declared function is a member of that object, so it is callable by the call
+//! that follows whether the object it was declared on is the global object or a
+//! context's.
 
 use std::rc::Rc;
 
-use crate::vm::runtime::bridge::{CHandle, SharedGlobals, global_members};
+use crate::vm::runtime::bridge::CHandle;
+use crate::vm::runtime::bridge::{SharedGlobals, global_members, global_object, scope_global};
 use crate::vm::runtime::exec::build::{Block, BuildError};
+use crate::vm::runtime::exec::throw::Unwind;
 use crate::vm::runtime::exec::throw::{self, FrameTrace};
 use crate::vm::runtime::exec::{Fault, Machine};
 use crate::vm::runtime::object::{Dispatch, ObjectError};
@@ -59,7 +58,7 @@ pub enum EngineError {
     /// The block's top-level code raised or reached an instruction this
     /// interpreter does not run.
     #[error(transparent)]
-    Run(#[from] Fault),
+    Run(#[from] Unwind),
     /// An object the code reached refused the entry.
     #[error(transparent)]
     Object(#[from] ObjectError),
@@ -145,7 +144,9 @@ impl ScriptFailure {
     pub fn message(&self) -> String {
         match self.error.as_ref() {
             EngineError::Compile(error) => error.message().to_string(),
-            EngineError::Run(Fault::Raised(raise)) => throw::message_of(raise),
+            EngineError::Run(unwind) if matches!(unwind.fault(), Fault::Raised(_)) => {
+                throw::message_of(unwind)
+            }
             EngineError::Run(_) => String::from("script exception"),
             EngineError::Build(error) => error.to_string(),
             EngineError::Object(error) => error.to_string(),
@@ -385,7 +386,7 @@ pub fn eval_with_members_options(
     run_block(engine, block, globals, name, expression, options)
 }
 
-/// Runs a built block's top-level context against the engine's global object.
+/// Runs a built block's top-level context against the scope's global object.
 fn run_block(
     engine: Rc<Tjs2Engine>,
     block: Block,
@@ -394,18 +395,19 @@ fn run_block(
     source: &str,
     options: ScriptOptions,
 ) -> Result<Variant, ScriptFailure> {
-    let global_id = engine.global_object().map_err(|error| {
-        ScriptFailure::before_run(
-            EngineError::Global(error),
-            name,
-            source,
-            options.lineofs,
-            None,
-        )
-    })?;
-    let global: Rc<dyn Dispatch> = Rc::new(
-        CHandle::with_members(Rc::clone(&engine), global_id, Rc::clone(&globals)).map_err(
-            |error| {
+    let global = match scope_global(&globals) {
+        Some(global) => global,
+        None => {
+            let value = engine.global_object().map_err(|error| {
+                ScriptFailure::before_run(
+                    EngineError::Global(error),
+                    name,
+                    source,
+                    options.lineofs,
+                    None,
+                )
+            })?;
+            global_object(&engine, &globals, value).map_err(|error| {
                 ScriptFailure::before_run(
                     EngineError::Object(error),
                     name,
@@ -413,9 +415,10 @@ fn run_block(
                     options.lineofs,
                     None,
                 )
-            },
-        )?,
-    );
+            })?
+        }
+    };
+    let global: Rc<dyn Dispatch> = global;
     let top_level = block
         .top_level()
         .ok_or(BuildError::TopLevel { index: -1 })
@@ -465,7 +468,7 @@ fn run_block(
             let trace = unwind.trace().to_vec();
             let line = failure_line(&block, source, &trace);
             Err(ScriptFailure {
-                error: Box::new(EngineError::Run(unwind.fault())),
+                error: Box::new(EngineError::Run(unwind)),
                 trace,
                 name: name.to_string(),
                 line,

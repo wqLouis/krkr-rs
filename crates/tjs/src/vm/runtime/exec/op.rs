@@ -29,9 +29,9 @@
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-use super::Fault;
 use super::Raise;
 use super::decode::Operator;
+use super::throw::Unwind;
 use crate::vm::runtime::number::Number;
 use crate::vm::runtime::object::Dispatch;
 use crate::vm::runtime::string::TjsString;
@@ -41,8 +41,8 @@ use crate::vm::runtime::variant::{Variant, VariantError};
 ///
 /// Every rule here is the language's; a pair the language has no operation for
 /// is a [`Raise`], never a fabricated value.
-pub fn apply(operator: Operator, left: &Variant, right: &Variant) -> Result<Variant, Fault> {
-    let compound = |result: Result<Variant, VariantError>| -> Result<Variant, Fault> {
+pub fn apply(operator: Operator, left: &Variant, right: &Variant) -> Result<Variant, Unwind> {
+    let compound = |result: Result<Variant, VariantError>| -> Result<Variant, Unwind> {
         result.map_err(|error| raised(error, left, right, operator))
     };
     match operator {
@@ -73,28 +73,28 @@ pub fn apply(operator: Operator, left: &Variant, right: &Variant) -> Result<Vari
 ///
 /// The step instructions convert their operand the way the arithmetic does, and
 /// an octet or an object has no increment.
-pub fn step_up(value: &Variant) -> Result<Variant, Fault> {
+pub fn step_up(value: &Variant) -> Result<Variant, Unwind> {
     value
         .increment()
         .map_err(|error| refused_conversion(error, value))
 }
 
 /// The value of `self - 1`.
-pub fn step_down(value: &Variant) -> Result<Variant, Fault> {
+pub fn step_down(value: &Variant) -> Result<Variant, Unwind> {
     value
         .decrement()
         .map_err(|error| refused_conversion(error, value))
 }
 
 /// The value of `~self`.
-pub fn complement(value: &Variant) -> Result<Variant, Fault> {
+pub fn complement(value: &Variant) -> Result<Variant, Unwind> {
     value
         .complement()
         .map_err(|error| refused_conversion(error, value))
 }
 
 /// The value of `-self`.
-pub fn negate(value: &Variant) -> Result<Variant, Fault> {
+pub fn negate(value: &Variant) -> Result<Variant, Unwind> {
     value
         .negate()
         .map_err(|error| refused_conversion(error, value))
@@ -105,7 +105,7 @@ pub fn negate(value: &Variant) -> Result<Variant, Fault> {
 ///
 /// The empty variant reads as the integer zero and a text that is not a number
 /// reads as zero; a value with no numeric conversion at all is refused.
-pub fn to_number(value: &Variant) -> Result<Variant, Fault> {
+pub fn to_number(value: &Variant) -> Result<Variant, Unwind> {
     match value {
         Variant::Integer(_) | Variant::Real(_) => Ok(value.clone()),
         _ => match value.to_number() {
@@ -121,7 +121,7 @@ pub fn to_number(value: &Variant) -> Result<Variant, Fault> {
 /// The empty variant and a null object are false; an object is true when it has
 /// one; a text is true when it reads as a number that is not zero; an octet is
 /// true when it holds a byte; a number is true when it is not zero.
-pub fn truth(value: &Variant) -> Result<bool, Fault> {
+pub fn truth(value: &Variant) -> Result<bool, Unwind> {
     match value {
         Variant::Void => Ok(false),
         Variant::Integer(number) => Ok(*number != 0),
@@ -138,7 +138,7 @@ pub fn truth(value: &Variant) -> Result<bool, Fault> {
 /// The truth of a value as the `!` operator answers it.
 ///
 /// The answer is an integer, not a separate boolean kind.
-pub fn logical_not(value: &Variant) -> Result<Variant, Fault> {
+pub fn logical_not(value: &Variant) -> Result<Variant, Unwind> {
     Ok(Variant::Integer(i64::from(!truth(value)?)))
 }
 
@@ -183,7 +183,7 @@ fn same_handle(left: &Option<Rc<dyn Dispatch>>, right: &Option<Rc<dyn Dispatch>>
 /// The variant's own right shift is arithmetic, so this one is not its call. The
 /// count is the low six bits, which is what the hardware does with a shift count
 /// and what the variant's own shifts do.
-pub fn logical_shift_right(left: &Variant, right: &Variant) -> Result<Variant, Fault> {
+pub fn logical_shift_right(left: &Variant, right: &Variant) -> Result<Variant, Unwind> {
     let value = left
         .to_integer()
         .map_err(|error| refused_conversion(error, left))?;
@@ -201,12 +201,12 @@ pub fn logical_shift_right(left: &Variant, right: &Variant) -> Result<Variant, F
 ///
 /// The comparison answers whether the *other* operand is greater, which is the
 /// same question as whether this one is less.
-pub fn less(left: &Variant, right: &Variant) -> Result<bool, Fault> {
+pub fn less(left: &Variant, right: &Variant) -> Result<bool, Unwind> {
     ordering(left, right, Ordering::Less)
 }
 
 /// The comparison the greater-than instruction asks for.
-pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
+pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Unwind> {
     ordering(left, right, Ordering::Greater)
 }
 
@@ -214,7 +214,7 @@ pub fn greater(left: &Variant, right: &Variant) -> Result<bool, Fault> {
 ///
 /// An unordered pair — one operand is a not-a-number — is false for both
 /// operators, and a value with no ordering at all is refused.
-fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, Fault> {
+fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, Unwind> {
     match left.compare(right) {
         Ok(Some(order)) => Ok(order == wanted),
         Ok(None) => Ok(false),
@@ -226,7 +226,7 @@ fn ordering(left: &Variant, right: &Variant, wanted: Ordering) -> Result<bool, F
 ///
 /// A value that has no text is refused; an empty text answers zero, which is the
 /// terminator an empty text holds.
-pub fn character_code(value: &Variant) -> Result<Variant, Fault> {
+pub fn character_code(value: &Variant) -> Result<Variant, Unwind> {
     let text = value
         .to_string()
         .map_err(|error| refused_conversion(error, value))?;
@@ -238,7 +238,7 @@ pub fn character_code(value: &Variant) -> Result<Variant, Fault> {
 ///
 /// The code is truncated to a unit, and a code of zero is the empty text because
 /// a text ends at its first zero unit.
-pub fn character_from(value: &Variant) -> Result<Variant, Fault> {
+pub fn character_from(value: &Variant) -> Result<Variant, Unwind> {
     let code = value
         .to_integer()
         .map_err(|error| refused_conversion(error, value))?;
@@ -248,7 +248,7 @@ pub fn character_from(value: &Variant) -> Result<Variant, Fault> {
 }
 
 /// The class name a value names, for `instanceof`.
-pub fn class_name(value: &Variant) -> Result<TjsString, Fault> {
+pub fn class_name(value: &Variant) -> Result<TjsString, Unwind> {
     value
         .to_string()
         .map_err(|error| refused_conversion(error, value))
@@ -256,26 +256,24 @@ pub fn class_name(value: &Variant) -> Result<TjsString, Fault> {
 
 /// A variant failure as a raise, naming the operand the operator converts
 /// first.
-fn raised(error: VariantError, left: &Variant, right: &Variant, operator: Operator) -> Fault {
+fn raised(error: VariantError, left: &Variant, right: &Variant, operator: Operator) -> Unwind {
     let operand = if operator.right_first() { right } else { left };
     refused_conversion(error, operand)
 }
 
 /// A variant failure as a raise, naming the value it was asked of.
-pub fn refused_conversion(error: VariantError, value: &Variant) -> Fault {
+pub fn refused_conversion(error: VariantError, value: &Variant) -> Unwind {
     match error {
-        VariantError::Convert { to } => Fault::Raised(Raise::Convert {
-            value: Box::new(value.clone()),
-            to,
-        }),
-        VariantError::DivideByZero => Fault::Raised(Raise::DivideByZero),
-        VariantError::IntegerOutOfRange => Fault::Raised(Raise::IntegerOutOfRange),
+        VariantError::Convert { to } => Unwind::raised(Raise::Convert { to }).with_value(value),
+        VariantError::DivideByZero => Unwind::raised(Raise::DivideByZero),
+        VariantError::IntegerOutOfRange => Unwind::raised(Raise::IntegerOutOfRange),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::runtime::exec::Fault;
     use crate::vm::runtime::object::CustomObject;
     use crate::vm::runtime::octet::Octet;
     use crate::vm::runtime::variant::Closure;
@@ -305,7 +303,7 @@ mod tests {
     /// A variant has no equality of its own, so the comparison is the strict
     /// one, which is equality over every kind and every handle.
     #[track_caller]
-    fn is(actual: Result<Variant, Fault>, expected: Variant) {
+    fn is(actual: Result<Variant, Unwind>, expected: Variant) {
         match actual {
             Ok(value) => assert!(
                 discern_equals(&value, &expected),
@@ -318,7 +316,7 @@ mod tests {
     /// The operator answers the expected value, and the reason is the message of
     /// a failure.
     #[track_caller]
-    fn is_because(actual: Result<Variant, Fault>, expected: Variant, why: &str) {
+    fn is_because(actual: Result<Variant, Unwind>, expected: Variant, why: &str) {
         match actual {
             Ok(value) => assert!(
                 discern_equals(&value, &expected),
@@ -330,11 +328,10 @@ mod tests {
 
     /// The operator raised, and the raise is the expected one.
     #[track_caller]
-    fn raises(actual: Result<Variant, Fault>, expected: Raise) {
+    fn raises(actual: Result<Variant, Unwind>, expected: Raise) {
         match actual {
             Ok(value) => panic!("expected {expected:?}, got the value {value:?}"),
-            Err(Fault::Raised(raise)) => assert_eq!(raise, expected),
-            Err(other) => panic!("expected {expected:?}, got {other:?}"),
+            Err(unwind) => assert_eq!(unwind.fault(), Fault::Raised(expected)),
         }
     }
 
@@ -342,26 +339,24 @@ mod tests {
     /// (`reference/krkr2/cpp/core/tjs2/tjsVariant.h:911-931`, `operator bool`).
     #[test]
     fn the_truth_of_a_value_is_the_engines() {
-        assert_eq!(truth(&Variant::Void), Ok(false));
-        assert_eq!(truth(&integer(0)), Ok(false));
-        assert_eq!(truth(&integer(1)), Ok(true));
-        assert_eq!(truth(&integer(-1)), Ok(true));
-        assert_eq!(truth(&Variant::Real(0.0)), Ok(false));
-        assert_eq!(truth(&Variant::Real(-0.0)), Ok(false));
-        assert_eq!(truth(&Variant::Real(0.5)), Ok(true));
-        assert_eq!(truth(&text("")), Ok(false));
-        assert_eq!(truth(&text("0")), Ok(false));
-        assert_eq!(truth(&text("2")), Ok(true));
-        assert_eq!(truth(&text("abc")), Ok(false));
-        assert_eq!(truth(&Variant::Octet(Octet::new())), Ok(false));
-        assert_eq!(
-            truth(&Variant::Object(Closure::null())),
-            Ok(false),
+        assert!(!truth(&Variant::Void).expect("a truth"));
+        assert!(!truth(&integer(0)).expect("a truth"));
+        assert!(truth(&integer(1)).expect("a truth"));
+        assert!(truth(&integer(-1)).expect("a truth"));
+        assert!(!truth(&Variant::Real(0.0)).expect("a truth"));
+        assert!(!truth(&Variant::Real(-0.0)).expect("a truth"));
+        assert!(truth(&Variant::Real(0.5)).expect("a truth"));
+        assert!(!truth(&text("")).expect("a truth"));
+        assert!(!truth(&text("0")).expect("a truth"));
+        assert!(truth(&text("2")).expect("a truth"));
+        assert!(!truth(&text("abc")).expect("a truth"));
+        assert!(!truth(&Variant::Octet(Octet::new())).expect("a truth"));
+        assert!(
+            !truth(&Variant::Object(Closure::null())).expect("a truth"),
             "a null object is false"
         );
-        assert_eq!(
-            truth(&object_value()),
-            Ok(true),
+        assert!(
+            truth(&object_value()).expect("a truth"),
             "an object with one is true"
         );
     }
@@ -374,7 +369,7 @@ mod tests {
             object: Some(an_object()),
             objthis: None,
         });
-        assert_eq!(truth(&value), Ok(true));
+        assert!(truth(&value).expect("a truth"));
     }
 
     /// The strict comparison holds two values of one kind, and of one kind only
@@ -523,10 +518,17 @@ mod tests {
     #[test]
     fn a_refused_conversion_carries_the_value() {
         match apply(Operator::BAnd, &object_value(), &integer(1)) {
-            Err(Fault::Raised(Raise::Convert { value, .. })) => {
-                assert!(matches!(*value, Variant::Object(_)), "the value travels");
+            Err(unwind) => {
+                assert!(
+                    matches!(unwind.fault(), Fault::Raised(Raise::Convert { .. })),
+                    "the failure is a conversion raise"
+                );
+                assert!(
+                    matches!(unwind.value(), Some(Variant::Object(_))),
+                    "the value travels"
+                );
             }
-            other => panic!("expected a conversion raise, got {other:?}"),
+            Ok(value) => panic!("expected a conversion raise, got the value {value:?}"),
         }
     }
 
@@ -535,19 +537,22 @@ mod tests {
     #[test]
     fn the_remainder_names_the_divisor() {
         match apply(Operator::Mod, &integer(1), &object_value()) {
-            Err(Fault::Raised(Raise::Convert { value, .. })) => {
-                assert!(matches!(*value, Variant::Object(_)), "the divisor is named");
+            Err(unwind) => {
+                assert!(
+                    matches!(unwind.value(), Some(Variant::Object(_))),
+                    "the divisor is named"
+                );
             }
-            other => panic!("expected a conversion raise, got {other:?}"),
+            Ok(value) => panic!("expected a conversion raise, got the value {value:?}"),
         }
         match apply(Operator::BAnd, &object_value(), &integer(1)) {
-            Err(Fault::Raised(Raise::Convert { value, .. })) => {
+            Err(unwind) => {
                 assert!(
-                    matches!(*value, Variant::Object(_)),
+                    matches!(unwind.value(), Some(Variant::Object(_))),
                     "the dividend is named"
                 );
             }
-            other => panic!("expected a conversion raise, got {other:?}"),
+            Ok(value) => panic!("expected a conversion raise, got the value {value:?}"),
         }
     }
 

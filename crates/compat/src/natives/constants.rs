@@ -13,7 +13,6 @@
 //! dictionary (the script's only non-scalar member, `ScriptMgnIntf.cpp:331`)
 #![allow(unsafe_code)]
 
-use crate::script::{ScriptOptions, ScriptScope};
 use crate::{CompatCtx, CompatError};
 
 /// The TVP global-constants script, evaluated once at engine setup.
@@ -23,15 +22,16 @@ const CONSTANTS_SCRIPT: &str = r#"const bsNone=0, bsSingle=1, bsSizeable=2, bsDi
 
 /// Register the global TVP constants by evaluating [`CONSTANTS_SCRIPT`] on the
 /// engine.
+///
+/// The constants are the engine's global members, not a store the Rust side
+/// keeps beside it: the host, the compatibility surface and a game script all
+/// read them through the engine's global object, and the dictionary the script
+/// declares is an object the engine holds.
 pub fn register(ctx: &mut CompatCtx) -> Result<(), CompatError> {
     // SAFETY: a `CompatCtx` is only created for a bound, live engine, and the
     // host calls `register_all` once during install.
-    ScriptScope::new(unsafe { ctx.engine() }, ctx)
-        .run(
-            CONSTANTS_SCRIPT,
-            "TVP_global_constants",
-            ScriptOptions::default(),
-        )
+    unsafe { ctx.engine() }
+        .exec_script_discard(CONSTANTS_SCRIPT, "TVP_global_constants")
         .map_err(|e| CompatError::Engine(format!("TVP global constants: {e}")))?;
     Ok(())
 }

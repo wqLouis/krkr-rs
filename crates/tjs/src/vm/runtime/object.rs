@@ -113,6 +113,14 @@ pub enum ObjectError {
     #[error("the object cannot serve the call")]
     CallNotServed,
 
+    /// The member takes a different number of arguments than the call gave.
+    #[error("the member does not accept this many arguments")]
+    ParameterCount,
+
+    /// The name is a declared property, and a property has no call of its own.
+    #[error("the member is a property")]
+    NotImplemented,
+
     /// The object has been invalidated.
     #[error("the object is invalid")]
     InvalidObject,
@@ -228,7 +236,9 @@ impl Member {
 ///
 /// Every call answers a typed failure instead of a fabricated value: a member
 /// that is not there, a member the caller required, a call a property cannot
-/// serve, and an invalidated object are told apart by [`ObjectError`].
+/// serve, a member that takes a different number of arguments, a declared
+/// property that has no call of its own, and an invalidated object are told
+/// apart by [`ObjectError`].
 pub trait Dispatch {
     /// Reads the member `name`.
     ///
@@ -339,6 +349,22 @@ pub trait Dispatch {
     /// Answers whether the call changed anything: an object that was already
     /// invalid stays as it is.
     fn invalidate(&self) -> bool;
+
+    /// The member a named call reaches, when the object answers a named call
+    /// by looking the name up in its members.
+    ///
+    /// `None` means the object serves named calls through its own
+    /// [`Self::func_call`] instead. `Some(Ok(member))` is the value the name
+    /// holds, and `Some(Err(error))` is the lookup's failure. The caller calls
+    /// the value with no name of its own, which is the engine's base rule; a
+    /// value whose call is code is run by the caller that has a machine.
+    fn func_member(
+        &self,
+        _name: &TjsString,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Option<Result<Variant, ObjectError>> {
+        None
+    }
 
     /// Invokes the value as a function.
     ///
@@ -513,19 +539,16 @@ impl CustomObject {
         name: &TjsString,
         flags: MemberFlags,
     ) -> Result<(Variant, Option<Property>), ObjectError> {
-        let present = self.members.borrow().get(name).is_some();
-        if !present {
+        let mut members = self.members.borrow_mut();
+        if members.get(name).is_none() {
             if flags.contains(MemberFlags::MUST_EXIST) {
                 return Err(ObjectError::MemberMustExist);
             }
             if !flags.contains(MemberFlags::ENSURE) {
                 return Err(ObjectError::MemberNotFound);
             }
-            self.members
-                .borrow_mut()
-                .insert(name.clone(), Member::value(Variant::Void));
+            members.insert(name.clone(), Member::value(Variant::Void));
         }
-        let members = self.members.borrow();
         let member = members.get(name).ok_or(ObjectError::MemberNotFound)?;
         Ok((member.value.clone(), member.property.clone()))
     }
@@ -633,8 +656,7 @@ impl Dispatch for CustomObject {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
         self.check_valid()?;
-        let object_class = TjsString::from("Object");
-        if *class == object_class {
+        if class.eq_str("Object") {
             return Ok(true);
         }
         Ok(self.class_names.borrow().contains(class))
@@ -661,6 +683,52 @@ impl Dispatch for CustomObject {
         self.invalid.set(true);
         self.members.borrow_mut().clear();
         true
+    }
+
+    fn func_member(
+        &self,
+        name: &TjsString,
+        _objthis: Option<&dyn Dispatch>,
+    ) -> Option<Result<Variant, ObjectError>> {
+        Some((|| {
+            self.check_valid()?;
+            let (value, property) = self.reach(name, MemberFlags::NONE)?;
+            if property.is_some() {
+                return Err(ObjectError::NotImplemented);
+            }
+            Ok(value)
+        })())
+    }
+
+    /// A named call looks the name up and calls the value it reached with no
+    /// name of its own, which is the engine's base-object rule. A value whose
+    /// call is code is not run here: the caller that has a machine asks
+    /// [`Self::func_member`] first.
+    fn func_call(
+        &self,
+        name: &TjsString,
+        argv: Option<&[Variant]>,
+        objthis: Option<&dyn Dispatch>,
+    ) -> Result<Variant, ObjectError> {
+        self.check_valid()?;
+        if name.is_empty() {
+            return Err(ObjectError::CallNotServed);
+        }
+        let Some(member) = self.func_member(name, objthis) else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let member = member?;
+        let Variant::Object(closure) = member else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let Some(object) = closure.object else {
+            return Err(ObjectError::CallNotServed);
+        };
+        let receiver = match &closure.objthis {
+            Some(receiver) => Some(receiver.as_ref()),
+            None => objthis,
+        };
+        object.func_call(&TjsString::new(), argv, receiver)
     }
 }
 

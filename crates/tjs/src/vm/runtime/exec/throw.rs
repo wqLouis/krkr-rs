@@ -29,29 +29,36 @@
 //!
 //! # The trace
 //!
-//! One line per frame the failure passed, innermost first. An entry adds its own
-//! line as the failure crosses out of it, so the list reads in unwind order. The
-//! engine's message carries the lines; a script's thrown value does not — it is
-//! the value, and the trace travels beside it for whoever reports it.
+//! One line per frame the failure passed, innermost first. A throw adds the
+//! frame it was raised in at the throw instruction, and a call adds the caller's
+//! frame at the call instruction as the failure crosses back into it, so the
+//! list reads in unwind order. An engine failure adds no line for the frame that
+//! raised it; only the frames it later crosses are named. The engine's message
+//! carries the lines; a script's thrown value does not — it is the value, and
+//! the trace travels beside it for whoever reports it.
 //!
-//! # Where the trace is dropped
+//! # Where the trace is kept
 //!
-//! The Rust path keeps the trace and the value for as long as the failure stays
-//! inside the interpreter. It is lost at the two boundaries that cannot carry
-//! it: the object surface's `func_call` answers an [`ObjectError`], so a failure
-//! leaving a called context becomes the surface's own refusal; and the C
-//! interface between this crate and the vendored executor carries a message
-//! only. The second is the known seam defect; the first is why
-//! [`super::Machine::run_context`] exists.
+//! The machine boundary answers the [`Unwind`] itself, so a caller that reports
+//! an uncaught failure reads the same frames a handler inside the code reads.
+//! The C interface between this crate and the vendored executor still carries a
+//! message only, which is the known seam defect.
 
-use crate::vm::codegen::opcode::vm;
+use crate::vm::runtime::message::{
+    self, TJS_ACCESS_DENIED, TJS_BAD_PARAM_COUNT, TJS_DIVIDE_BY_ZERO, TJS_INTEGER_OUT_OF_RANGE,
+    TJS_INVALID_FORMAT_STRING, TJS_INVALID_PARAM, TJS_INVALID_TYPE, TJS_MEMBER_NOT_FOUND,
+    TJS_NOT_IMPLEMENTED, TJS_NULL_ACCESS, TJS_RANGE_ERROR, TJS_SPECIFY_ARRAY,
+    TJS_UNKNOWN_BIT_STRING_CHARACTER, TJS_UNKNOWN_HEX_STRING_CHARACTER,
+    TJS_UNKNOWN_PACK_UNPACK_TEMPLATE, TJS_VARIANT_CONVERT_ERROR,
+    TJS_VARIANT_CONVERT_ERROR_TO_OBJECT,
+};
 use crate::vm::runtime::natives::exception::Exception;
 use crate::vm::runtime::object::ObjectError;
 use crate::vm::runtime::string::TjsString;
-use crate::vm::runtime::variant::{DIVISION_BY_ZERO_MESSAGE, Variant, conversion_message};
+use crate::vm::runtime::variant::Variant;
 
-use super::decode;
 use super::frame::{Code, Frame};
+use super::instruction::{Protected, Slot};
 use super::{ContextObject, Fault, Raise};
 
 /// One line of a trace: the frame a failure passed and the place in it.
@@ -74,15 +81,36 @@ impl FrameTrace {
     }
 }
 
+/// What a failure carries beside the reason it names.
+///
+/// The reason is static, so the data its text names lives here: it is made only
+/// when the failure is raised, and it is owned only for as long as the failure
+/// takes to reach a handler or the machine boundary.
+#[derive(Clone, Debug, Default)]
+enum Detail {
+    /// Nothing: the reason's text names no argument.
+    #[default]
+    None,
+    /// The value the operation was asked of.
+    Value(Box<Variant>),
+    /// The name an instruction named, or the front end's own text.
+    Text(TjsString),
+    /// The value a script threw.
+    Thrown(Box<Variant>),
+}
+
 /// A failure on its way out of the code, and the frames it has passed.
 ///
-/// This is what the run loop answers with, so that a failure can carry a value
-/// and a trace across the frames of the code it unwinds. It becomes a [`Fault`]
-/// at the machine's own boundary.
+/// This is what the run loop and the machine boundary answer with, so that a
+/// failure can carry a value and a trace across the frames of the code it
+/// unwinds. The reason it names is static; everything the reason's message or a
+/// catch needs travels beside it, so nothing is built until the failure happens.
 #[derive(Clone, Debug)]
 pub struct Unwind {
     /// What failed.
     failure: Fault,
+    /// What the failure names beside its reason.
+    detail: Detail,
     /// The frames it passed, innermost first.
     trace: Vec<FrameTrace>,
 }
@@ -92,8 +120,14 @@ impl Unwind {
     pub fn new(failure: Fault) -> Self {
         Self {
             failure,
+            detail: Detail::None,
             trace: Vec::new(),
         }
+    }
+
+    /// A raise that has not passed a frame yet.
+    pub fn raised(raise: Raise) -> Self {
+        Self::new(Fault::Raised(raise))
     }
 
     /// A failure that passes every protected region it meets.
@@ -104,8 +138,35 @@ impl Unwind {
         Self::new(Fault::Silent)
     }
 
-    /// The failure itself, with the trace dropped.
-    pub fn fault(self) -> Fault {
+    /// A failure a script threw.
+    ///
+    /// A throw is a failure a handler can reach into, so the value travels as
+    /// itself rather than as a message.
+    pub fn thrown(value: Variant) -> Self {
+        Self {
+            failure: Fault::Thrown,
+            detail: Detail::Thrown(Box::new(value)),
+            trace: Vec::new(),
+        }
+    }
+
+    /// The failure with the value its raise names.
+    #[must_use]
+    pub fn with_value(mut self, value: &Variant) -> Self {
+        self.detail = Detail::Value(Box::new(value.clone()));
+        self
+    }
+
+    /// The failure with the text its raise names: a member's name, or the front
+    /// end's own message.
+    #[must_use]
+    pub fn with_text(mut self, text: TjsString) -> Self {
+        self.detail = Detail::Text(text);
+        self
+    }
+
+    /// The failure itself.
+    pub fn fault(&self) -> Fault {
         self.failure
     }
 
@@ -114,7 +175,41 @@ impl Unwind {
         &self.trace
     }
 
+    /// The value the failure names, when it names one: the operand a conversion
+    /// was asked of.
+    pub fn value(&self) -> Option<&Variant> {
+        match &self.detail {
+            Detail::Value(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The text the failure names, when it names one: the member an instruction
+    /// named, or the front end's own message.
+    pub fn text(&self) -> Option<&TjsString> {
+        match &self.detail {
+            Detail::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// The value a script threw, when the failure is a throw.
+    pub fn thrown_value(&self) -> Option<&Variant> {
+        match &self.detail {
+            Detail::Thrown(value) => Some(value),
+            _ => None,
+        }
+    }
+
     /// Adds the frame the failure has just left.
+    ///
+    /// `context` and `ip` are the caller's: a call boundary records the call
+    /// instruction, not the callee's throw.
+    pub fn add_frame(&mut self, context: Option<&ContextObject>, ip: usize) {
+        self.push(line_of(context, ip));
+    }
+
+    /// Adds a frame the failure passed.
     fn push(&mut self, frame: FrameTrace) {
         self.trace.push(frame);
     }
@@ -125,9 +220,23 @@ impl Unwind {
     }
 }
 
+impl std::fmt::Display for Unwind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.failure.fmt(formatter)
+    }
+}
+
+impl std::error::Error for Unwind {}
+
 impl From<Fault> for Unwind {
     fn from(failure: Fault) -> Self {
         Self::new(failure)
+    }
+}
+
+impl From<Raise> for Unwind {
+    fn from(raise: Raise) -> Self {
+        Self::raised(raise)
     }
 }
 
@@ -137,75 +246,39 @@ impl From<ObjectError> for Unwind {
     }
 }
 
-/// Whether an opcode is one of the three exception instructions.
-pub fn handles(opcode: i32) -> bool {
-    matches!(opcode, vm::ENTRY | vm::EXTRY | vm::THROW)
-}
-
-/// Executes an exception instruction.
-///
-/// It answers the answer of the whole context, because an entry runs the body and
-/// an exit ends it: the caller has nothing left to do afterwards.
-pub fn execute(
-    machine: &super::Machine,
-    code: &Code,
-    frame: &mut Frame,
-    argv: &[Variant],
-    context: Option<&ContextObject>,
-    ip: usize,
-    opcode: i32,
-) -> Result<Variant, Unwind> {
-    match opcode {
-        vm::ENTRY => enter(machine, code, frame, argv, context, ip),
-        // an exit from a protected region ends the context, exactly as a return
-        // does
-        vm::EXTRY => Ok(Variant::Void),
-        vm::THROW => Err(throw(frame, code, context, ip)?),
-        _ => Err(Fault::Broken("an exception instruction that is not one").into()),
-    }
-}
-
 /// Runs a protected region and answers for it.
 ///
-/// The body runs from the word after the entry's two operands. A failure of the
-/// body crosses out of this entry: it takes this frame's line, and — unless it
-/// is the silent kind — the catch's register receives it and the catch's body
-/// runs from the entry's own distance.
-fn enter(
+/// The body runs from the instruction after the entry. A failure of the body
+/// crosses out of this entry: unless it is the silent kind, the catch's register
+/// receives it and the catch's body runs from the entry's own instruction. The
+/// entry adds no line of its own, because the body's frame already recorded the
+/// position the failure was at.
+pub fn enter(
     machine: &super::Machine,
     code: &Code,
     frame: &mut Frame,
     argv: &[Variant],
     context: Option<&ContextObject>,
-    ip: usize,
+    body: usize,
+    entry: &Protected,
 ) -> Result<Variant, Unwind> {
-    let distance = operand(code, ip, 1)?;
-    let register = operand(code, ip, 2)?;
-    let catch = catch_position(ip, distance)?;
-    match machine.execute(code, frame, argv, context, ip + 3) {
+    match machine.execute(code, frame, argv, context, body) {
         Ok(answer) => Ok(answer),
-        Err(mut unwind) => {
-            unwind.push(line_of(context, ip));
+        Err(unwind) => {
             if unwind.is_silent() {
                 return Err(unwind);
             }
-            deliver(&unwind, frame, register)?;
-            machine.execute(code, frame, argv, context, catch)
+            deliver(&unwind, frame, entry.register)?;
+            machine.execute(code, frame, argv, context, entry.target)
         }
     }
 }
 
-/// The position the catch's body starts at.
-fn catch_position(ip: usize, distance: i32) -> Result<usize, Unwind> {
-    let offset = decode::code_position(distance)?;
-    let target = i64::try_from(ip)
-        .map_err(|_| Fault::Broken("a code position does not fit an address"))?
-        .checked_add(i64::from(offset))
-        .ok_or(Fault::Broken("a catch position is out of range"))?;
-    if target < 0 {
-        return Err(Fault::Broken("a catch position is before the code stream").into());
-    }
-    usize::try_from(target).map_err(|_| Fault::Broken("a catch position is out of range").into())
+/// The failure a throw instruction raises.
+pub fn raise(frame: &Frame, context: Option<&ContextObject>, value: Slot, at: usize) -> Unwind {
+    let mut unwind = Unwind::thrown(frame.slot(value).clone());
+    unwind.push(line_of(context, at));
+    unwind
 }
 
 /// Hands a failure to the catch's register.
@@ -214,14 +287,16 @@ fn catch_position(ip: usize, distance: i32) -> Result<usize, Unwind> {
 /// an exception object carrying the message and the trace, because that is what a
 /// handler reads. A failure that is neither — a defective code stream, say —
 /// leaves the register empty, which is what the engine's own catch-all does.
-fn deliver(unwind: &Unwind, frame: &mut Frame, register: i32) -> Result<(), Unwind> {
-    let value = match &unwind.failure {
-        Fault::Thrown { value } => (**value).clone(),
-        Fault::Raised(raise) => exception_object(&message_of(raise), unwind.trace())?,
-        Fault::Silent => Variant::Void,
-        _ => Variant::Void,
+fn deliver(unwind: &Unwind, frame: &mut Frame, register: Slot) -> Result<(), Unwind> {
+    let value = match unwind.thrown_value() {
+        Some(value) => value.clone(),
+        None => match unwind.fault() {
+            Fault::Raised(_) => exception_object(&message_of(unwind), unwind.trace())?,
+            _ => Variant::Void,
+        },
     };
-    frame.set(register, value).map_err(Unwind::from)
+    frame.store(register, value);
+    Ok(())
 }
 
 /// The exception object a handler reads.
@@ -237,43 +312,77 @@ fn exception_object(message: &str, trace: &[FrameTrace]) -> Result<Variant, Faul
     exception.object().map_err(Fault::from)
 }
 
-/// The message a reason reads as.
+/// The message a raise reads as.
 ///
-/// The engine's own text where this tree knows it, and a plain statement of the
-/// reason where it does not. A handler that prints `message` sees these.
-pub fn message_of(raise: &Raise) -> String {
+/// The text is read from [`message`] now, not fixed when the raising code was
+/// written, so an assignment made before the raise changes what a handler
+/// prints. The value or the name the text carries is the one the failure was
+/// raised with.
+pub fn message_of(unwind: &Unwind) -> String {
+    let Fault::Raised(raise) = unwind.failure else {
+        return unwind.failure.to_string();
+    };
     match raise {
-        Raise::Convert { value, to } => conversion_message(&value.readable().to_string(), to),
-        Raise::DivideByZero => DIVISION_BY_ZERO_MESSAGE.to_string(),
-        Raise::IntegerOutOfRange => String::from("The integer result is out of range"),
-        Raise::MemberNotFound { name } => format!("Member \"{name}\" does not exist"),
-        Raise::AccessDenied => {
-            String::from("Invalid operation for Read-only or Write-only property")
+        Raise::Convert { to } => {
+            // a conversion raise is built with the value it was asked of, so the
+            // pairing is the raising code's and no condition a script can reach
+            let value = match unwind.value() {
+                Some(value) => value,
+                None => panic!("a conversion raise carries the value it was asked of"),
+            };
+            let readable = value.readable().to_string();
+            if to == "Object" {
+                required(TJS_VARIANT_CONVERT_ERROR_TO_OBJECT, &[readable.as_str()])
+            } else {
+                required(TJS_VARIANT_CONVERT_ERROR, &[readable.as_str(), to])
+            }
         }
-        Raise::RangeError => String::from("The value is out of the range"),
-        Raise::NotCallable { .. } => String::from("Not a function or invalid method/property type"),
-        Raise::ParameterCount => String::from("Invalid argument count"),
-        Raise::InvalidParameter => String::from("Invalid argument"),
-        Raise::FormatString => String::from("Invalid format string"),
-        Raise::NotAnArray => String::from("Specify an Array object"),
-        Raise::ScriptError { message } => message.to_string(),
+        Raise::DivideByZero => required(TJS_DIVIDE_BY_ZERO, &[]),
+        Raise::IntegerOutOfRange => required(TJS_INTEGER_OUT_OF_RANGE, &[]),
+        Raise::NullAccess => required(TJS_NULL_ACCESS, &[]),
+        Raise::UnknownPackTemplate => required(TJS_UNKNOWN_PACK_UNPACK_TEMPLATE, &[]),
+        Raise::UnknownBitString => required(TJS_UNKNOWN_BIT_STRING_CHARACTER, &[]),
+        Raise::UnknownHexString => required(TJS_UNKNOWN_HEX_STRING_CHARACTER, &[]),
+        Raise::MemberNotFound => {
+            let name = match unwind.text() {
+                Some(name) => name.to_string(),
+                None => panic!("a member raise carries the name it was raised on"),
+            };
+            required(TJS_MEMBER_NOT_FOUND, &[name.as_str()])
+        }
+        Raise::AccessDenied => required(TJS_ACCESS_DENIED, &[]),
+        Raise::RangeError => required(TJS_RANGE_ERROR, &[]),
+        Raise::NotCallable => required(TJS_INVALID_TYPE, &[]),
+        Raise::ParameterCount => required(TJS_BAD_PARAM_COUNT, &[]),
+        Raise::InvalidParameter => required(TJS_INVALID_PARAM, &[]),
+        Raise::FormatString => required(TJS_INVALID_FORMAT_STRING, &[]),
+        Raise::NotAnArray => required(TJS_SPECIFY_ARRAY, &[]),
+        // A front end failure carries its own text rather than an id: the
+        // message already names what the parse failed on, and there is no
+        // registered text to read instead. The one text that is a registered
+        // entry is the declaration failure, whose message names TJSNotImplemented.
+        Raise::ScriptError => {
+            let text = match unwind.text() {
+                Some(text) => text.to_string(),
+                None => panic!("a compile raise carries the front end's own text"),
+            };
+            match message::default_text(TJS_NOT_IMPLEMENTED) {
+                Some(default) if text == default => required(TJS_NOT_IMPLEMENTED, &[]),
+                _ => text,
+            }
+        }
     }
 }
 
-/// The failure a throw instruction raises.
-fn throw(
-    frame: &Frame,
-    code: &Code,
-    context: Option<&ContextObject>,
-    ip: usize,
-) -> Result<Unwind, Fault> {
-    let address = operand(code, ip, 1)?;
-    let value = frame.reg(address)?.clone();
-    let mut unwind = Unwind::new(Fault::Thrown {
-        value: Box::new(value),
-    });
-    unwind.push(line_of(context, ip));
-    Ok(unwind)
+/// The text of a registered id, with this raise's arguments substituted.
+///
+/// The id is one of this module's message-table constants, so a miss is a
+/// defect in the pairing rather than a condition a script can reach.
+fn required(id: &str, arguments: &[&str]) -> String {
+    match message::format(id, arguments) {
+        Some(text) => text,
+        None => panic!("the message id {id} is not registered"),
+    }
 }
 
 /// The trace line for the frame at `ip`.
@@ -285,14 +394,10 @@ fn line_of(context: Option<&ContextObject>, ip: usize) -> FrameTrace {
     FrameTrace { name, position: ip }
 }
 
-/// The `slot`-th operand of the instruction at `ip`.
-fn operand(code: &Code, ip: usize, slot: usize) -> Result<i32, Fault> {
-    super::operand(&code.code, ip, slot)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vm::codegen::opcode::vm;
     use std::rc::Rc;
 
     use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags};
@@ -301,6 +406,11 @@ mod tests {
 
     fn text(value: &str) -> TjsString {
         TjsString::from(value)
+    }
+
+    /// The raise a refused conversion of `value` makes.
+    fn conversion(value: Variant, target: Target) -> Unwind {
+        Unwind::raised(Raise::Convert { to: target.name() }).with_value(&value)
     }
 
     fn same(left: &Variant, right: &Variant) -> bool {
@@ -319,6 +429,8 @@ mod tests {
             max_frame_count: 6,
             ..Code::default()
         }
+        .decoded()
+        .expect("the stream decodes")
     }
 
     /// A thrown value reaches the catch's register as itself, and the catch's
@@ -500,10 +612,12 @@ mod tests {
         );
         let mut machine = super::super::Machine::new();
         match machine.run(&code, None, &[]) {
-            Err(Fault::Thrown { value }) => {
-                assert!(same(&value, &Variant::String(text("uncaught"))));
+            Err(unwind) => {
+                assert_eq!(unwind.fault(), Fault::Thrown);
+                let value = unwind.thrown_value().expect("the thrown value");
+                assert!(same(value, &Variant::String(text("uncaught"))));
             }
-            other => panic!("expected the thrown value, got {other:?}"),
+            Ok(answer) => panic!("expected the thrown value, got {answer:?}"),
         }
     }
 
@@ -528,9 +642,10 @@ mod tests {
             panic!("the exception is not an object");
         };
         let object = closure.object.expect("an object");
-        // reference/cpp/core/tjs2/tjsException.cpp:22-52 - a native class's
-        // instance is not an instance of that class
-        assert_eq!(object.is_instance_of(&text("Exception"), None), Ok(false));
+        // reference/cpp/core/tjs2/tjsNative.cpp:318-325 - a native construction
+        // adds the class name, so the text "Exception" names the instance; the
+        // class *object* does not, because the operator compares texts
+        assert_eq!(object.is_instance_of(&text("Exception"), None), Ok(true));
         let message = object
             .prop_get(&text("message"), MemberFlags::NONE, None)
             .expect("the message");
@@ -548,16 +663,6 @@ mod tests {
         assert!(matches!(finalize, Variant::Object(_)));
     }
 
-    /// The three opcodes are the ones handled, and no others.
-    #[test]
-    fn the_three_instructions_are_the_ones_handled() {
-        for opcode in [vm::ENTRY, vm::EXTRY, vm::THROW] {
-            assert!(handles(opcode));
-        }
-        assert!(!handles(vm::CALL));
-        assert!(!handles(vm::RET));
-    }
-
     /// The message a handler reads is the engine's own text.
     ///
     /// reference/cpp/core/tjs2/tjsError.h:250-253 (the conversion message),
@@ -568,40 +673,31 @@ mod tests {
     fn the_message_table_is_the_engines() {
         let null = Variant::Object(Closure::null());
         let octet = Variant::from(Octet::from_slice(&[1]));
-        for (raise, message) in [
+        for (unwind, message) in [
             (
-                Raise::Convert {
-                    value: Box::new(null),
-                    to: Target::Real.name(),
-                },
+                conversion(null, Target::Real),
                 "Cannot convert the variable type ((object)(object 0x0:0x0) to real)",
             ),
             (
-                Raise::Convert {
-                    value: Box::new(octet),
-                    to: Target::Text.name(),
-                },
+                conversion(octet, Target::Text),
                 "Cannot convert the variable type ((octet)<% 01 %> to string)",
             ),
             (
-                Raise::Convert {
-                    value: Box::new(Variant::Integer(1)),
-                    to: Target::Octet.name(),
-                },
+                conversion(Variant::Integer(1), Target::Octet),
                 "Cannot convert the variable type ((int)1 to octet)",
             ),
             (
-                Raise::AccessDenied,
+                Raise::AccessDenied.into(),
                 "Invalid operation for Read-only or Write-only property",
             ),
-            (Raise::RangeError, "The value is out of the range"),
-            (Raise::FormatString, "Invalid format string"),
-            (Raise::ParameterCount, "Invalid argument count"),
-            (Raise::InvalidParameter, "Invalid argument"),
-            (Raise::NotAnArray, "Specify an Array object"),
-            (Raise::DivideByZero, "Division by zero"),
+            (Raise::RangeError.into(), "The value is out of the range"),
+            (Raise::FormatString.into(), "Invalid format string"),
+            (Raise::ParameterCount.into(), "Invalid argument count"),
+            (Raise::InvalidParameter.into(), "Invalid argument"),
+            (Raise::NotAnArray.into(), "Specify an Array object"),
+            (Raise::DivideByZero.into(), "Division by zero"),
         ] {
-            assert_eq!(message_of(&raise), message);
+            assert_eq!(message_of(&unwind), message);
         }
     }
 }

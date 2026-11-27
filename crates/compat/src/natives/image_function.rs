@@ -123,11 +123,7 @@ fn run(
     let a = unsafe { args(argv, argc) };
     match f(&resolved, &ctx, a) {
         Ok(region) => {
-            set_region_out(
-                &ScriptScope::new(resolved.engine(), &ctx),
-                out,
-                region,
-            );
+            set_region_out(&ScriptScope::new(resolved.engine(), &ctx), out, region);
             0
         }
         Err(error) => report_error(out_error, &error),
@@ -162,30 +158,31 @@ fn set_region_out(scripts: &ScriptScope<'_>, out: *mut Value, region: Option<Rec
         set_void(out);
         return;
     };
-    let object = match scripts.eval("new Rect()", "ImageFunction.rect", ScriptOptions::default()) {
-        Ok(RetainedValue::Object(object)) => object,
-        Ok(RetainedValue::Value(_)) => {
-            log::warn!("ImageFunction: `new Rect()` did not return an object");
-            set_void(out);
-            return;
-        }
-        Err(error) => {
-            log::warn!("ImageFunction: cannot create the result Rect: {error}");
-            set_void(out);
-            return;
-        }
-    };
+    let object =
+        match scripts.evaluate("new Rect()", "ImageFunction.rect", ScriptOptions::default()) {
+            Ok(RetainedValue::Object(object)) => object,
+            Ok(RetainedValue::Value(_)) => {
+                log::warn!("ImageFunction: `new Rect()` did not return an object");
+                set_void(out);
+                return;
+            }
+            Err(error) => {
+                log::warn!("ImageFunction: cannot create the result Rect: {error}");
+                set_void(out);
+                return;
+            }
+        };
     for (name, value) in [
         ("left", left),
         ("top", top),
         ("right", right),
         ("bottom", bottom),
     ] {
-        if let Err(error) = scripts.engine().set_member(
-            object.raw_id(),
-            name,
-            &TjsValue::Integer(i64::from(value)),
-        ) {
+        if let Err(error) =
+            scripts
+                .engine()
+                .set_member(object.raw_id(), name, &TjsValue::Integer(i64::from(value)))
+        {
             log::warn!("ImageFunction: cannot set the result Rect.{name}: {error}");
             set_void(out);
             return;

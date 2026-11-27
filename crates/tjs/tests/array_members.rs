@@ -20,6 +20,10 @@ use tjs::vm::runtime::octet::Octet;
 use tjs::vm::runtime::string::TjsString;
 use tjs::vm::runtime::variant::Variant;
 
+/// The text a class object has on the right of `instanceof`: its handle, never
+/// its class name (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187-213`).
+const CLASS_OBJECT_TEXT: &str = "(object 0:0)";
+
 /// The probes the record must hold, in the recorder's order.
 const PROBES: &[&str] = &[
     "length_initial",
@@ -140,6 +144,16 @@ const PROBES: &[&str] = &[
     "instanceof_array",
     "instanceof_object",
     "instanceof_dictionary",
+    "instanceof_array_name",
+    "instanceof_object_name",
+    "instanceof_dictionary_name",
+    "instanceof_string_name",
+    "instanceof_number_name",
+    "instanceof_octet_name",
+    "instanceof_split_name",
+    "instanceof_literal_name",
+    "instanceof_new_name",
+    "instanceof_invalidated",
     "split_text_count",
     "split_text_first",
     "split_text_second",
@@ -219,6 +233,23 @@ fn the_array_model_reproduces_the_recorded_member_answers() {
         assert_eq!(record.text, text, "probe {}: the text", record.probe);
     }
     deferred_are_what_the_engine_raised(&records);
+}
+
+/// An invalidated array refuses the class question with the engine's own
+/// invalid-object error, never with `false`.
+///
+/// reference/krkr2/cpp/core/tjs2/tjsArray.cpp:1750-1758 (a named class question
+/// delegates to the custom object);
+/// reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1764-1765 (the custom object
+/// checks its validity before it compares a name).
+#[test]
+fn an_invalidated_array_refuses_the_class_question() {
+    let array = ArrayObject::new();
+    assert!(array.invalidate(), "the array invalidates");
+    assert_eq!(
+        array.is_instance_of(&text("Array"), None),
+        Err(ObjectError::InvalidObject)
+    );
 }
 
 /// The probes whose rule this model cannot answer: the engine raised before the
@@ -581,9 +612,49 @@ fn run_probe(array: &ArrayObject, probe: &str) -> Result<Variant, ()> {
         "assign_first" => read_at(array, 0),
         "assign_second" => read_at(array, 1),
         "named_survives_assign" => typeof_name(array, "blank"),
-        "instanceof_array" => Ok(instance_of(array, "Array")),
+        // `a instanceof Array` compares the class object's handle text, not
+        // its class name (`reference/krkr2/cpp/core/tjs2/tjsVariant.cpp:187-213`).
+        "instanceof_array" | "instanceof_dictionary" => Ok(instance_of(array, CLASS_OBJECT_TEXT)),
         "instanceof_object" => Ok(instance_of(array, "Object")),
-        "instanceof_dictionary" => Ok(instance_of(array, "Dictionary")),
+        // reference/krkr2/cpp/core/tjs2/tjsArray.cpp:1750-1758 (a named class
+        // question is the custom object's), and
+        // reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1767-1781 (the custom
+        // object answers "Object" or a class name it carries).
+        "instanceof_array_name" => Ok(instance_of(array, "Array")),
+        "instanceof_object_name" => Ok(instance_of(array, "Object")),
+        "instanceof_dictionary_name" => Ok(instance_of(array, "Dictionary")),
+        "instanceof_string_name" => Ok(instance_of(array, "String")),
+        "instanceof_number_name" => Ok(instance_of(array, "Number")),
+        "instanceof_octet_name" => Ok(instance_of(array, "Octet")),
+        // A split array, a literal and a construction all carry the class
+        // name the native construction adds
+        // (`reference/krkr2/cpp/core/tjs2/tjsNative.cpp:323-325`).
+        "instanceof_split_name" => {
+            let split = ArrayObject::new();
+            call_split(
+                &split,
+                &Variant::from(","),
+                &Variant::from("a,b"),
+                &Variant::Void,
+                &Variant::Void,
+            )
+            .expect("the split is served");
+            Ok(instance_of(&split, "Array"))
+        }
+        "instanceof_literal_name" => Ok(instance_of(&ArrayObject::new(), "Array")),
+        "instanceof_new_name" => Ok(instance_of(&ArrayObject::new(), "Array")),
+        // An invalidated array refuses the class question instead of answering
+        // false (`reference/krkr2/cpp/core/tjs2/tjsArray.cpp:1750-1758`;
+        // `reference/krkr2/cpp/core/tjs2/tjsObject.cpp:1764-1765`).
+        "instanceof_invalidated" => {
+            let invalidated = ArrayObject::new();
+            assert!(invalidated.invalidate(), "the array invalidates");
+            let error = invalidated
+                .is_instance_of(&text("Array"), None)
+                .expect_err("the invalidated array refuses the class question");
+            assert_eq!(error, ObjectError::InvalidObject);
+            Err(())
+        }
         // reference/krkr2/cpp/core/tjs2/tjsArray.cpp:490-560
         "split_text_count" => split_count(
             array,
@@ -832,7 +903,7 @@ fn run_probe(array: &ArrayObject, probe: &str) -> Result<Variant, ()> {
         "split_one_param_refused" => {
             let answer = array.func_call(&text("split"), Some(&[Variant::from(",")]), None);
             assert!(
-                matches!(answer, Err(ObjectError::CallNotServed)),
+                matches!(answer, Err(ObjectError::ParameterCount)),
                 "the one-parameter call was served"
             );
             Err(())

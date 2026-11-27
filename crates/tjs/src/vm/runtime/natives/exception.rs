@@ -41,11 +41,10 @@ impl ExceptionMember {
 
     /// The member `name` denotes, or `None` when it names no member.
     pub fn lookup(name: &TjsString) -> Option<Self> {
-        let units = name.as_utf16();
         Self::ALL
             .iter()
             .copied()
-            .find(|member| units.iter().copied().eq(member.name().encode_utf16()))
+            .find(|member| name.len() == member.name().len() && name.eq_str(member.name()))
     }
 
     /// The name the class publishes the member under.
@@ -131,15 +130,15 @@ impl Exception {
     ///
     /// Every member of the table is set from this exception's state, and the
     /// finalizer is the class's own empty method with the object as its
-    /// receiver. The object carries no class name: the engine answers that an
-    /// instance is not an instance of its own native class, which is the same
-    /// answer an array gives.
+    /// receiver. The object carries the class's name, which is what a class
+    /// question asks about; a class object on the right of `instanceof` is read
+    /// as its own text form and so never matches that name.
     ///
     /// # Errors
     ///
     /// The object surface's failure while a member is set.
     pub fn object(&self) -> Result<Variant, ObjectError> {
-        let members = Rc::new(CustomObject::new([]));
+        let members = Rc::new(CustomObject::new([TjsString::from(CLASS_NAME)]));
         let object: Rc<dyn Dispatch> = members.clone();
         for member in Self::members() {
             members.prop_set(
@@ -229,9 +228,7 @@ impl Dispatch for Finalizer {
         class: &TjsString,
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<bool, ObjectError> {
-        let object = TjsString::from("Object");
-        let function = TjsString::from("Function");
-        Ok(*class == object || *class == function)
+        Ok(class.eq_str("Object") || class.eq_str("Function"))
     }
 
     fn class_names(&self) -> Vec<TjsString> {
@@ -316,21 +313,21 @@ mod tests {
         );
     }
 
-    /// The object carries exactly the table's members and its class name.
+    /// The object carries exactly the table's members and the class's name.
     #[test]
-    // reference/cpp/core/tjs2/tjsException.cpp:22-52 - the class publishes its
-    // finalizer and its constructor, and an instance is not an instance of its own
-    // native class, which is the answer an array gives too
-    fn the_object_carries_the_table_and_no_class_name() {
+    // reference/krkr2/cpp/core/tjs2/tjsException.cpp:22-52 - the class publishes
+    // its finalizer and its constructor, and a construction adds the class's name
+    // to the object it makes
+    fn the_object_carries_the_table_and_its_class_name() {
         let exception = Exception::new(&[]);
         let Variant::Object(closure) = exception.object().expect("the object builds") else {
             panic!("the exception is not an object");
         };
         let object = closure.object.expect("the object is there");
-        assert!(object.class_names().is_empty());
+        assert_eq!(object.class_names(), vec![TjsString::from(CLASS_NAME)]);
         assert_eq!(
             object.is_instance_of(&TjsString::from(CLASS_NAME), None),
-            Ok(false)
+            Ok(true)
         );
         let mut names = Vec::new();
         object
