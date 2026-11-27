@@ -44,10 +44,9 @@
 //! only. The second is the known seam defect; the first is why
 //! [`super::Machine::run_context`] exists.
 
-use std::rc::Rc;
-
 use crate::vm::codegen::opcode::vm;
-use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags, ObjectError};
+use crate::vm::runtime::natives::exception::Exception;
+use crate::vm::runtime::object::ObjectError;
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::Variant;
 
@@ -227,30 +226,15 @@ fn deliver(unwind: &Unwind, frame: &mut Frame, register: i32) -> Result<(), Unwi
 
 /// The exception object a handler reads.
 ///
-/// The engine builds one by constructing the global `Exception` class with the
-/// message and then setting its trace. That class is not in this runtime yet, so
-/// the object is built here with the two members a handler reads and the class
-/// name the class would give it.
+/// The exception is constructed with the message and then given the trace, and
+/// its members and class name come from the class's member table.
 fn exception_object(message: &str, trace: &[FrameTrace]) -> Result<Variant, Fault> {
-    let object = Rc::new(CustomObject::new([TjsString::from("Exception")]));
-    let handle: Rc<dyn crate::vm::runtime::object::Dispatch> = object.clone();
-    object.prop_set(
-        &TjsString::from("message"),
-        MemberFlags::ENSURE,
-        &Variant::String(TjsString::from(message)),
-        Some(handle.as_ref()),
-    )?;
     let lines: Vec<String> = trace.iter().map(FrameTrace::line).collect();
-    object.prop_set(
-        &TjsString::from("trace"),
-        MemberFlags::ENSURE,
-        &Variant::String(TjsString::from(lines.join("\n"))),
-        Some(handle.as_ref()),
-    )?;
-    Ok(Variant::Object(crate::vm::runtime::variant::Closure {
-        object: Some(handle.clone()),
-        objthis: Some(handle),
-    }))
+    let exception = Exception::raised(
+        Variant::String(TjsString::from(message)),
+        Variant::String(TjsString::from(lines.join("\n"))),
+    );
+    exception.object().map_err(Fault::from)
 }
 
 /// The message a reason reads as.
@@ -303,6 +287,9 @@ fn operand(code: &Code, ip: usize, slot: usize) -> Result<i32, Fault> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    use crate::vm::runtime::object::{CustomObject, Dispatch, MemberFlags};
     use crate::vm::runtime::variant::Closure;
 
     fn text(value: &str) -> TjsString {
@@ -513,8 +500,10 @@ mod tests {
         }
     }
 
-    /// The exception object carries the class name a handler asks about and the
-    /// trace as a text (`reference/krkr2/cpp/core/tjs2/tjsError.cpp:47-51`).
+    /// The exception object carries the class name a handler asks about, the
+    /// trace as a text and the class's finalizer
+    /// (`reference/krkr2/cpp/core/tjs2/tjsError.cpp:47-51`,
+    /// `reference/krkr2/cpp/core/tjs2/tjsException.cpp:26`).
     #[test]
     fn the_exception_object_carries_its_trace() {
         let trace = [
@@ -532,7 +521,9 @@ mod tests {
             panic!("the exception is not an object");
         };
         let object = closure.object.expect("an object");
-        assert_eq!(object.is_instance_of(&text("Exception"), None), Ok(true));
+        // reference/cpp/core/tjs2/tjsException.cpp:22-52 - a native class's
+        // instance is not an instance of that class
+        assert_eq!(object.is_instance_of(&text("Exception"), None), Ok(false));
         let message = object
             .prop_get(&text("message"), MemberFlags::NONE, None)
             .expect("the message");
@@ -544,6 +535,10 @@ mod tests {
             panic!("the trace is not a text");
         };
         assert_eq!(trace.to_string().lines().count(), 2);
+        let finalize = object
+            .prop_get(&text("finalize"), MemberFlags::NONE, None)
+            .expect("the finalizer");
+        assert!(matches!(finalize, Variant::Object(_)));
     }
 
     /// The three opcodes are the ones handled, and no others.

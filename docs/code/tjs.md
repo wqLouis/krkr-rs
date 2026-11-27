@@ -103,6 +103,7 @@ the Rust side — no bindgen.
 | natives | `tjs2_register_native_class`, `…_class_ex`, `…_class_instance`, `…_native_static_members`, `…_native_instance_members` |
 | values | `tjs2_retain_value`, `tjs2_release_value`, `tjs2_invalidate_retained`, `tjs2_retain_object`, `tjs2_retain_retained_id`, `tjs2_find_retained_id`, `tjs2_get_global` |
 | members | `tjs2_prop_get`, `tjs2_prop_set` (with the member flags), `tjs2_prop_delete`, `tjs2_prop_set_default`, `tjs2_call_value`, `tjs2_call_value_with_objthis`, `tjs2_call_member`, `tjs2_create_new`, `tjs2_operation`, `tjs2_is_instance_of`, `tjs2_is_valid`, `tjs2_set_arg`, `tjs2_result_needed` |
+| retained calls / class names | `tjs2_call_value_with_objthis_retained`, `tjs2_call_member_retained`, `tjs2_create_new_named` — an object answer stays retained for the caller and the receiver/name crosses by retained id; `tjs2_add_class_name` — add a class name to an object |
 | containers | `tjs2_new_array`, `tjs2_new_dictionary`, `tjs2_array_add` — the VM's own array and dictionary classes, and the array's `add` |
 | introspection | `tjs2_get_class_names`, `tjs2_enum_members`, `tjs2_set_call_missing`, `tjs2_get_native_instance`, `tjs2_get_stack_trace_string`, `tjs2_dump`, `tjs2_do_gc` |
 

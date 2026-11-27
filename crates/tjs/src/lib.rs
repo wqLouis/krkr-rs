@@ -563,6 +563,13 @@ unsafe extern "C" {
         obj: Tjs2ValueId,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Add a class name to a retained object.
+    fn tjs2_add_class_name(
+        e: *mut Engine,
+        obj: Tjs2ValueId,
+        name: *const c_char,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Resolve a retained object to the Rust payload of an instance-based
     /// native class (the VM's native-instance lookup).
     /// Returns null when there is none — the VM's glue states the full
@@ -658,6 +665,17 @@ unsafe extern "C" {
         argc: c_int,
         argv: *const Value,
         objthis: *mut c_void,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Like [`Self::tjs2_call_value_with_objthis`], but an object result is
+    /// retained and crosses as `VAL_RETAINED`; `objthis` is a retained id.
+    fn tjs2_call_value_with_objthis_retained(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        argc: c_int,
+        argv: *const Value,
+        objthis: Tjs2ValueId,
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
@@ -772,6 +790,18 @@ unsafe extern "C" {
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
+    /// Invoke a named member with a retained receiver and retain an object
+    /// answer as `VAL_RETAINED`.
+    fn tjs2_call_member_retained(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
+        argc: c_int,
+        argv: *const Value,
+        objthis: Tjs2ValueId,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
     /// Construct a new object through a retained value's default member
     /// (`CreateNew`, what `new C(...)` does on a class object). An object
     /// result carries no handle: it is the engine's most recent object
@@ -781,6 +811,19 @@ unsafe extern "C" {
         id: Tjs2ValueId,
         argc: c_int,
         argv: *const Value,
+        out: *mut Value,
+        out_error: *mut *mut c_char,
+    ) -> c_int;
+    /// Construct through a named member (or the default member when the name
+    /// is empty) with a retained receiver, retaining an object answer as
+    /// `VAL_RETAINED`.
+    fn tjs2_create_new_named(
+        engine: *mut Engine,
+        id: Tjs2ValueId,
+        membername: *const c_char,
+        argc: c_int,
+        argv: *const Value,
+        objthis: Tjs2ValueId,
         out: *mut Value,
         out_error: *mut *mut c_char,
     ) -> c_int;
@@ -1095,6 +1138,22 @@ pub(crate) enum MemberShape {
     /// The member holds a byte string; the bytes are a copy of the variant's.
     Octet(Vec<u8>),
     /// The member holds an integer, a real or a text.
+    Scalar(TjsValue),
+}
+
+/// The shape a call answer crosses with.
+///
+/// The safe [`TjsValue`] surface folds an object and `null` into
+/// [`TjsValue::Object`]. A call result is read through this shape instead, so
+/// an object result keeps the retention the engine handed back and `null`
+/// stays distinct from it. A byte string is not a call answer this surface
+/// carries and is reported as a failure.
+pub(crate) enum CallAnswer {
+    /// The answer is TJS `null`.
+    Null,
+    /// The answer is an object; the handle owns the retention.
+    Object(DetachedValue),
+    /// The answer is the empty variant, an integer, a real or a text.
     Scalar(TjsValue),
 }
 
@@ -2743,6 +2802,144 @@ name), and none was available"
         })
     }
 
+    /// Invoke a named member and keep the shape of its answer.
+    ///
+    /// `objthis` is the retained id of the receiver the caller computed, or
+    /// `None` to let the engine select the value's own receiver. An object
+    /// answer is retained and returned as [`CallAnswer::Object`].
+    pub(crate) fn call_member_answer(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        args: &[TjsValue],
+        objthis: Option<Tjs2ValueId>,
+    ) -> Result<CallAnswer, String> {
+        let name = std::ffi::CString::new(membername)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        let (_strings, ffi_args) = ffi_arguments(args)?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // argv/out follow the ABI contract for the duration of the call.
+        let rc = unsafe {
+            tjs2_call_member_retained(
+                self.inner,
+                id,
+                name.as_ptr(),
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                objthis.unwrap_or(Tjs2ValueId::null()),
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        self.answer_shape(&out)
+    }
+
+    /// Invoke a retained value's default member and keep the shape of its
+    /// answer. `objthis` has the same meaning as in
+    /// [`Self::call_member_answer`].
+    pub(crate) fn call_value_answer(
+        &self,
+        id: Tjs2ValueId,
+        args: &[TjsValue],
+        objthis: Option<Tjs2ValueId>,
+    ) -> Result<CallAnswer, String> {
+        let (_strings, ffi_args) = ffi_arguments(args)?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // argv/out follow the ABI contract for the duration of the call.
+        let rc = unsafe {
+            tjs2_call_value_with_objthis_retained(
+                self.inner,
+                id,
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                objthis.unwrap_or(Tjs2ValueId::null()),
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        self.answer_shape(&out)
+    }
+
+    /// Construct through a named member (or the default member when `name` is
+    /// empty) and keep the shape of the answer.
+    pub(crate) fn create_new_answer(
+        &self,
+        id: Tjs2ValueId,
+        name: &str,
+        args: &[TjsValue],
+        objthis: Option<Tjs2ValueId>,
+    ) -> Result<CallAnswer, String> {
+        let membername = std::ffi::CString::new(name)
+            .map_err(|_| "member name contains a NUL byte".to_string())?;
+        let (_strings, ffi_args) = ffi_arguments(args)?;
+        let mut out = Value {
+            ty: VAL_VOID,
+            integer: 0,
+            real: 0.0,
+            string: ptr::null(),
+            array: ptr::null(),
+            array_count: 0,
+            retained: 0,
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and id is a live retained id;
+        // argv/out follow the ABI contract for the duration of the call.
+        let rc = unsafe {
+            tjs2_create_new_named(
+                self.inner,
+                id,
+                membername.as_ptr(),
+                ffi_args.len() as c_int,
+                if ffi_args.is_empty() {
+                    ptr::null()
+                } else {
+                    ffi_args.as_ptr()
+                },
+                objthis.unwrap_or(Tjs2ValueId::null()),
+                &mut out,
+                &mut error,
+            )
+        };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        self.answer_shape(&out)
+    }
+
     /// Apply a compound assignment to a member of a retained object value in
     /// one call, so a property or a container observes the read and the write
     /// as the single operation it is.
@@ -2930,47 +3127,69 @@ name), and none was available"
             Err(error) if is_missing_member(&error) => return Ok(MemberShape::Absent),
             Err(error) => return Err(error),
         };
+        if raw.ty == VAL_VOID {
+            return Ok(MemberShape::Void);
+        }
+        if raw.ty == VAL_OCTET {
+            // A zero-length octet is an empty file: it carries no bytes and
+            // is not a failure.
+            if raw.array_count == 0 && !raw.string.is_null() {
+                return Ok(MemberShape::Octet(Vec::new()));
+            }
+            // The octet's bytes live in the engine's last-string buffer and
+            // are valid until the next engine call, so they are copied now.
+            // SAFETY: the value came from a call on this engine and no engine
+            // call runs between the read and the copy.
+            let bytes = match unsafe { raw.octet_bytes() } {
+                Some(bytes) => bytes.to_vec(),
+                // A variant that carries no byte payload is not an empty
+                // octet: the read fails instead of answering with bytes the
+                // value does not hold.
+                None => {
+                    return Err("member read: the octet value has no bytes".into());
+                }
+            };
+            return Ok(MemberShape::Octet(bytes));
+        }
+        Ok(match self.answer_shape(&raw)? {
+            CallAnswer::Null => MemberShape::Null,
+            CallAnswer::Object(object) => MemberShape::Object(object),
+            CallAnswer::Scalar(value) => MemberShape::Scalar(value),
+        })
+    }
+
+    /// The shape of a value the engine returned, with an object's retention
+    /// owned by the answer.
+    fn answer_shape(&self, raw: &Value) -> Result<CallAnswer, String> {
         match raw.ty {
-            VAL_VOID => Ok(MemberShape::Void),
-            VAL_NULL => Ok(MemberShape::Null),
+            VAL_NULL => Ok(CallAnswer::Null),
             VAL_OBJECT => {
                 // The VM keeps the object it produced in the engine's
                 // most-recent-object slot, and the retention resolves
                 // against that slot.
                 // SAFETY: self.inner is a live engine and the value came
                 // from a call on it.
-                let id = unsafe { tjs2_retain_value(self.inner, &raw) };
+                let id = unsafe { tjs2_retain_value(self.inner, raw) };
                 if id.is_null() {
-                    return Err("member read: the object could not be retained".into());
+                    return Err("the object could not be retained".into());
                 }
-                Ok(MemberShape::Object(DetachedValue {
+                Ok(CallAnswer::Object(DetachedValue {
                     engine: self.inner,
                     id,
                 }))
             }
-            VAL_OCTET => {
-                // A zero-length octet is an empty file: it carries no bytes
-                // and is not a failure.
-                if raw.array_count == 0 && !raw.string.is_null() {
-                    return Ok(MemberShape::Octet(Vec::new()));
+            VAL_RETAINED => {
+                let id = Tjs2ValueId::from_raw(raw.retained as *mut c_void);
+                if id.is_null() {
+                    return Err("the retained answer has no id".into());
                 }
-                // The octet's bytes live in the engine's last-string buffer
-                // and are valid until the next engine call, so they are
-                // copied now.
-                // SAFETY: the value came from a call on this engine and no
-                // engine call runs between the read and the copy.
-                let bytes = match unsafe { raw.octet_bytes() } {
-                    Some(bytes) => bytes.to_vec(),
-                    // A variant that carries no byte payload is not an empty
-                    // octet: the read fails instead of answering with bytes
-                    // the value does not hold.
-                    None => {
-                        return Err("member read: the octet value has no bytes".into());
-                    }
-                };
-                Ok(MemberShape::Octet(bytes))
+                Ok(CallAnswer::Object(DetachedValue {
+                    engine: self.inner,
+                    id,
+                }))
             }
-            _ => Ok(MemberShape::Scalar(take_value(&raw))),
+            VAL_OCTET => Err("an octet answer is not a value the bridge carries".into()),
+            _ => Ok(CallAnswer::Scalar(take_value(raw))),
         }
     }
 
@@ -3281,6 +3500,21 @@ name), and none was available"
         })
     }
 
+    /// Add a class name to a retained object (the VM's
+    /// `ClassInstanceInfo(TJS_CII_ADD)`).
+    pub(crate) fn add_class_name(&self, obj: Tjs2ValueId, name: &str) -> Result<(), String> {
+        let name = std::ffi::CString::new(name)
+            .map_err(|_| "class name contains a NUL byte".to_string())?;
+        let mut error: *mut c_char = ptr::null_mut();
+        // SAFETY: self.inner is a live engine and obj is a live retained id;
+        // name is a NUL-terminated string for the duration of the call.
+        let rc = unsafe { tjs2_add_class_name(self.inner, obj, name.as_ptr(), &mut error) };
+        if rc != 0 {
+            return Err(take_error_string(error));
+        }
+        Ok(())
+    }
+
     /// Member names of a retained object, sorted and de-duplicated.
     ///
     /// Uses the VM's `EnumMembers` with `TJS_IGNOREPROP | TJS_ENUM_NO_VALUE`
@@ -3581,6 +3815,15 @@ fn take_error_string(e: *mut c_char) -> String {
 /// NUL-terminated copies kept alive in `strings` for the duration of the
 /// call. Object values cannot be reconstructed on the Rust side (no object
 /// handle crosses the ABI) and are rejected.
+fn ffi_arguments(args: &[TjsValue]) -> Result<(Vec<CString>, Vec<Value>), String> {
+    let mut strings = Vec::new();
+    let values = args
+        .iter()
+        .map(|value| value_to_ffi(value, &mut strings))
+        .collect::<Result<_, _>>()?;
+    Ok((strings, values))
+}
+
 fn value_to_ffi(v: &TjsValue, strings: &mut Vec<CString>) -> Result<Value, String> {
     let mut out = Value {
         ty: VAL_VOID,

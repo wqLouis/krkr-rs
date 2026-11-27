@@ -1,0 +1,39 @@
+# the engine's answers, recorded by `crates/tjs/examples/exception_oracle.rs`; regenerate with the command in the example's docs
+surface_class	String	Object
+surface_class_constructor	String	Object
+surface_class_finalize	String	Object
+surface_class_message	String	undefined
+surface_class_trace	String	undefined
+absent_class	String	undefined
+absent_constructor	String	undefined
+absent_init	String	undefined
+absent_to_string	String	undefined
+kind_instance	String	Object
+kind_message	String	String
+kind_trace	String	String
+kind_finalize	String	Object
+kind_finalize_call	String	void
+kind_void_message	String	String
+value_default_message	String	
+value_default_trace	String	
+value_message_text	String	m
+value_message_integer	Integer	1
+value_message_real	Real	1.5
+value_message_empty	String	
+value_message_void	String	
+value_trace_text	String	t
+value_trace_integer	Integer	4
+value_trace_void	String	
+value_message_extra	String	m
+value_instance_of	Integer	0
+value_instance_of_object	!raise	!raise
+caught_exception	String	Object:0
+caught_text	String	String:0
+caught_integer	String	Integer:0
+caught_dictionary	String	Object:0
+caught_exception_two	String	Object:0
+caught_exception_default	String	Object:0
+caught_members	String	Object:String:thrown:String:
+caught_members_two	String	Object:String:m:String:t
+caught_members_default	String	Object:String::String:
+deferred_value_raised_divide	String	Object:0:Object:String:Division by zero:String:0

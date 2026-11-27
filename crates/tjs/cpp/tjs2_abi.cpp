@@ -1799,6 +1799,41 @@ static TJS::iTJSDispatch2 *resolve_retained_object(tjs2_engine *e,
     return it->second.AsObjectNoAddRef();
 }
 
+// Copy a call result to a tjs2_value, retaining an object as
+// TJS2_VAL_RETAINED. A null result is still TJS2_VAL_NULL, and every other
+// kind follows variant_to_value. The caller owns the retention.
+static void variant_to_retained_value(tjs2_engine *e,
+                                      const TJS::tTJSVariant &v,
+                                      tjs2_value *out) {
+    if(v.Type() == tvtObject && v.AsObjectNoAddRef()) {
+        if(!out)
+            return;
+        out->type = TJS2_VAL_RETAINED;
+        out->integer = 0;
+        out->real = 0.0;
+        out->string = nullptr;
+        out->array = nullptr;
+        out->array_count = 0;
+        out->retained = retain_variant(e, v);
+        return;
+    }
+    variant_to_value(e, v, out);
+}
+
+// Resolve an optional objthis id after the arguments have been converted.
+// The conversion may consume retained ids, so this must not run before it.
+static bool resolve_objthis(tjs2_engine *e, tjs2_value_id id,
+                            TJS::iTJSDispatch2 *&objthis, char **out_error) {
+    if(!id)
+        return true;
+    objthis = resolve_retained_object(e, id);
+    if(objthis)
+        return true;
+    if(out_error)
+        *out_error = make_error_string("invalid objthis retained value");
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // C ABI
 // ---------------------------------------------------------------------------
@@ -2486,6 +2521,52 @@ int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
         out->array = nullptr;
         out->array_count = 0;
         out->retained = retain_variant(e, var);
+        return 0;
+    } catch(const TJS::eTJS &err) {
+        if(out_error)
+            *out_error = make_error_message(err);
+        return 1;
+    } catch(const std::exception &err) {
+        if(out_error) {
+            std::string m = std::string("C++ exception: ") + err.what();
+            char *buf = (char *)malloc(m.size() + 1);
+            if(buf)
+                std::memcpy(buf, m.c_str(), m.size() + 1);
+            *out_error = buf;
+        }
+        return 1;
+    } catch(...) {
+        if(out_error) {
+            char *buf = (char *)malloc(8);
+            if(buf)
+                std::memcpy(buf, "unknown", 8);
+            *out_error = buf;
+        }
+        return 1;
+    }
+}
+
+int tjs2_add_class_name(tjs2_engine *e, tjs2_value_id obj,
+                        const char *name_utf8, char **out_error) {
+    if(out_error)
+        *out_error = nullptr;
+    if(!e || !obj || !name_utf8) {
+        if(out_error)
+            *out_error = make_error_string("invalid object argument");
+        return -1;
+    }
+    try {
+        TJS::iTJSDispatch2 *dsp = resolve_retained_object(e, obj);
+        if(!dsp) {
+            if(out_error)
+                *out_error = make_error_string("invalid retained object");
+            return 1;
+        }
+        std::u16string name16 = utf8_to_u16(name_utf8);
+        TJS::tTJSVariant name(ttstr(name16.c_str()));
+        tjs_error err = dsp->ClassInstanceInfo(TJS_CII_ADD, 0, &name);
+        if(TJS_FAILED(err))
+            TJSThrowFrom_tjs_error(err, nullptr);
         return 0;
     } catch(const TJS::eTJS &err) {
         if(out_error)
@@ -3299,6 +3380,7 @@ char *tjs2_invalidate_error_message(void *engine) {
 // fills `out`; non-zero on failure with a malloc'd message in *out_error.
 static int tjs2_call_value_impl(void *engine, tjs2_value_id id, int argc,
                                 const tjs2_value *argv, void *objthis,
+                                tjs2_value_id objthis_id, bool retain_object,
                                 tjs2_value *out, char **out_error) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id || argc < 0 || (argc > 0 && !argv)) {
@@ -3342,16 +3424,23 @@ static int tjs2_call_value_impl(void *engine, tjs2_value_id id, int argc,
             return 1;
         }
 
+        TJS::iTJSDispatch2 *receiver = (TJS::iTJSDispatch2 *)objthis;
+        if(!resolve_objthis(e, objthis_id, receiver, out_error))
+            return 1;
+
         TJS::tTJSVariant result;
         TJS::tTJSVariantClosure clo =
             it->second.AsObjectClosureNoAddRef(); // throws if not an object
         tjs_error hr = clo.FuncCall(0, nullptr, nullptr, &result, argc,
                                     params.empty() ? nullptr : params.data(),
-                                    (TJS::iTJSDispatch2 *)objthis);
+                                    receiver);
         if(TJS_FAILED(hr))
             TJSThrowFrom_tjs_error(hr, nullptr); // -> catch(eTJS) below
 
-        variant_to_value(e, result, out);
+        if(retain_object)
+            variant_to_retained_value(e, result, out);
+        else
+            variant_to_value(e, result, out);
         if(out_error)
             *out_error = nullptr;
         return 0;
@@ -3382,15 +3471,23 @@ static int tjs2_call_value_impl(void *engine, tjs2_value_id id, int argc,
 int tjs2_call_value(void *engine, tjs2_value_id id, int argc,
                     const tjs2_value *argv, tjs2_value *out,
                     char **out_error) {
-    return tjs2_call_value_impl(engine, id, argc, argv, nullptr, out,
-                                out_error);
+    return tjs2_call_value_impl(engine, id, argc, argv, nullptr, nullptr,
+                                false, out, out_error);
 }
 
 int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
                                  const tjs2_value *argv, void *objthis,
                                  tjs2_value *out, char **out_error) {
-    return tjs2_call_value_impl(engine, id, argc, argv, objthis, out,
-                                out_error);
+    return tjs2_call_value_impl(engine, id, argc, argv, objthis, nullptr,
+                                false, out, out_error);
+}
+
+int tjs2_call_value_with_objthis_retained(void *engine, tjs2_value_id id,
+                                          int argc, const tjs2_value *argv,
+                                          tjs2_value_id objthis,
+                                          tjs2_value *out, char **out_error) {
+    return tjs2_call_value_impl(engine, id, argc, argv, nullptr, objthis, true,
+                                out, out_error);
 }
 
 // Invoke a named member on a retained object value (e.g. the timer
@@ -3399,11 +3496,15 @@ int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
 // handler then resolves to the script subclass's override). Member lookup
 // goes through the object's own class chain, so a script subclass that
 // overrides `onTimer` (like the game's OnceTimer) runs its override
-// instead of the native method. Returns 0 on success and fills `out`;
-// non-zero on failure with a malloc'd message in *out_error.
-int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
-                     int argc, const tjs2_value *argv, tjs2_value *out,
-                     char **out_error) {
+// instead of the native method. `retain_object` selects whether an object
+// answer is retained or kept as the old object-typed value; `objthis_id`
+// supplies a fallback receiver by retained id. Returns 0 on success and
+// fills `out`; non-zero on failure with a malloc'd message in *out_error.
+static int tjs2_call_member_impl(void *engine, tjs2_value_id id,
+                                 const char *membername, int argc,
+                                 const tjs2_value *argv,
+                                 tjs2_value_id objthis_id, bool retain_object,
+                                 tjs2_value *out, char **out_error) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id || !membername || argc < 0 || (argc > 0 && !argv)) {
         if(out_error)
@@ -3438,6 +3539,10 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
             return 1;
         }
 
+        TJS::iTJSDispatch2 *objthis = nullptr;
+        if(!resolve_objthis(e, objthis_id, objthis, out_error))
+            return 1;
+
         std::u16string member16 = utf8_to_u16(membername);
         TJS::tTJSVariant result;
         TJS::tTJSVariantClosure clo =
@@ -3445,11 +3550,14 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
         tjs_error hr = clo.FuncCall(0, member16.c_str(), nullptr, &result,
                                     argc,
                                     params.empty() ? nullptr : params.data(),
-                                    nullptr);
+                                    objthis);
         if(TJS_FAILED(hr))
             TJSThrowFrom_tjs_error(hr, member16.c_str()); // -> catch(eTJS) below
 
-        variant_to_value(e, result, out);
+        if(retain_object)
+            variant_to_retained_value(e, result, out);
+        else
+            variant_to_value(e, result, out);
         if(out_error)
             *out_error = nullptr;
         return 0;
@@ -3477,15 +3585,30 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
     }
 }
 
-// Construct a new object through a retained value's default member
-// (CreateNew with no member name), which is what `new C(...)` does on a class
-// object. The created object is handed over as an object-typed value: the
-// value itself carries no handle, so the caller retains it (tjs2_retain_value)
-// before the next engine call. Same argument and error conventions as
-// tjs2_call_value_impl, whose shape this entry follows.
-int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
-                    const tjs2_value *argv, tjs2_value *out,
-                    char **out_error) {
+int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
+                     int argc, const tjs2_value *argv, tjs2_value *out,
+                     char **out_error) {
+    return tjs2_call_member_impl(engine, id, membername, argc, argv, nullptr,
+                                 false, out, out_error);
+}
+
+int tjs2_call_member_retained(void *engine, tjs2_value_id id,
+                              const char *membername, int argc,
+                              const tjs2_value *argv, tjs2_value_id objthis,
+                              tjs2_value *out, char **out_error) {
+    return tjs2_call_member_impl(engine, id, membername, argc, argv, objthis,
+                                 true, out, out_error);
+}
+
+// Construct through a retained value, optionally through a named member and
+// with a fallback receiver. `retain_object` selects whether an object answer
+// is retained or kept as the old object-typed value. Same argument and error
+// conventions as tjs2_call_value_impl, whose shape this entry follows.
+static int tjs2_create_new_impl(void *engine, tjs2_value_id id,
+                                const char *membername, int argc,
+                                const tjs2_value *argv,
+                                tjs2_value_id objthis_id, bool retain_object,
+                                tjs2_value *out, char **out_error) {
     tjs2_engine *e = (tjs2_engine *)engine;
     if(!e || !id || argc < 0 || (argc > 0 && !argv)) {
         if(out_error)
@@ -3523,14 +3646,21 @@ int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
             return 1;
         }
 
+        TJS::iTJSDispatch2 *objthis = nullptr;
+        if(!resolve_objthis(e, objthis_id, objthis, out_error))
+            return 1;
+
+        std::u16string member16 =
+            membername ? utf8_to_u16(membername) : std::u16string();
+        const tjs_char *member = member16.empty() ? nullptr : member16.c_str();
         TJS::tTJSVariantClosure clo =
             it->second.AsObjectClosureNoAddRef(); // throws if not an object
         TJS::iTJSDispatch2 *created = nullptr;
         tjs_error hr = clo.CreateNew(
-            0, nullptr, nullptr, &created, argc,
-            params.empty() ? nullptr : params.data(), nullptr);
+            0, member, nullptr, &created, argc,
+            params.empty() ? nullptr : params.data(), objthis);
         if(TJS_FAILED(hr))
-            TJSThrowFrom_tjs_error(hr, nullptr); // -> catch(eTJS) below
+            TJSThrowFrom_tjs_error(hr, member); // -> catch(eTJS) below
 
         // The created reference is transferred into the result variant, which
         // AddRefs it, so the local reference is released right away.
@@ -3539,7 +3669,10 @@ int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
             result = TJS::tTJSVariant(created, created);
             created->Release();
         }
-        variant_to_value(e, result, out);
+        if(retain_object)
+            variant_to_retained_value(e, result, out);
+        else
+            variant_to_value(e, result, out);
         if(out_error)
             *out_error = nullptr;
         return 0;
@@ -3561,6 +3694,21 @@ int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
             *out_error = make_error_string("create_new failed");
         return 1;
     }
+}
+
+int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
+                    const tjs2_value *argv, tjs2_value *out,
+                    char **out_error) {
+    return tjs2_create_new_impl(engine, id, nullptr, argc, argv, nullptr,
+                                false, out, out_error);
+}
+
+int tjs2_create_new_named(void *engine, tjs2_value_id id,
+                          const char *membername, int argc,
+                          const tjs2_value *argv, tjs2_value_id objthis,
+                          tjs2_value *out, char **out_error) {
+    return tjs2_create_new_impl(engine, id, membername, argc, argv, objthis,
+                                true, out, out_error);
 }
 
 // Read a named property from a retained object value through its class

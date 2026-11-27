@@ -13,6 +13,7 @@
 pub mod config;
 pub mod date;
 pub mod date_parse;
+pub mod exception;
 pub mod math;
 pub mod random;
 pub mod string;

@@ -373,6 +373,14 @@ int tjs2_get_class_names(tjs2_engine *e, tjs2_value_id obj, tjs2_value *out,
                          char **out_error);
 
 /*
+ * Add a class name to a retained object (`ClassInstanceInfo(TJS_CII_ADD)`).
+ * `name_utf8` is a NUL-terminated UTF-8 class name. Returns 0 on success; on
+ * failure returns non-zero with a malloc'd UTF-8 message in *out_error.
+ */
+int tjs2_add_class_name(tjs2_engine *e, tjs2_value_id obj,
+                        const char *name_utf8, char **out_error);
+
+/*
  * Enumerate the members of a retained object (reference
  * `Scripts.getObjectKeys` / `ScriptsAdd::_getKeys`): walk the object's
  * `iTJSDispatch2::EnumMembers` with `TJS_IGNOREPROP | TJS_ENUM_NO_VALUE`
@@ -540,6 +548,17 @@ int tjs2_call_value_with_objthis(void *engine, tjs2_value_id id, int argc,
                                  tjs2_value *out, char **out_error);
 
 /*
+ * Like tjs2_call_value_with_objthis, but an object answer is retained for the
+ * caller and crosses as TJS2_VAL_RETAINED (its `retained` slot owns the
+ * release); `objthis` is a retained object id, or 0 for no fallback receiver.
+ * A null answer stays TJS2_VAL_NULL, and a byte string stays TJS2_VAL_OCTET.
+ */
+int tjs2_call_value_with_objthis_retained(void *engine, tjs2_value_id id,
+                                          int argc, const tjs2_value *argv,
+                                          tjs2_value_id objthis,
+                                          tjs2_value *out, char **out_error);
+
+/*
  * Invoke a named member of a retained object value (FuncCall with the member
  * name), so naming a method is one call rather than a read of the member
  * followed by a call on the value the read answered. Member lookup goes
@@ -556,6 +575,16 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
                      char **out_error);
 
 /*
+ * Like tjs2_call_member, but an object answer is retained for the caller and
+ * crosses as TJS2_VAL_RETAINED; `objthis` is a retained object id, or 0 for no
+ * fallback receiver. The retained id in `objthis` is not consumed.
+ */
+int tjs2_call_member_retained(void *engine, tjs2_value_id id,
+                              const char *membername, int argc,
+                              const tjs2_value *argv, tjs2_value_id objthis,
+                              tjs2_value *out, char **out_error);
+
+/*
  * Construct a new object through a retained value's default member (CreateNew
  * with no member name, which is what `new C(...)` does on a class object)
  * with argc arguments. The object it answers crosses as a TJS2_VAL_OBJECT
@@ -570,6 +599,18 @@ int tjs2_call_member(void *engine, tjs2_value_id id, const char *membername,
 int tjs2_create_new(void *engine, tjs2_value_id id, int argc,
                     const tjs2_value *argv, tjs2_value *out,
                     char **out_error);
+
+/*
+ * Construct through a named member of a retained value, with a retained
+ * receiver, and retain an object answer for the caller. `membername` is the
+ * member to construct through, or NULL/empty for the value's default member.
+ * `objthis` is a retained object id, or 0 for no fallback receiver. An object
+ * answer crosses as TJS2_VAL_RETAINED.
+ */
+int tjs2_create_new_named(void *engine, tjs2_value_id id,
+                          const char *membername, int argc,
+                          const tjs2_value *argv, tjs2_value_id objthis,
+                          tjs2_value *out, char **out_error);
 
 /*
  * Read a named property from a retained object value (PropGet through the

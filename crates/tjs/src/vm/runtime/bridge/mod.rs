@@ -17,19 +17,20 @@
 //! refused.
 //!
 //! An answer crosses **out** of the engine as a [`Variant`]: an object the
-//! read retained becomes a [`CHandle`], so the next entry reaches the same
-//! object. An answer the safe surface cannot tell apart from `null` or a byte
-//! string is refused rather than guessed.
+//! call retained becomes a [`CHandle`], so the next entry reaches the same
+//! object; `null` is the null closure, and a byte string is refused because
+//! the safe value surface has no octet kind.
 //!
-//! # The refusals
+//! # What remains limited
 //!
-//! The interface has no entry for a named construction, for adding a class
-//! name to an existing object, or for an ordered member walk; those entries
-//! answer [`ObjectError::CallNotServed`]. The calls the interface does have
-//! keep the receiver the value itself carries, so a receiver the executor
-//! computed is not crossed.
+//! An ordered member walk is not served: [`Dispatch::enum_members`] answers
+//! the safe wrapper's sorted, de-duplicated names and gives every member zero
+//! flags. A byte-string answer is refused because the safe value surface has
+//! no octet kind. A call carries the receiver the executor computed when it
+//! is an engine object; a receiver the Rust object model owns has no retained
+//! id, so the call is refused rather than run on another object.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::vm::runtime::number::Number;
@@ -37,7 +38,7 @@ use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
 use crate::vm::runtime::string::TjsString;
 use crate::vm::runtime::variant::{Closure, Variant};
-use crate::{DetachedValue, MemberShape, Tjs2Engine, Tjs2ValueId, TjsValue};
+use crate::{CallAnswer, DetachedValue, MemberShape, Tjs2Engine, Tjs2ValueId, TjsValue};
 
 /// An engine object, reached through its retained id.
 ///
@@ -52,8 +53,8 @@ pub struct CHandle {
     retained: Rc<DetachedValue>,
     /// The engine the object belongs to.
     engine: Rc<Tjs2Engine>,
-    /// The class names the interface answered for the object, once.
-    class_names: Rc<Vec<TjsString>>,
+    /// The class names the interface answered for the object.
+    class_names: Rc<RefCell<Vec<TjsString>>>,
     /// Whether the object was usable, from the last interface answer.
     valid: Rc<Cell<bool>>,
 }
@@ -86,7 +87,7 @@ impl CHandle {
         Ok(Self {
             retained: Rc::new(value),
             engine,
-            class_names: Rc::new(class_names),
+            class_names: Rc::new(RefCell::new(class_names)),
             valid: Rc::new(Cell::new(valid)),
         })
     }
@@ -205,12 +206,10 @@ fn retained_value(value: &DetachedValue) -> TjsValue {
     TjsValue::Retained(value.raw_id().as_ptr() as u64)
 }
 
-/// The variant an engine answer marshals to.
+/// The variant a scalar engine answer marshals to.
 ///
-/// An object answer is refused: the call that produces it keeps the object in
-/// the engine's most-recent-object slot, not in a handle this adapter can own,
-/// and the safe value surface cannot tell such an answer from `null` or a byte
-/// string.
+/// An object or a byte string never reaches here: the read and the call adopt
+/// an object through [`CHandle`] and refuse a byte string.
 fn to_variant(answer: TjsValue) -> Result<Variant, ObjectError> {
     match answer {
         TjsValue::Void => Ok(Variant::Void),
@@ -233,6 +232,30 @@ fn arguments(
             .map(|value| to_value(engine, value, keep))
             .collect(),
         None => Ok(Vec::new()),
+    }
+}
+
+/// The receiver id a call crosses with.
+///
+/// `None` is no fallback receiver: the engine then uses the value's own
+/// receiver, or the value itself. A receiver the Rust object model owns has no
+/// retained id, so it cannot cross.
+fn receiver_id(objthis: Option<&dyn Dispatch>) -> Result<Option<Tjs2ValueId>, ObjectError> {
+    match objthis {
+        None => Ok(None),
+        Some(receiver) => receiver
+            .engine_id()
+            .map(Some)
+            .ok_or(ObjectError::CallNotServed),
+    }
+}
+
+/// The variant an engine call answer becomes.
+fn call_answer(engine: &Rc<Tjs2Engine>, answer: CallAnswer) -> Result<Variant, ObjectError> {
+    match answer {
+        CallAnswer::Null => Ok(Variant::Object(Closure::null())),
+        CallAnswer::Object(object) => Ok(object_value(CHandle::new(engine.clone(), object)?)),
+        CallAnswer::Scalar(value) => to_variant(value),
     }
 }
 
@@ -363,13 +386,16 @@ impl Dispatch for CHandle {
     }
 
     fn class_names(&self) -> Vec<TjsString> {
-        (*self.class_names).clone()
+        self.class_names.borrow().clone()
     }
 
-    fn add_class_name(&self, _name: &TjsString) -> Result<(), ObjectError> {
-        // The interface publishes class names as a read; there is no write
-        // beside it, so a name cannot be added to an engine object.
-        Err(ObjectError::CallNotServed)
+    fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError> {
+        self.live()?;
+        self.engine
+            .add_class_name(self.id(), &name.to_string())
+            .map_err(|_| ObjectError::CallNotServed)?;
+        self.class_names.borrow_mut().push(name.clone());
+        Ok(())
     }
 
     fn engine_id(&self) -> Option<Tjs2ValueId> {
@@ -401,45 +427,48 @@ impl Dispatch for CHandle {
         &self,
         name: &TjsString,
         argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
+        let receiver = receiver_id(objthis)?;
         let mut keep = Vec::new();
         let args = arguments(&self.engine, argv, &mut keep)?;
         // A named call goes through the object's class chain; the value's own
-        // call is its default member. The receiver the executor computed is
-        // not crossed: the interface has no safe route for it, and the value's
-        // own receiver wins in the engine's rule anyway.
+        // call is its default member. The computed receiver crosses as its
+        // retained id, so the engine's own receiver preference still wins.
         let answer = if name.is_empty() {
-            self.engine.call_detached(&self.retained, &args)
+            self.engine.call_value_answer(self.id(), &args, receiver)
         } else {
-            self.engine.call_member(self.id(), &name.to_string(), &args)
+            self.engine
+                .call_member_answer(self.id(), &name.to_string(), &args, receiver)
         };
         drop(keep);
-        to_variant(answer.map_err(|_| ObjectError::CallNotServed)?)
+        call_answer(
+            &self.engine,
+            answer.map_err(|_| ObjectError::CallNotServed)?,
+        )
     }
 
     fn create_new(
         &self,
         name: &TjsString,
         argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
+        objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
-        if !name.is_empty() {
-            // The `NEW` instruction already resolved the class into the value
-            // it hands over; a named construction would need a member lookup
-            // the interface does not offer as one call.
-            return Err(ObjectError::CallNotServed);
-        }
+        let receiver = receiver_id(objthis)?;
         let mut keep = Vec::new();
         let args = arguments(&self.engine, argv, &mut keep)?;
-        let object = self
+        let answer = self
             .engine
-            .create_new(self.id(), &args)
-            .map_err(|_| ObjectError::CallNotServed)?;
+            .create_new_answer(self.id(), &name.to_string(), &args, receiver);
         drop(keep);
-        Ok(object_value(CHandle::new(self.engine.clone(), object)?))
+        match answer.map_err(|_| ObjectError::CallNotServed)? {
+            CallAnswer::Object(object) => {
+                Ok(object_value(CHandle::new(self.engine.clone(), object)?))
+            }
+            CallAnswer::Null | CallAnswer::Scalar(_) => Err(ObjectError::CallNotServed),
+        }
     }
 
     fn operation(
