@@ -41,33 +41,34 @@ Twenty-two further members are attached to the same class object by the
 
 Both read the storage, apply the mode's `oN` byte offset, and then:
 
-1. offer the bytes to the **bytecode loader** first;
-2. only if the loader reports "not bytecode", decode them as text.
+1. refuse a **compiled** storage whose bytes start with the `TJS2100` tag;
+2. decode every other storage as text and run it through the Rust executor.
 
-The order matters: a file with the bytecode magic that fails to load is a
-typed error, not a fall-through to the text path.
+The refusal is deliberate: the vendored bytecode loader dies with the
+inter-code bridge, and the Rust executor has no loader for the reference's
+container yet. A `.tjsb` raises a typed error that names the storage and the
+`TJS2100` tag; it is never decoded as text and never falls back to the
+vendored executor.
 
 The reference reads the storage the script named and offers what it read to
 the bytecode loader (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`);
 it looks for no other storage. A script that wants a compiled form asks for
-that storage by name.
+that storage by name. Until the Rust loader lands, that request fails by
+name rather than running through the old engine.
 
 `execStorage` runs the script and an explicit top-level `return` is the
 result; `evalStorage` evaluates the storage: an expression-shaped storage
 yields its value, and a script-shaped storage — a class or a function
 definition — runs as a script. The TJS2's expression mode compiles the text
 as `return <text>;`, so a script-shaped storage is a grammar error there;
-`evalStorage` runs it as a script instead.
+`evalStorage` runs it as a script instead. Only that compile failure selects
+the script mode, so an expression that compiles and then raises has run once
+and is not run again.
 
-A bytecode storage carries **one** script. The loader reads a single block
-per file and executes that block; the file's data area holds the compiled
-script's **constant pools** — the byte, short, int, int64, double, string and
-octet arrays (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:75-152`). Its
-strings are constants of that one script, not a list of scripts to run: a
-shipped title's `patch.tjs` keeps its whole script manifest there, as UTF-16
-constants, and the title's runtime loads those scripts one storage at a time.
 The block name is the **basename** of the requested storage, not the full
-name.
+name. The executor keeps one shared global-member store per bound engine, so
+a top-level function one script declares stays callable from the next Rust
+script entry.
 
 The third argument is the script's `this`. It must be an **object**: a
 present non-object raises `Scripts.execStorage: the execution context is not
@@ -198,36 +199,38 @@ error message.
 result-need rule, `eval` returning a callable object, `setCallMissing`,
 `getClassNames`, `getTraceString` and `dump`, the `textEncoding` round trip
 and its alias normalization, `context` as `this` and `lineofs`, the storage
-basename as the block name, the debug failure excerpt, the
-`compileStorage` → `execStorage` bytecode round trip, the bytecode magic
-being rejected by the loader rather than run as text, a corrupt or truncated
-bytecode being a typed error, the "no storage" errors and the arity errors,
+basename as the block name, the debug failure excerpt, the `compileStorage`
+writer, the `TJS2100` refusal, the "no storage" errors and the arity errors,
 and `evalStorage` evaluating an expression-shaped storage and running a
 script-shaped one.
 
-The bytecode story has its own tests there: a script run from its compiled
-form leaves the same values and raises the same message as the source it was
-compiled from.
+The bytecode tests now assert the decision: a compiled storage is refused by
+name before any text decode, whether its header is intact, corrupt,
+truncated, or shorter than the reference's fixed header.
 
 ---
 
 ## 8. Known gaps
 
-1. **The bytecode round trip is a self-consistency proof.** The port's
-   bytecode *writer* has a known gap — a property-access compound assignment
-   (`+=`) is not round-tripped — so a `.tjsb` produced by the original
-   KiriKiri is **not** proven to load here. That needs a device run.
-2. **Bytecode from another compiler revision is not proven** to load; the
-   loader's recognized-but-rejected path raises the loader's own
-   `Bytecode read error`.
-3. **`compileStorage` reads the source as text only** and always uses an
+1. **No bytecode loader in the Rust executor.** `compileStorage` still writes
+   the reference's `TJS2100` container through the vendored writer, but
+   `execStorage`/`evalStorage` refuse such a storage until a Rust loader
+   replaces the vendored one.
+2. **`compileStorage` reads the source as text only** and always uses an
    empty mode (no `oN` offset).
-4. **`textEncoding` unset means auto-detection**, not forced UTF-8, even
+3. **`textEncoding` unset means auto-detection**, not forced UTF-8, even
    though the getter reports `"UTF-8"`.
-5. **The `textEncoding` setter fails silently** when the binding is missing.
-6. **Debug-only diagnostics** (not script-observable): the `script read …`
+4. **The `textEncoding` setter fails silently** when the binding is missing.
+5. **Debug-only diagnostics** (not script-observable): the `script read …`
    line and the failure excerpt, which shows the failing line's source window
    capped at 8192 bytes.
+6. **A Rust-owned object answer cannot cross the native result.** An
+   `evalStorage` of a dictionary literal, or a script that returns a class or
+   function object, raises the typed "object with no engine handle" refusal.
+   A class or function a storage declares is visible to later Rust script
+   entries through the shared global store, but not to a script still running
+   in the vendored executor. Closing this needs a bridge that lets a
+   non-global engine object carry Rust-owned members.
 
 ---
 

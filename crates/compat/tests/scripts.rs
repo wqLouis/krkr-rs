@@ -728,93 +728,34 @@ const OPCODE_SCRIPTS: &[(&str, &str)] = &[
     // VM_DEBUGGER: the debugger statement.
     ("p_debugger", "debugger; var p_debugger = 1;"),
 ];
-
-/// Every opcode the code generator can emit survives the bytecode round
-/// trip: the script and the bytecode it was compiled from produce the same
-/// result.
+/// Every script the opcode table names compiles to the reference's container
+/// through `Scripts.compileStorage`, and `Scripts.execStorage` refuses that
+/// container by name: the Rust executor has no bytecode loader.
 ///
-/// The writer and the reader share one table of opcode layouts, so an
-/// instruction is serialised and read back with the same operand count.
+/// The writer still has to accept every opcode the generator emits, so a
+/// source form that fails to compile is a writer finding even though the
+/// compiled form cannot run here.
 #[test]
-fn every_opcode_round_trips_through_bytecode() {
+fn every_opcode_compiles_to_refused_bytecode() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     for (name, source) in OPCODE_SCRIPTS {
-        // The source form.
-        env.run(source);
-        let from_source = env.eval_ok(name);
-        // The member the source form wrote is removed, so the bytecode form
-        // has to write it again: a bytecode form that ran nothing cannot
-        // pass on the value the source form left behind.
-        env.run(&format!("delete {name};"));
-        // The bytecode form: the same script, compiled and run.
         let compiled = compile_fixture(
             &env,
             source,
             &format!("data/{name}_src.tjs"),
             &format!("data/{name}.tjsb"),
         );
-        env.run(&format!("Scripts.execStorage({compiled:?});"));
-        let from_bytecode = env.eval_ok(name);
+        let bytes = std::fs::read(env.game_dir().unwrap().join(&compiled)).unwrap();
         assert_eq!(
-            from_bytecode, from_source,
-            "{name}: the bytecode form must produce the result of the source"
+            &bytes[..8],
+            b"TJS2100\0",
+            "{name}: the writer must emit the bytecode tag"
         );
+        let error = env.error(&format!("Scripts.execStorage({compiled:?});"));
+        assert!(error.contains("TJS2100"), "{name}: {error}");
+        assert!(error.contains("unsupported"), "{name}: {error}");
     }
-}
-
-/// The diagnostic of the script that failed: the line it names and the
-/// message it carries.
-///
-/// The VM formats a script error as "<block>(<line>): <message>"
-/// (`reference/cpp/core/tjs2/tjsScriptBlock.cpp:176-189`), and the error
-/// that reaches the caller carries the caller's own block and line in front
-/// of the script's diagnostic. The script's diagnostic is the one that names
-/// the storage the script ran from.
-fn script_diagnostic<'a>(error: &'a str, storage: &str) -> Option<(u32, &'a str)> {
-    let named = format!("{storage}(");
-    let start = error.find(&named)? + named.len();
-    let line_end = error[start..].find(')')? + start;
-    let line = error[start..line_end].parse().ok()?;
-    let message = error[line_end..].strip_prefix("): ")?;
-    Some((line, message))
-}
-
-/// A script that fails at run time names the line of its source, and the
-/// same script compiled to bytecode names that line too.
-///
-/// The source form is the reference's own: the block counts the lines of the
-/// text it compiles, and the error carries the line the failing statement is
-/// on (`reference/cpp/core/tjs2/tjsScriptBlock.cpp:214-233`,
-/// `reference/cpp/core/tjs2/tjsError.cpp:84-87`).
-///
-/// The bytecode form used to report line 1: the loader created the script
-/// block without a source, so the line table was empty and every failure
-/// landed on the first line. The bytecode file carries the source text and
-/// the source positions, and the block rebuilds its line table from them, so
-/// the two forms name the same line.
-#[test]
-fn a_bytecode_script_reports_the_line_of_its_source() {
-    let _lock = vm_lock();
-    let env = common::Env::with_storage();
-    let source = "var probe = 1;\nvar probe2 = 2;\nthrow 'boom';\n";
-    let compiled = compile_fixture(&env, source, "data/line_src.tjs", "data/line.tjsb");
-    // The source form.
-    let from_source = env.error("Scripts.execStorage('data/line_src.tjs');");
-    // The bytecode form.
-    let from_bytecode = env.error(&format!("Scripts.execStorage({compiled:?});"));
-    let (source_line, _) = script_diagnostic(&from_source, "line_src.tjs")
-        .unwrap_or_else(|| panic!("the source form names no line: {from_source}"));
-    assert_eq!(
-        source_line, 3,
-        "the source form must name the line it fails on: {from_source}"
-    );
-    let (bytecode_line, _) = script_diagnostic(&from_bytecode, "line.tjsb")
-        .unwrap_or_else(|| panic!("the bytecode form names no line: {from_bytecode}"));
-    assert_eq!(
-        bytecode_line, 3,
-        "the bytecode form must name the line it fails on: {from_bytecode}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -846,27 +787,11 @@ fn compile_fixture(
     );
     compiled_name.to_string()
 }
-
-/// A compiled script loads and executes. `Scripts.compileStorage` is the
-/// VM's bytecode writer (`reference/cpp/core/base/ScriptMgnIntf.cpp:810-845`)
-/// and `Scripts.execStorage` calls the same VM's `LoadByteCode` before it
-/// opens the text stream
-/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`).
-///
-/// This is a **self-consistency** round trip: both sides are this port's copy
-/// of the same VM, so it proves the loader wiring, not that a `.tjsb`
-/// produced by the original KiriKiri (or another compiler revision) loads.
-/// That needs a device run with a real title's bytecode file (D36).
-///
-/// The fixture uses a plain top-level `var` (a `VM_GLOBAL` + `VM_SPDS` pair).
-/// The writer and the loader share one table of opcode layouts, so every
-/// opcode the generator emits round-trips; the opcodes themselves are
-/// covered by `every_opcode_round_trips_through_bytecode` below. The
-/// assertion below still fails on a wrong context: a top-level `var` needs
-/// the global as its context, and a null/wrong one makes the `VM_SPDS`
-/// object-operand conversion raise.
+/// `Scripts.compileStorage` writes the reference's container, and
+/// `Scripts.execStorage` refuses that container by name instead of decoding it
+/// as text or running it through the vendored loader.
 #[test]
-fn exec_storage_executes_compiled_bytecode() {
+fn exec_storage_refuses_compiled_bytecode() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     let compiled = compile_fixture(
@@ -877,77 +802,33 @@ fn exec_storage_executes_compiled_bytecode() {
     );
     let bytes = std::fs::read(env.game_dir().unwrap().join(&compiled)).unwrap();
     // The writer emits the TJS2 bytecode tag `TJS2100\0`
-    // (`TJS::tTJSByteCodeLoader::FILE_TAG_LE`/`VER_TAG_LE`), the signature
-    // the loader checks (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:40-47`).
+    // (`TJS::tTJSByteCodeLoader::FILE_TAG_LE`/`VER_TAG_LE`).
     assert_eq!(&bytes[..8], b"TJS2100\0", "compiled bytecode tag");
 
-    env.run(&format!("Scripts.execStorage({compiled:?});"));
-    assert_eq!(env.eval_ok("bytecode_ran"), TjsValue::Integer(42));
-}
-
-/// A bytecode storage runs **one** script: the reference's loader reads a
-/// single block per file and executes that block. `ReadByteCode` returns one
-/// `tTJSScriptBlock` (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:30-73`)
-/// and `LoadByteCode` runs it with `ExecuteTopLevel`
-/// (`reference/cpp/core/tjs2/tjsScriptCache.cpp:199-214`).
-///
-/// The DATA area of such a file holds the compiled script's **constant
-/// pools** — the byte, short, int, int64, double, string and octet arrays
-/// (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:75-152`). Its strings are
-/// constants of that one script, not a list of scripts to run: a shipped
-/// title's `patch.tjs` keeps its whole script manifest there, as UTF-16
-/// constants, and the title's runtime loads those scripts one storage at a
-/// time. The fixture names two other storages; running the compiled storage
-/// must define its own variable and leave the named storages alone.
-#[test]
-fn a_bytecode_storage_runs_only_its_own_script() {
-    let _lock = vm_lock();
-    let env = common::Env::with_storage();
-    let other = compile_fixture(
-        &env,
-        "var other_ran = 1;",
-        "data/other_src.tjs",
-        "data/other.tjsb",
+    let error = env.error(&format!("Scripts.execStorage({compiled:?});"));
+    assert!(
+        error.contains(&compiled),
+        "the refusal names the storage: {error}"
     );
-    let named = compile_fixture(
-        &env,
-        "var named_ran = 1;",
-        "data/named_src.tjs",
-        "data/named.tjsb",
+    assert!(
+        error.contains("TJS2100"),
+        "the refusal names the tag: {error}"
     );
-    let compiled = compile_fixture(
-        &env,
-        &format!("var manifest = [{other:?}, {named:?}];"),
-        "data/manifest_src.tjs",
-        "data/manifest.tjsb",
-    );
-
-    env.run(&format!("Scripts.execStorage({compiled:?});"));
-
-    // The compiled storage ran its own top level: the array literal with the
-    // two names sits in its DATA area.
-    assert_eq!(env.eval_ok("manifest[0]"), TjsValue::String(other));
-    // The names are constants: the storages they name did not run.
-    assert_eq!(
-        env.eval_ok("typeof global.other_ran"),
-        TjsValue::String("undefined".to_string())
+    assert!(
+        error.contains("unsupported"),
+        "the refusal names the decision: {error}"
     );
     assert_eq!(
-        env.eval_ok("typeof global.named_ran"),
+        env.eval_ok("typeof global.bytecode_ran"),
         TjsValue::String("undefined".to_string())
     );
 }
 
-/// A precompiled script that fails at run time has no text source to reprint:
-/// the diagnostic names the bytecode path instead of dumping decoded
-/// nonsense. The VM reads the source text out of the bytecode file and
-/// reports the failing line with it, but the host does not decode that
-/// section, so it has no excerpt to print. `execStorage` offers the bytes to
-/// the loader (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`), and the
-/// loader executes them, so the failure travels back through the bytecode
-/// branch.
+/// A refused compiled script has no text source to reprint: the diagnostic
+/// names the bytecode path instead of dumping decoded nonsense, and the
+/// refusal happens before any decode, so there is no source window.
 #[test]
-fn failing_bytecode_script_logs_no_source_excerpt() {
+fn refused_bytecode_logs_no_source_excerpt() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     let compiled = compile_fixture(
@@ -970,9 +851,8 @@ fn failing_bytecode_script_logs_no_source_excerpt() {
     assert!(!failure.contains("source lines"), "{failure}");
 }
 
-/// A non-bytecode storage script still takes the text path: the loader
-/// reports "not bytecode" and `TVPExecuteStorage` falls through to the text
-/// stream (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-811`).
+/// A storage without the compiled-script tag runs as text through the Rust
+/// executor.
 #[test]
 fn exec_storage_still_runs_plain_text() {
     let _lock = vm_lock();
@@ -983,123 +863,11 @@ fn exec_storage_still_runs_plain_text() {
     assert_eq!(env.eval_ok("text_path_ran"), TjsValue::Integer(7));
 }
 
-/// A script run from its compiled form leaves the same values behind as the
-/// source it was compiled from.
-///
-/// The script is compiled by the VM's own writer and run by the VM's own
-/// loader, so the two runs differ only in the form the script was read in.
-/// The values, their order and the context the script runs with are the
-/// script's own behaviour, and they do not depend on that form.
-///
-/// The context argument of `execStorage` is the script's `this`
-/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:1314-1354,704-811`), and a
-/// script that runs with a context declares its variables in that context,
-/// not in the global object. Each run gets its own context, so a member the
-/// compiled form failed to declare cannot be read back from the run of the
-/// source form.
+/// Corrupt `TJS2100` data is refused by name, never decoded as text: the
+/// Rust executor has no bytecode loader, so it does not inspect the container
+/// it cannot run.
 #[test]
-fn a_compiled_script_leaves_the_same_values_as_its_source() {
-    let _lock = vm_lock();
-    let env = common::Env::with_storage();
-    let dir = env.game_dir().expect("game dir").clone();
-    std::fs::create_dir_all(dir.join("data")).expect("create the data directory");
-    let source = "\
-var number_value = 40;
-var text_value = 'a' + 'b';
-var list_value = [1, 2, 3];
-var sum_value = number_value + 2;
-function twice(value) { return value * 2; }
-var call_value = twice(21);
-var context_value = this.context_tag;
-";
-    std::fs::write(dir.join("data/values.tjs"), source).expect("write the source");
-    // The context each run gets: the `this` of its top level.
-    env.run("var source_context = %[context_tag: 'tag'];");
-    env.run("var bytecode_context = %[context_tag: 'tag'];");
-    env.run("Scripts.execStorage('data/values.tjs', '', source_context);");
-    let from_source = script_values(&env, "source_context");
-    // The compiled form of the same script runs from its own storage: the
-    // storage's own bytes are the bytecode the loader reads.
-    compile_fixture(&env, source, "data/values_src.tjs", "data/values.tjsb");
-    env.run("Scripts.execStorage('data/values.tjsb', '', bytecode_context);");
-    let from_bytecode = script_values(&env, "bytecode_context");
-    assert_eq!(from_bytecode, from_source);
-    // The values are the script's own: they are in the context, and they are
-    // what the script declares.
-    let expected = vec![
-        TjsValue::Integer(40),
-        TjsValue::String("ab".into()),
-        TjsValue::Integer(1),
-        TjsValue::Integer(2),
-        TjsValue::Integer(3),
-        TjsValue::Integer(42),
-        TjsValue::Integer(42),
-        TjsValue::String("tag".into()),
-    ];
-    assert_eq!(from_source, expected, "the source form left other values");
-    assert_eq!(
-        from_bytecode, expected,
-        "the compiled form left other values"
-    );
-}
-
-/// The values the comparison test reads.
-///
-/// The script runs with a context, so the values it declares are members of
-/// that context and not of the global object.
-fn script_values(env: &common::Env, context: &str) -> Vec<TjsValue> {
-    vec![
-        env.eval_ok(&format!("{context}['number_value']")),
-        env.eval_ok(&format!("{context}['text_value']")),
-        env.eval_ok(&format!("{context}['list_value'][0]")),
-        env.eval_ok(&format!("{context}['list_value'][1]")),
-        env.eval_ok(&format!("{context}['list_value'][2]")),
-        env.eval_ok(&format!("{context}['sum_value']")),
-        env.eval_ok(&format!("{context}['call_value']")),
-        env.eval_ok(&format!("{context}['context_value']")),
-    ]
-}
-
-/// A script that fails fails the same way from its compiled form: the
-/// message is the script's own.
-///
-/// The diagnostic's block name is the storage the script ran from and its
-/// line is the failure's position, and the compiled form carries its own
-/// storage and its own positions, so only the message the script raises is
-/// compared.
-///
-/// The block name is the storage the script ran from
-/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:720,782`) and the line is the
-/// position the failing statement is on
-/// (`reference/cpp/core/tjs2/tjsScriptBlock.cpp:176-189`).
-#[test]
-fn a_compiled_script_fails_the_same_way_as_its_source() {
-    let _lock = vm_lock();
-    let env = common::Env::with_storage();
-    let dir = env.game_dir().expect("game dir").clone();
-    std::fs::create_dir_all(dir.join("data")).expect("create the data directory");
-    let source = "var first_value = 1;\nthrow 'the boom';\n";
-    std::fs::write(dir.join("data/fail.tjs"), source).expect("write the source");
-    let from_source = env.error("Scripts.execStorage('data/fail.tjs');");
-    compile_fixture(&env, source, "data/fail_src.tjs", "data/fail.tjsb");
-    let from_bytecode = env.error("Scripts.execStorage('data/fail.tjsb');");
-    let (_, source_message) = script_diagnostic(&from_source, "fail.tjs")
-        .unwrap_or_else(|| panic!("the source form names no diagnostic: {from_source}"));
-    let (_, bytecode_message) = script_diagnostic(&from_bytecode, "fail.tjsb")
-        .unwrap_or_else(|| panic!("the compiled form names no diagnostic: {from_bytecode}"));
-    assert_eq!(
-        bytecode_message, source_message,
-        "the compiled form raised another message"
-    );
-}
-
-/// Corrupt recognized bytecode is a typed error, never a silent fall-through
-/// to the text decoder: the reference's `LoadByteCode` raises
-/// `TJSByteCodeBroken` when the loader rejects data whose tag it recognized
-/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`,
-/// `reference/cpp/core/tjs2/tjsScriptCache.cpp:199-212`).
-#[test]
-fn corrupt_bytecode_is_a_typed_error() {
+fn corrupt_bytecode_is_refused_by_name() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     let compiled = compile_fixture(
@@ -1118,17 +886,14 @@ fn corrupt_bytecode_is_a_typed_error() {
     std::fs::write(&path, &bytes).unwrap();
 
     let message = env.error(&format!("Scripts.execStorage({compiled:?})"));
-    assert!(
-        message.contains("Bytecode read error"),
-        "expected the bytecode loader's error, got: {message}"
-    );
+    assert!(message.contains("TJS2100"), "{message}");
+    assert!(message.contains("unsupported"), "{message}");
 }
 
-/// A truncated bytecode blob is a typed error, not a fall-through: the
-/// loader reads the declared size from the header and rejects a mismatch
-/// (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:49-51`).
+/// A truncated `TJS2100` blob is refused by name, not decoded as text: the
+/// Rust executor refuses the tag before it reads any header field.
 #[test]
-fn truncated_bytecode_is_a_typed_error() {
+fn truncated_bytecode_is_refused_by_name() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     let compiled = compile_fixture(
@@ -1146,19 +911,15 @@ fn truncated_bytecode_is_a_typed_error() {
     std::fs::write(&path, &bytes).unwrap();
 
     let message = env.error(&format!("Scripts.execStorage({compiled:?})"));
-    assert!(
-        message.contains("Bytecode read error"),
-        "expected the bytecode loader's error, got: {message}"
-    );
+    assert!(message.contains("TJS2100"), "{message}");
+    assert!(message.contains("unsupported"), "{message}");
 }
 
-/// The loader is consulted before the text decoder, so a file whose header
-/// looks like bytecode is not run as text when the loader rejects it: the
-/// reference branches on the `LoadByteCode` result
-/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-727`). The error names the
-/// bytecode loader, not the text lexer, so the order is observable.
+/// A file whose header looks like bytecode is refused as bytecode and is not
+/// run as text. The error names the tag and the missing loader, not the text
+/// lexer, so the decision is observable.
 #[test]
-fn magic_prefixed_text_is_rejected_by_the_loader_not_run_as_text() {
+fn magic_prefixed_text_is_refused_as_bytecode_not_run_as_text() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     let dir = env.game_dir().unwrap();
@@ -1170,19 +931,15 @@ fn magic_prefixed_text_is_rejected_by_the_loader_not_run_as_text() {
     std::fs::write(dir.join("fake.tjsb"), &bytes).unwrap();
 
     let message = env.error("Scripts.execStorage('fake.tjsb')");
-    assert!(
-        message.contains("Bytecode read error"),
-        "the bytecode loader must run first; got: {message}"
-    );
+    assert!(message.contains("TJS2100"), "{message}");
+    assert!(message.contains("unsupported"), "{message}");
 }
 
-/// A magic-prefixed blob shorter than the loader's fixed header is a typed
-/// error, not an out-of-bounds read. `ReadByteCode` reads the file size at
-/// offset 8, the `DATA` tag at 12 and the data-area size at 16
-/// (`reference/cpp/core/tjs2/tjsByteCodeLoader.cpp:40-56`), so a recognized
-/// magic below 20 bytes must be rejected before the loader touches it.
+/// A magic-prefixed blob shorter than the reference's fixed header is refused
+/// by name, not read as a truncated container: the tag alone selects the
+/// refusal.
 #[test]
-fn short_magic_prefixed_blob_is_a_typed_error() {
+fn short_magic_prefixed_blob_is_refused_by_name() {
     let _lock = vm_lock();
     let env = common::Env::with_storage();
     let dir = env.game_dir().unwrap();
@@ -1197,11 +954,8 @@ fn short_magic_prefixed_blob_is_a_typed_error() {
     ] {
         std::fs::write(dir.join(name), &bytes).unwrap();
         let message = env.error(&format!("Scripts.execStorage({name:?})"));
-        assert!(
-            message.contains("Bytecode read error"),
-            "{name} ({} bytes) should be a typed error; got: {message}",
-            bytes.len()
-        );
+        assert!(message.contains("TJS2100"), "{name}: {message}");
+        assert!(message.contains("unsupported"), "{name}: {message}");
     }
 }
 
@@ -1239,6 +993,33 @@ fn eval_storage_evaluates_an_expression_shaped_storage() {
     assert!(
         matches!(value, TjsValue::Object),
         "the evaluated storage should be the dictionary, got {value:?}"
+    );
+}
+
+/// `evalStorage` runs an expression once. A text that compiles as an
+/// expression and then raises has already run, so its failure is the
+/// storage's failure; the script mode is only for a text that fails to
+/// compile as an expression.
+///
+/// Reference: `TVPExecuteStorage` calls `EvalExpression` once for an
+/// expression-shaped storage (`reference/cpp/core/base/ScriptMgnIntf.cpp:803-807`).
+#[test]
+fn eval_storage_does_not_run_a_failing_expression_twice() {
+    let _lock = vm_lock();
+    let env = common::Env::with_storage();
+    let dir = env.game_dir().expect("the temp game directory");
+    std::fs::write(
+        dir.join("once.tjs"),
+        "(global.eval_storage_runs = global.eval_storage_runs + 1) \\ 0",
+    )
+    .expect("write the storage");
+    env.run("global.eval_storage_runs = 0;");
+    let error = env.error("Scripts.evalStorage('once.tjs');");
+    assert!(!error.is_empty(), "the expression must raise");
+    assert_eq!(
+        env.eval_ok("global.eval_storage_runs"),
+        TjsValue::Integer(1),
+        "the expression must have run exactly once"
     );
 }
 

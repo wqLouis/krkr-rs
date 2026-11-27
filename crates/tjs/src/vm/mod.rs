@@ -155,19 +155,25 @@ pub fn compile(script: &str, name: &str) -> Result<Image, ParseError> {
     compiled.into_image()
 }
 
-/// Compiles an expression into the image of its block.
+/// Compiles an expression, saying whether the caller needs its value.
 ///
-/// The text is one expression, and the block keeps the value it produces.
-/// `name` labels the block as [`compile`] does.
+/// The text is one expression. `name` labels the block as [`compile`] does.
+/// The `result_needed` flag is the caller's: a statement context compiles the
+/// same text without requiring a value, so an expression that produces none is
+/// not an error there.
 ///
 /// # Errors
 ///
 /// The first failure the front end reported, with its position. A panic in the
 /// image builder is reported as [`ParseError::Generator`] with the panic's
 /// text.
-pub(crate) fn compile_expression(expression: &str, name: &str) -> Result<Image, ParseError> {
+pub(crate) fn compile_expression_result(
+    expression: &str,
+    name: &str,
+    result_needed: bool,
+) -> Result<Image, ParseError> {
     let units: Vec<u16> = expression.encode_utf16().collect();
-    let compiled = guard(|| compile_units(&units, true, true, &[], Some(name)))
+    let compiled = guard(|| compile_units(&units, true, result_needed, &[], Some(name)))
         .map_err(|message| ParseError::Generator { message })?;
     compiled.into_image()
 }

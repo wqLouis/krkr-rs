@@ -30,9 +30,10 @@
 //! so the call is refused rather than run on another object.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
+use crate::vm::runtime::natives::registry::NativeRegistry;
 use crate::vm::runtime::number::Number;
 use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::octet::Octet;
@@ -45,9 +46,14 @@ use crate::{CallAnswer, DetachedValue, MemberShape, Tjs2Engine, Tjs2ValueId, Tjs
 /// The engine cannot hold a value of the Rust object model, so a handle created
 /// for a global scope may carry those values here. Scalars and engine objects
 /// still cross to the engine; only an object the engine cannot address stays
-/// in this store.
+/// in this store. The store also owns the native class registry: a name the
+/// registry publishes is answered from the registry before the engine, and a
+/// write or a delete of that name is kept here so the two views do not
+/// disagree.
 pub struct GlobalMembers {
     members: RefCell<BTreeMap<TjsString, Variant>>,
+    removed: RefCell<BTreeSet<TjsString>>,
+    natives: NativeRegistry,
     log: Option<LogSink>,
 }
 
@@ -59,6 +65,8 @@ impl GlobalMembers {
     pub fn new() -> Self {
         Self {
             members: RefCell::new(BTreeMap::new()),
+            removed: RefCell::new(BTreeSet::new()),
+            natives: NativeRegistry::new(),
             log: None,
         }
     }
@@ -81,6 +89,7 @@ impl GlobalMembers {
 
     /// Stores a member the engine cannot hold.
     fn insert(&self, name: TjsString, value: Variant) {
+        self.removed.borrow_mut().remove(&name);
         self.members.borrow_mut().insert(name, value);
     }
 
@@ -96,6 +105,46 @@ impl GlobalMembers {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
+    }
+
+    /// The class object the global name denotes, when the registry publishes
+    /// one and the name has not been deleted.
+    fn native(&self, name: &TjsString) -> Option<Variant> {
+        if self.removed.borrow().contains(name) {
+            return None;
+        }
+        self.natives.get(name)
+    }
+
+    /// Whether the registry publishes the global name.
+    fn is_native(&self, name: &TjsString) -> bool {
+        self.natives.contains(name)
+    }
+
+    /// Whether the global name was deleted from the registry's view.
+    fn is_removed(&self, name: &TjsString) -> bool {
+        self.removed.borrow().contains(name)
+    }
+
+    /// Marks a registry name deleted, so the name reads as absent.
+    fn mark_removed(&self, name: &TjsString) {
+        self.removed.borrow_mut().insert(name.clone());
+    }
+
+    /// The registry's class objects, by name, excluding deleted names.
+    fn native_entries(&self) -> Vec<(TjsString, Variant)> {
+        let removed = self.removed.borrow();
+        let mut entries = Vec::new();
+        for name in self.natives.names() {
+            let name = TjsString::from(name);
+            if removed.contains(&name) {
+                continue;
+            }
+            if let Some(value) = self.natives.get(&name) {
+                entries.push((name, value));
+            }
+        }
+        entries
     }
 }
 
@@ -416,10 +465,16 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         self.live()?;
-        if let Some(globals) = &self.globals
-            && let Some(value) = globals.get(name)
-        {
-            return Ok(value);
+        if let Some(globals) = &self.globals {
+            if let Some(value) = globals.get(name) {
+                return Ok(value);
+            }
+            if globals.is_removed(name) {
+                return Err(ObjectError::MemberNotFound);
+            }
+            if let Some(value) = globals.native(name) {
+                return Ok(value);
+            }
         }
         read_member(
             &self.engine,
@@ -438,13 +493,21 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
         self.live()?;
-        // A value the engine cannot address lives in the handle's own store.
-        if let Some(globals) = &self.globals
-            && let Variant::Object(closure) = value
-            && matches!(&closure.object, Some(object) if object.engine_id().is_none())
-        {
-            globals.insert(name.clone(), value.clone());
-            return Ok(());
+        // A value the engine cannot address lives in the handle's own store,
+        // and so does any write to a name the class registry owns: the store
+        // is then the one view of that name.
+        if let Some(globals) = &self.globals {
+            let unaddressable = match value {
+                Variant::Object(closure) => matches!(
+                    &closure.object,
+                    Some(object) if object.engine_id().is_none()
+                ),
+                _ => false,
+            };
+            if globals.is_native(name) || unaddressable {
+                globals.insert(name.clone(), value.clone());
+                return Ok(());
+            }
         }
         let mut keep = Vec::new();
         let crossing = to_value(&self.engine, value, &mut keep)?;
@@ -478,13 +541,20 @@ impl Dispatch for CHandle {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<(), ObjectError> {
         self.live()?;
-        if let Some(globals) = &self.globals
-            && globals.remove(name).is_some()
-        {
-            match self.engine.delete_member(self.id(), &name.to_string()) {
-                Ok(()) => return Ok(()),
-                Err(error) if crate::is_missing_member(&error) => return Ok(()),
-                Err(_) => return Err(ObjectError::CallNotServed),
+        if let Some(globals) = &self.globals {
+            let stored = globals.remove(name).is_some();
+            if globals.is_native(name) {
+                // The class object is this store's value, so deleting the name
+                // is this store's answer; the engine's copy is not the view.
+                globals.mark_removed(name);
+                return Ok(());
+            }
+            if stored {
+                match self.engine.delete_member(self.id(), &name.to_string()) {
+                    Ok(()) => return Ok(()),
+                    Err(error) if crate::is_missing_member(&error) => return Ok(()),
+                    Err(_) => return Err(ObjectError::CallNotServed),
+                }
             }
         }
         match self.engine.delete_member(self.id(), &name.to_string()) {
@@ -518,8 +588,20 @@ impl Dispatch for CHandle {
             .as_ref()
             .map(|globals| globals.entries().into_iter().collect())
             .unwrap_or_default();
+        if let Some(globals) = &self.globals {
+            for (name, value) in globals.native_entries() {
+                extra.entry(name).or_insert(value);
+            }
+        }
         for name in names {
             let name = TjsString::from(name);
+            if self
+                .globals
+                .as_ref()
+                .is_some_and(|globals| globals.is_removed(&name))
+            {
+                continue;
+            }
             let value = if let Some(value) = extra.remove(&name) {
                 value
             } else if values {
@@ -573,7 +655,8 @@ impl Dispatch for CHandle {
     }
 
     fn rust_member(&self, name: &TjsString) -> Option<Variant> {
-        self.globals.as_ref()?.get(name)
+        let globals = self.globals.as_ref()?;
+        globals.get(name).or_else(|| globals.native(name))
     }
 
     fn is_valid(&self) -> bool {

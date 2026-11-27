@@ -20,25 +20,25 @@
 //! | `dump()` | dump every live script block through the engine log |
 //! | `textEncoding` | get/set the fallback text decoder (default `"UTF-8"`) |
 //!
-//! `mode` honors the reference's `oN` byte offset. A storage script is
-//! offered to the TJS2 bytecode loader first and decoded as text only when
-//! the loader reports it is not bytecode, which is the reference
-//! `TVPExecuteStorage` order
-//! (`reference/cpp/core/base/ScriptMgnIntf.cpp:713-760`). Script decoding
+//! `mode` carries the `oN` byte offset a caller applies. A text storage runs through
+//! the Rust executor: its top-level context runs against the engine's global
+//! object, or against the `context` argument as its receiver. Script decoding
 //! goes through [`crate::text::decode_units`], which handles the `FE FE`
 //! cipher / zlib container, a UTF-8/UTF-16 BOM, an explicit `textEncoding`
-//! override, then UTF-8 and CP932. The decode produces the UTF-16 code units
-//! the VM takes a script in, so the script's text is materialised once. An
-//! undecodable script raises a typed error instead of producing mojibake. The
-//! `context` argument is the script's `this`, and `lineofs` the reported
-//! line-number offset, both forwarded to the VM.
+//! override, then UTF-8 and CP932. An undecodable script raises a typed error
+//! instead of producing mojibake. The `context` argument is the script's
+//! `this`, and `lineofs` the reported line-number offset, both forwarded to
+//! the executor.
 //!
-//! A bytecode storage carries **one** script. The loader reads a single
-//! block per file and executes that block; the file's data area holds the
-//! compiled script's constant pools, and the strings in it are constants of
-//! that one script, not a list of scripts to run: a shipped title's compiled
-//! patch script keeps its whole script manifest there, as UTF-16 constants,
-//! and the title's runtime loads those scripts one storage at a time.
+//! A storage that starts with the compiled-script tag `TJS2100` is refused by
+//! name: the vendored bytecode loader dies with the inter-code bridge, and the
+//! Rust executor has no loader for that container yet. It is never decoded as
+//! text and never falls back to the vendored executor.
+//!
+//! An answer the engine can hold crosses back as a retained value. A Rust-owned
+//! object has no engine handle, so it is a typed refusal instead of an empty
+//! value; the bridge does not yet give a non-global engine object a store for
+//! such members.
 #![allow(unsafe_code)]
 
 use std::cell::Cell;
@@ -47,6 +47,8 @@ use std::ptr;
 use std::time::Instant;
 
 use crate::engine_api::Storage;
+use tjs::vm::runtime::bridge::SharedGlobals;
+use tjs::vm::runtime::engine as runtime_engine;
 use tjs::{
     Engine, NativeClassBuilder, NativeMethodDef, NativePropertyDef, RetainedValue, Tjs2Engine,
     TjsValue, VAL_NULL, VAL_OBJECT, VAL_REAL, VAL_RETAINED, VAL_STRING, VAL_VOID, Value,
@@ -369,19 +371,6 @@ pub fn decode_storage_text(
     decode_storage_script(name, bytes, encoding).map(|decoded| decoded.text())
 }
 
-/// Decode `bytes` to UTF-16 code units for execution, preserving every code
-/// unit the way the reference text stream does. This is the script path's
-/// decode: the reference reads the decrypted `FE FE` payload as a
-/// `std::u16string` (`reference/cpp/core/base/TextStream.cpp:82-135`), so a
-/// lone surrogate must survive to the VM.
-fn decode_storage_units(
-    name: &str,
-    bytes: &[u8],
-    encoding: Option<&str>,
-) -> Result<Vec<u16>, String> {
-    decode_storage_script(name, bytes, encoding).map(|decoded| decoded.units)
-}
-
 /// Maximum number of source bytes a failure diagnostic prints.
 const FAILURE_SOURCE_BYTES: usize = 8 * 1024;
 /// Lines printed from the head when an error names no line.
@@ -564,16 +553,113 @@ fn load_storage_text(
     decode_storage_text(name, &bytes, encoding)
 }
 
+/// The tag of a compiled TJS2 script file.
+const BYTECODE_TAG: &[u8] = b"TJS2100\0";
+
+/// Whether `bytes` are the compiled-script container's magic.
+fn is_bytecode(bytes: &[u8]) -> bool {
+    bytes.starts_with(BYTECODE_TAG)
+}
+
+/// The error a compiled storage raises until the Rust executor has a loader.
+fn unsupported_bytecode(name: &str) -> String {
+    format!(
+        "Scripts: '{name}': precompiled TJS2 bytecode (TJS2100) is unsupported: \
+         the Rust executor has no bytecode loader"
+    )
+}
+
+/// The globals the script entries share.
+///
+/// The compatibility surface's services carry the store, so a top-level
+/// function one script declares stays callable from the next. A caller
+/// outside a bound engine gets a store of its own.
+fn script_globals(services: Option<&CompatServices>) -> SharedGlobals {
+    match services {
+        Some(services) => services.script_globals(),
+        None => tjs::vm::runtime::bridge::global_members(),
+    }
+}
+
+/// The failure a text script entry can raise.
+enum TextScriptError {
+    /// The executor refused the script.
+    Run(runtime_engine::ScriptFailure),
+    /// The executor's answer cannot cross back into the engine.
+    Answer(runtime_engine::AnswerError),
+}
+
+impl std::fmt::Display for TextScriptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run(failure) => formatter.write_str(&failure.diagnostic()),
+            Self::Answer(error) => error.fmt(formatter),
+        }
+    }
+}
+
+/// The options a script entry runs with: its `this`, line offset and result
+/// need.
+fn script_options(
+    context: *mut c_void,
+    lineofs: i32,
+    result_needed: bool,
+) -> runtime_engine::ScriptOptions {
+    runtime_engine::ScriptOptions {
+        context: (!context.is_null()).then(|| tjs::Tjs2ValueId::from(context)),
+        lineofs,
+        result_needed,
+    }
+}
+
+/// Run `source` in the Rust executor, retaining an object answer.
+///
+/// `expression` selects the expression entry. The options carry the script's
+/// `this` and its reported line offset; a non-null context keeps the object
+/// alive for the call and hands it to the top-level context as its receiver.
+fn run_text(
+    engine: &Tjs2Engine,
+    source: &str,
+    block_name: &str,
+    expression: bool,
+    options: runtime_engine::ScriptOptions,
+    globals: &SharedGlobals,
+) -> Result<RetainedValue, TextScriptError> {
+    let shared = std::rc::Rc::new(engine.share());
+    let answer = if expression {
+        runtime_engine::eval_with_members_options(
+            shared,
+            source,
+            block_name,
+            std::rc::Rc::clone(globals),
+            options,
+        )
+    } else {
+        runtime_engine::run_with_members_options(
+            shared,
+            source,
+            block_name,
+            std::rc::Rc::clone(globals),
+            options,
+        )
+    };
+    match answer {
+        Ok(answer) => {
+            runtime_engine::retained_value(engine, answer).map_err(TextScriptError::Answer)
+        }
+        Err(failure) => Err(TextScriptError::Run(failure)),
+    }
+}
+
 /// Read `name` through storage and run it as a script (`expression == false`)
 /// or an expression (`expression == true`), retaining an object result. The
 /// script block is labelled with `block_name` (the reference
 /// `TVPExtractStorageName` of the placed path) and runs with `context` as its
 /// `this` (`nullptr` for the global object).
 ///
-/// The bytes are offered to the bytecode loader first and only decoded as
-/// text when that reports they were not bytecode, which is the reference
-/// `TVPExecuteStorage` order
-/// (`reference/cpp/core/base/ScriptMgnIntf.cpp:691-699,713-760`).
+/// A compiled `TJS2100` storage is refused by name: the Rust executor has no
+/// bytecode loader, and the vendored loader dies with the inter-code bridge.
+/// Every other storage is decoded as text and run through the Rust entry.
 struct StorageScript<'a> {
     storage: &'a Storage,
     name: &'a str,
@@ -601,36 +687,32 @@ fn execute_storage(
     } = script;
     let _timer = ScriptExecTimer::start(services, block_name);
     let bytes = read_storage_bytes(storage, name, mode)?;
-    // Bytecode first, text second. `Ok(None)` means the loader did not
-    // recognize bytecode; a non-bytecode input is not an error, but a
-    // recognized-and-rejected one is.
-    match engine.load_bytecode(&bytes, block_name, context) {
-        Ok(Some(result)) => {
-            if log::log_enabled!(log::Level::Debug) {
-                log_script_read(name, &bytes, Some("precompiled bytecode"));
-            }
-            return Ok(result);
+    if is_bytecode(&bytes) {
+        if log::log_enabled!(log::Level::Debug) {
+            log_script_read(name, &bytes, Some("precompiled bytecode"));
         }
-        Ok(None) => {}
-        Err(error) => {
-            if log::log_enabled!(log::Level::Debug) {
-                log_script_read(name, &bytes, Some("precompiled bytecode"));
-            }
-            let error = error.to_string();
-            log_bytecode_failure(name, &error);
-            return Err(error);
-        }
+        let error = unsupported_bytecode(name);
+        log_bytecode_failure(name, &error);
+        return Err(error);
     }
-    let units = decode_storage_units(name, &bytes, encoding)?;
+    let decoded = decode_storage_script(name, &bytes, encoding)?;
+    let source = decoded.text();
+    let globals = script_globals(services);
     let result = if expression {
-        evaluate_storage(engine, &units, block_name, context)
+        evaluate_storage(engine, &source, block_name, context, &globals)
     } else {
-        engine
-            .exec_script_retained_wide_with_context(&units, block_name, context, 0)
-            .map_err(|error| error.to_string())
+        run_text(
+            engine,
+            &source,
+            block_name,
+            false,
+            script_options(context, 0, true),
+            &globals,
+        )
+        .map_err(|error| error.to_string())
     };
     result.inspect_err(|error| {
-        log_script_failure(name, &String::from_utf16_lossy(&units), error);
+        log_script_failure(name, &source, error);
     })
 }
 
@@ -643,14 +725,10 @@ fn execute_storage(
 ///
 /// The VM's expression mode compiles the text as `return <text>;`, so a
 /// script-shaped storage — a class or a function definition — is a grammar
-/// error there. The script mode compiles the same text as statements and
-/// runs it, which is what such a storage needs.
-///
-/// The evaluation runs first, so a storage that is an expression runs once,
-/// and a storage that is not one never ran, so the script mode runs it once.
-/// A storage that is an expression and raises at run time is evaluated
-/// twice: the evaluation raises and the script mode runs the same text
-/// again.
+/// error there. Only that compile failure selects the script mode, which
+/// compiles the same text as statements and runs it. An expression that
+/// compiles and then raises has already run once, so its error is the
+/// storage's error and the text is not run a second time.
 ///
 /// # Errors
 ///
@@ -659,22 +737,42 @@ fn execute_storage(
 /// grammar error the evaluation reports.
 fn evaluate_storage(
     engine: &Tjs2Engine,
-    units: &[u16],
+    source: &str,
     block_name: &str,
     context: *mut c_void,
+    globals: &SharedGlobals,
 ) -> Result<RetainedValue, String> {
-    match engine.eval_retained_wide_with_context(units, block_name, context, 0) {
+    match run_text(
+        engine,
+        source,
+        block_name,
+        true,
+        script_options(context, 0, true),
+        globals,
+    ) {
         Ok(value) => Ok(value),
-        Err(evaluation) => {
+        Err(TextScriptError::Run(failure))
+            if matches!(&*failure.error, runtime_engine::EngineError::Compile(_)) =>
+        {
             // The storage is not an expression: run it as a script. The
             // script mode's error is the storage's own error, and for a
             // storage that is neither an expression nor a script it is the
             // same grammar error the evaluation reports.
-            log::debug!("the storage is not an expression: {evaluation}");
-            engine
-                .exec_script_retained_wide_with_context(units, block_name, context, 0)
-                .map_err(|error| error.to_string())
+            log::debug!(
+                "compat.scripts: the storage is not an expression: {}",
+                failure.diagnostic()
+            );
+            run_text(
+                engine,
+                source,
+                block_name,
+                false,
+                script_options(context, 0, true),
+                globals,
+            )
+            .map_err(|error| error.to_string())
         }
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -884,10 +982,16 @@ extern "C" fn native_exec(
         Ok(context) => context,
         Err(error) => return report_error(out_error, &format!("Scripts.exec: {error}")),
     };
-    let result = resolved
-        .engine()
-        .exec_script_retained_with_context(&script, &name, context, lineofs)
-        .map_err(|error| error.to_string());
+    let globals = services.script_globals();
+    let result = run_text(
+        resolved.engine(),
+        &script,
+        &name,
+        false,
+        script_options(context, lineofs, true),
+        &globals,
+    )
+    .map_err(|error| error.to_string());
     finish_retained(out, out_error, services, result)
 }
 
@@ -925,10 +1029,16 @@ extern "C" fn native_eval(
         Err(error) => return report_error(out_error, &format!("Scripts.eval: {error}")),
     };
     let need_result = resolved.engine().result_needed();
-    let result = resolved
-        .engine()
-        .eval_retained_with_context_result(&expression, &name, context, lineofs, need_result)
-        .map_err(|error| error.to_string());
+    let globals = services.script_globals();
+    let result = run_text(
+        resolved.engine(),
+        &expression,
+        &name,
+        true,
+        script_options(context, lineofs, need_result),
+        &globals,
+    )
+    .map_err(|error| error.to_string());
     finish_retained(out, out_error, services, result)
 }
 

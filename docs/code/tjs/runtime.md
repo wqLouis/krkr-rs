@@ -34,6 +34,8 @@ code it replaces removed.
 | the object | `runtime/object.rs` | the custom object, its member records and the dispatch a member access goes through |
 | the containers | `runtime/{array,dictionary}.rs` | the array's index space of its own, the dictionary's must-exist policy, and the struct text a dictionary writes |
 | the interpreter | `runtime/exec/` | the frame and its register window, the instruction layout table, the arithmetic and member instructions, and the operators |
+| the engine adapter | `runtime/bridge/` | an object the engine owns, seen as a dispatch object, and the values that cross between the two object models |
+| the script entry | `runtime/engine.rs` | text in, the top-level context out: compile, build, run, and the value an answer crosses as |
 | the built-in classes | `runtime/natives/` | `Math`'s functions and constants, `Date`'s calendar and text grammar, and `RegExp`'s members over the linked regular-expression engine |
 | the measurement | `runtime/bench.rs` | the A/B harness against the vendored primitives; `#[cfg(test)]`, `#[ignore]`d |
 

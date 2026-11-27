@@ -17,7 +17,6 @@ use compat::{CompatHost, EventAdapter, FrameBody, PluginRegistry, run_frame_body
 use platform::PlatformEvent;
 use tjs::vm::runtime::bridge::{GlobalMembers, SharedGlobals};
 use tjs::vm::runtime::engine as runtime_engine;
-use tjs::vm::runtime::variant::Variant;
 use tjs::{LOG_DEBUG, LOG_ERROR, LOG_INFO, LOG_WARN, Tjs2Engine, TjsValue};
 
 use crate::VmError;
@@ -330,30 +329,6 @@ extern "C" fn vm_log(level: c_int, msg: *const c_char, user: *mut c_void) {
     }
 }
 
-/// The host value a runtime answer crosses as.
-///
-/// Scalars cross as themselves. An object crosses as the engine's object
-/// marker when it stands for an engine object (or is `null`); an object the
-/// Rust object model owns has no engine handle, so the answer is refused
-/// rather than reported as an empty value.
-fn host_value(answer: Variant) -> Result<TjsValue, VmError> {
-    match answer {
-        Variant::Void => Ok(TjsValue::Void),
-        Variant::Integer(value) => Ok(TjsValue::Integer(value)),
-        Variant::Real(value) => Ok(TjsValue::Real(value)),
-        Variant::String(text) => Ok(TjsValue::String(text.to_string())),
-        Variant::Octet(octet) => Ok(TjsValue::Octet(octet.as_slice().to_vec())),
-        Variant::Object(closure) => match &closure.object {
-            None => Ok(TjsValue::Object),
-            Some(object) if object.engine_id().is_some() => Ok(TjsValue::Object),
-            Some(_) => Err(VmError::Script(
-                "the script result is an object with no engine handle; it cannot cross the VM boundary"
-                    .to_string(),
-            )),
-        },
-    }
-}
-
 impl VmHost {
     /// Create a host with the built-in plugin registry.
     ///
@@ -415,6 +390,9 @@ impl VmHost {
         }));
         let mut compat = CompatHost::with_registry(registry);
         attach(compat.services_mut());
+        compat
+            .services_mut()
+            .attach_script_globals(Rc::clone(&globals));
         compat.install(&engine)?;
         Ok(Self {
             compat,
@@ -454,10 +432,11 @@ impl VmHost {
             name,
             Rc::clone(&self.globals),
         ) {
-            Ok(answer) => host_value(answer),
+            Ok(answer) => runtime_engine::host_value(answer)
+                .map_err(|error| VmError::Script(error.to_string())),
             Err(failure) => {
                 self.log_script_failure(name, &failure);
-                Err(VmError::Engine(failure.error))
+                Err(VmError::Engine(*failure.error))
             }
         }
     }
@@ -473,10 +452,11 @@ impl VmHost {
             name,
             Rc::clone(&self.globals),
         ) {
-            Ok(answer) => host_value(answer),
+            Ok(answer) => runtime_engine::host_value(answer)
+                .map_err(|error| VmError::Script(error.to_string())),
             Err(failure) => {
                 self.log_script_failure(name, &failure);
-                Err(VmError::Engine(failure.error))
+                Err(VmError::Engine(*failure.error))
             }
         }
     }
@@ -484,7 +464,7 @@ impl VmHost {
     /// Emits an uncaught Rust-executor failure as the diagnostic dump the VM
     /// log deduplicator expects.
     fn log_script_failure(&self, name: &str, failure: &runtime_engine::ScriptFailure) {
-        if !matches!(&failure.error, runtime_engine::EngineError::Run(_)) {
+        if !matches!(&*failure.error, runtime_engine::EngineError::Run(_)) {
             return;
         }
         let (location, position) = match failure.trace.first() {

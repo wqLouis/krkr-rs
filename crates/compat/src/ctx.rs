@@ -10,6 +10,7 @@ use crate::engine_api::TextEngine;
 use crate::engine_api::TimerState;
 use crate::engine_api::{DecodePool, Scene, Storage};
 use crate::engine_api::{FrameClock, FrameTimeSource};
+use tjs::vm::runtime::bridge::SharedGlobals;
 use tjs::{
     NativeClassBuilder, NativeInstanceBuilder, NativeInstanceMembers, NativeStaticMembers,
     Tjs2Engine, Tjs2ValueId,
@@ -82,6 +83,13 @@ pub struct CompatServices {
     /// process global, so the single documented binding stays the only
     /// process-wide state.
     states: StateMap,
+    /// The members the Rust executor keeps outside the engine's global object.
+    ///
+    /// Every script entry from the compatibility surface shares this store, so
+    /// a top-level function one script declares stays callable from the next.
+    /// A host that has its own store attaches it before the surface is
+    /// installed; the default store is enough for a host that does not.
+    script_globals: SharedGlobals,
 }
 
 impl CompatServices {
@@ -228,6 +236,19 @@ impl CompatServices {
     /// See [`Self::scene`] for why this returns a raw pointer.
     pub fn decode_pool(&self) -> Option<*mut DecodePool> {
         self.decode_pool
+    }
+
+    /// Attach the global-member store the script entries share.
+    ///
+    /// A host attaches its store before installing the binding, so the store's
+    /// log sink and the scripts' view of the globals are the same one.
+    pub fn attach_script_globals(&mut self, globals: SharedGlobals) {
+        self.script_globals = globals;
+    }
+
+    /// The global-member store the script entries share.
+    pub fn script_globals(&self) -> SharedGlobals {
+        std::rc::Rc::clone(&self.script_globals)
     }
 
     /// The mutable `Plugins.getList` scratch buffers.

@@ -923,7 +923,7 @@ pub(crate) fn run_bench_entry(
 /// interchangeable: a retained id passed where a raw object pointer is
 /// expected is dereferenced as one.
 #[repr(transparent)]
-#[derive(Copy, Clone, Default, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Tjs2ValueId(*mut c_void);
 
 impl From<*mut c_void> for Tjs2ValueId {
@@ -993,6 +993,27 @@ pub struct Tjs2Engine {
     /// The number of scripts this engine has evaluated or executed (see
     /// [`Self::script_evaluation_count`]).
     evaluations: std::cell::Cell<u64>,
+    /// The ownership of the VM the handles share.
+    ///
+    /// It is declared last so every handle that still retains a value
+    /// releases it before the VM is destroyed. A handle made by
+    /// [`Self::share`] carries its own retained registry and shares this
+    /// ownership, so the VM outlives every handle that names it.
+    life: std::rc::Rc<EngineLife>,
+}
+
+/// One VM's lifetime, shared by every [`Tjs2Engine`] handle that names it.
+struct EngineLife {
+    inner: *mut Engine,
+}
+
+impl Drop for EngineLife {
+    fn drop(&mut self) {
+        // SAFETY: the last handle is gone and `inner` is a valid engine
+        // created by `tjs2_create`; every retained value was released by
+        // the handles' own drops before this field was dropped.
+        unsafe { tjs2_destroy(self.inner) };
+    }
 }
 
 /// An opaque id of a script value retained on a [`Tjs2Engine`] (see
@@ -1392,7 +1413,22 @@ impl Tjs2Engine {
             inner,
             retained: std::cell::RefCell::new(Vec::new()),
             evaluations: std::cell::Cell::new(0),
+            life: std::rc::Rc::new(EngineLife { inner }),
         })
+    }
+
+    /// A second handle to the same VM.
+    ///
+    /// The handles share the VM and its lifetime, but each keeps the values it
+    /// retains on its own: dropping one releases only the ids that handle
+    /// retained. The VM is destroyed when the last handle is dropped.
+    pub fn share(&self) -> Self {
+        Self {
+            inner: self.inner,
+            retained: std::cell::RefCell::new(Vec::new()),
+            evaluations: std::cell::Cell::new(0),
+            life: std::rc::Rc::clone(&self.life),
+        }
     }
 
     /// Install a console/log callback (replaces any previous one).
@@ -3742,8 +3778,7 @@ impl Drop for Tjs2Engine {
             unsafe { tjs2_release_value(self.inner, id) };
         }
         self.retained.get_mut().clear();
-        // SAFETY: self.inner is a valid engine created by tjs2_create.
-        unsafe { tjs2_destroy(self.inner) };
+        // The shared `life` field destroys the VM when the last handle drops.
     }
 }
 

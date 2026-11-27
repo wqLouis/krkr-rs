@@ -14,7 +14,10 @@
 //! also the machine's global. A top-level script runs in the global scope, so a
 //! `var` the script declares and a `function` it declares are both properties
 //! of that one object and outlive the call. The block's top-level context is
-//! the code's own structure; it does not receive the script's members.
+//! the code's own structure; it does not receive the script's members. A caller
+//! that supplies a context runs the same top-level context with that object as
+//! its receiver, which is the execution context the compatibility surface
+//! exposes.
 //!
 //! # Why the global handle carries a store
 //!
@@ -29,14 +32,14 @@
 
 use std::rc::Rc;
 
-use crate::Tjs2Engine;
 use crate::vm::runtime::bridge::{CHandle, SharedGlobals, global_members};
 use crate::vm::runtime::exec::build::{Block, BuildError};
-use crate::vm::runtime::exec::throw::FrameTrace;
+use crate::vm::runtime::exec::throw::{self, FrameTrace};
 use crate::vm::runtime::exec::{Fault, Machine};
 use crate::vm::runtime::object::{Dispatch, ObjectError};
 use crate::vm::runtime::variant::Variant;
-use crate::vm::{ParseError, compile, compile_expression};
+use crate::vm::{ParseError, compile, compile_expression_result};
+use crate::{RetainedValue, Tjs2Engine, Tjs2ValueId, TjsValue};
 
 /// The reason a script did not run.
 ///
@@ -62,6 +65,28 @@ pub enum EngineError {
     /// The engine did not hand out its global object.
     #[error("the engine has no global object: {0}")]
     Global(String),
+    /// The engine refused the execution context.
+    #[error("the execution context cannot be used: {0}")]
+    Context(String),
+}
+
+/// The reason a script answer cannot leave the runtime.
+///
+/// A scalar crosses as itself, and an object the engine owns crosses as the
+/// engine's handle or as a retention of it. An object the Rust object model
+/// owns has no engine handle, so it cannot cross; the answer is refused rather
+/// than reported as an empty value.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum AnswerError {
+    /// The answer is an object with no engine handle.
+    #[error(
+        "the script result is an object with no engine handle; it cannot cross the VM boundary"
+    )]
+    ObjectWithoutHandle,
+    /// The engine refused to retain an object answer.
+    #[error("the script result could not be retained: {0}")]
+    Retain(String),
 }
 
 /// A script failure and the frames the code passed before it surfaced.
@@ -72,18 +97,157 @@ pub enum EngineError {
 #[derive(Debug)]
 pub struct ScriptFailure {
     /// The executor failure.
-    pub error: EngineError,
+    pub error: Box<EngineError>,
     /// The frames the code passed, innermost first.
     pub trace: Vec<FrameTrace>,
+    /// The label of the block that failed.
+    name: String,
+    /// The source line the failure names, before the caller's offset.
+    line: Option<usize>,
+    /// The line-number offset the caller gave the block.
+    lineofs: i32,
 }
 
 impl ScriptFailure {
-    /// A failure that has not passed a frame.
-    fn before_run(error: EngineError) -> Self {
+    /// A failure raised before the block ran.
+    fn before_run(
+        error: EngineError,
+        name: &str,
+        source: &str,
+        lineofs: i32,
+        line: Option<usize>,
+    ) -> Self {
+        let line = line.or_else(|| match &error {
+            EngineError::Compile(parse) => line_at(source, parse.position()),
+            _ => None,
+        });
         Self {
-            error,
+            error: Box::new(error),
             trace: Vec::new(),
+            name: name.to_string(),
+            line,
+            lineofs,
         }
+    }
+
+    /// The source line the failure names, with the caller's offset applied.
+    ///
+    /// `None` when the failure names no place in the text, which is the case
+    /// for a block that was never compiled.
+    pub fn line(&self) -> Option<usize> {
+        let line = self.line?;
+        let shifted = i64::try_from(line).ok()? + i64::from(self.lineofs);
+        usize::try_from(shifted.max(1)).ok()
+    }
+
+    /// The failure's own message, without the block and line prefix.
+    pub fn message(&self) -> String {
+        match self.error.as_ref() {
+            EngineError::Compile(error) => error.message().to_string(),
+            EngineError::Run(Fault::Raised(raise)) => throw::message_of(raise),
+            EngineError::Run(_) => String::from("script exception"),
+            EngineError::Build(error) => error.to_string(),
+            EngineError::Object(error) => error.to_string(),
+            EngineError::Global(error) => error.clone(),
+            EngineError::Context(error) => error.clone(),
+        }
+    }
+
+    /// The failure as a script diagnostic names it: `block(line): message`.
+    pub fn diagnostic(&self) -> String {
+        match self.line() {
+            Some(line) => format!("{}({line}): {}", self.name, self.message()),
+            None => self.message(),
+        }
+    }
+}
+
+/// How one script entry runs its top-level context.
+///
+/// The defaults run against the engine's global object, at the text's own
+/// lines, and treat an expression's value as required. A caller that supplies
+/// a context makes that object the top-level receiver; a caller that does not
+/// need an expression's value compiles it in a statement context.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScriptOptions {
+    /// The script's `this`, or no context for the global object.
+    pub context: Option<Tjs2ValueId>,
+    /// The line-number offset the caller reports.
+    pub lineofs: i32,
+    /// Whether an expression's value is required.
+    pub result_needed: bool,
+}
+
+/// The host value a runtime answer crosses as.
+///
+/// Scalars cross as themselves. An object crosses as the engine's object
+/// marker when it stands for an engine object (or is `null`); an object the
+/// Rust object model owns has no engine handle, so the answer is refused
+/// rather than reported as an empty value.
+///
+/// # Errors
+///
+/// [`AnswerError::ObjectWithoutHandle`] for an object the Rust object model
+/// owns.
+pub fn host_value(answer: Variant) -> Result<TjsValue, AnswerError> {
+    match answer {
+        Variant::Void => Ok(TjsValue::Void),
+        Variant::Integer(value) => Ok(TjsValue::Integer(value)),
+        Variant::Real(value) => Ok(TjsValue::Real(value)),
+        Variant::String(text) => Ok(TjsValue::String(text.to_string())),
+        Variant::Octet(octet) => Ok(TjsValue::Octet(octet.as_slice().to_vec())),
+        Variant::Object(closure) => {
+            engine_id(&closure)?;
+            Ok(TjsValue::Object)
+        }
+    }
+}
+
+/// The retained value a runtime answer crosses as.
+///
+/// Scalars cross as themselves. An object crosses as a retention of its engine
+/// handle, and `null` crosses as a retention of `null`. An object the Rust
+/// object model owns has no engine handle, so the answer is refused rather
+/// than retained against another object.
+///
+/// # Errors
+///
+/// [`AnswerError::ObjectWithoutHandle`] for an object the Rust object model
+/// owns, and [`AnswerError::Retain`] when the engine refuses the retention.
+pub fn retained_value(engine: &Tjs2Engine, answer: Variant) -> Result<RetainedValue, AnswerError> {
+    match answer {
+        Variant::Void => Ok(RetainedValue::Value(TjsValue::Void)),
+        Variant::Integer(value) => Ok(RetainedValue::Value(TjsValue::Integer(value))),
+        Variant::Real(value) => Ok(RetainedValue::Value(TjsValue::Real(value))),
+        Variant::String(text) => Ok(RetainedValue::Value(TjsValue::String(text.to_string()))),
+        Variant::Octet(octet) => Ok(RetainedValue::Value(TjsValue::Octet(
+            octet.as_slice().to_vec(),
+        ))),
+        Variant::Object(closure) => match engine_id(&closure)? {
+            Some(id) => engine
+                .duplicate_retained(id)
+                .map(RetainedValue::Object)
+                .map_err(AnswerError::Retain),
+            None => engine
+                .retain_null()
+                .map(RetainedValue::Object)
+                .map_err(AnswerError::Retain),
+        },
+    }
+}
+
+/// The engine id a variant's object carries, if it carries one.
+///
+/// `None` is the null object, which crosses as a retained `null`.
+fn engine_id(
+    closure: &crate::vm::runtime::variant::Closure,
+) -> Result<Option<Tjs2ValueId>, AnswerError> {
+    match &closure.object {
+        None => Ok(None),
+        Some(object) => object
+            .engine_id()
+            .map(Some)
+            .ok_or(AnswerError::ObjectWithoutHandle),
     }
 }
 
@@ -98,7 +262,7 @@ impl ScriptFailure {
 /// The compile's failure, the builder's, the code's, or an object entry's; no
 /// step substitutes a value for a failure.
 pub fn run(engine: Rc<Tjs2Engine>, script: &str, name: &str) -> Result<Variant, EngineError> {
-    run_with_members(engine, script, name, global_members()).map_err(|failure| failure.error)
+    run_with_members(engine, script, name, global_members()).map_err(|failure| *failure.error)
 }
 
 /// Compiles `script` and runs its top-level context with a shared global.
@@ -117,9 +281,29 @@ pub fn run_with_members(
     name: &str,
     globals: SharedGlobals,
 ) -> Result<Variant, ScriptFailure> {
-    let image = compile(script, name).map_err(|error| ScriptFailure::before_run(error.into()))?;
-    let block = Block::build(&image).map_err(|error| ScriptFailure::before_run(error.into()))?;
-    run_block(engine, block, globals)
+    run_with_members_options(engine, script, name, globals, ScriptOptions::default())
+}
+
+/// Compiles `script` and runs it with the given global and options.
+///
+/// # Errors
+///
+/// The compile's failure, the builder's, the code's, or an object entry's; a
+/// code failure carries the frames it passed.
+pub fn run_with_members_options(
+    engine: Rc<Tjs2Engine>,
+    script: &str,
+    name: &str,
+    globals: SharedGlobals,
+    options: ScriptOptions,
+) -> Result<Variant, ScriptFailure> {
+    let image = compile(script, name).map_err(|error| {
+        ScriptFailure::before_run(error.into(), name, script, options.lineofs, None)
+    })?;
+    let block = Block::build(&image).map_err(|error| {
+        ScriptFailure::before_run(error.into(), name, script, options.lineofs, None)
+    })?;
+    run_block(engine, block, globals, name, script, options)
 }
 
 /// Compiles `expression` and runs its top-level context.
@@ -132,7 +316,7 @@ pub fn run_with_members(
 /// The compile's failure, the builder's, the code's, or an object entry's; no
 /// step substitutes a value for a failure.
 pub fn eval(engine: Rc<Tjs2Engine>, expression: &str, name: &str) -> Result<Variant, EngineError> {
-    eval_with_members(engine, expression, name, global_members()).map_err(|failure| failure.error)
+    eval_with_members(engine, expression, name, global_members()).map_err(|failure| *failure.error)
 }
 
 /// Compiles `expression` and runs it with a shared global.
@@ -147,10 +331,34 @@ pub fn eval_with_members(
     name: &str,
     globals: SharedGlobals,
 ) -> Result<Variant, ScriptFailure> {
-    let image = compile_expression(expression, name)
-        .map_err(|error| ScriptFailure::before_run(error.into()))?;
-    let block = Block::build(&image).map_err(|error| ScriptFailure::before_run(error.into()))?;
-    run_block(engine, block, globals)
+    let options = ScriptOptions {
+        result_needed: true,
+        ..ScriptOptions::default()
+    };
+    eval_with_members_options(engine, expression, name, globals, options)
+}
+
+/// Compiles `expression` and runs it with the given global and options.
+///
+/// # Errors
+///
+/// The compile's failure, the builder's, the code's, or an object entry's; a
+/// code failure carries the frames it passed.
+pub fn eval_with_members_options(
+    engine: Rc<Tjs2Engine>,
+    expression: &str,
+    name: &str,
+    globals: SharedGlobals,
+    options: ScriptOptions,
+) -> Result<Variant, ScriptFailure> {
+    let image =
+        compile_expression_result(expression, name, options.result_needed).map_err(|error| {
+            ScriptFailure::before_run(error.into(), name, expression, options.lineofs, None)
+        })?;
+    let block = Block::build(&image).map_err(|error| {
+        ScriptFailure::before_run(error.into(), name, expression, options.lineofs, None)
+    })?;
+    run_block(engine, block, globals, name, expression, options)
 }
 
 /// Runs a built block's top-level context against the engine's global object.
@@ -158,30 +366,108 @@ fn run_block(
     engine: Rc<Tjs2Engine>,
     block: Block,
     globals: SharedGlobals,
+    name: &str,
+    source: &str,
+    options: ScriptOptions,
 ) -> Result<Variant, ScriptFailure> {
-    let global_id = engine
-        .global_object()
-        .map_err(|error| ScriptFailure::before_run(EngineError::Global(error)))?;
+    let global_id = engine.global_object().map_err(|error| {
+        ScriptFailure::before_run(
+            EngineError::Global(error),
+            name,
+            source,
+            options.lineofs,
+            None,
+        )
+    })?;
     let global: Rc<dyn Dispatch> = Rc::new(
-        CHandle::with_members(engine, global_id, globals)
-            .map_err(|error| ScriptFailure::before_run(EngineError::Object(error)))?,
+        CHandle::with_members(Rc::clone(&engine), global_id, globals).map_err(|error| {
+            ScriptFailure::before_run(
+                EngineError::Object(error),
+                name,
+                source,
+                options.lineofs,
+                None,
+            )
+        })?,
     );
     let top_level = block
         .top_level()
         .ok_or(BuildError::TopLevel { index: -1 })
-        .map_err(|error| ScriptFailure::before_run(EngineError::Build(error)))?;
+        .map_err(|error| {
+            ScriptFailure::before_run(
+                EngineError::Build(error),
+                name,
+                source,
+                options.lineofs,
+                None,
+            )
+        })?;
     let context = top_level.object().clone();
+    let receiver = match options.context {
+        None => None,
+        Some(id) if id.is_null() => None,
+        Some(id) => {
+            let retained = engine.retain_object_detached(id).map_err(|error| {
+                ScriptFailure::before_run(
+                    EngineError::Context(error),
+                    name,
+                    source,
+                    options.lineofs,
+                    None,
+                )
+            })?;
+            let handle = CHandle::new(Rc::clone(&engine), retained).map_err(|error| {
+                ScriptFailure::before_run(
+                    EngineError::Object(error),
+                    name,
+                    source,
+                    options.lineofs,
+                    None,
+                )
+            })?;
+            Some(Rc::new(handle) as Rc<dyn Dispatch>)
+        }
+    };
     let mut machine = Machine::with_global(global);
     // A top-level context handed no receiver runs with the machine's global
     // object, which is the scope a script's own body runs in.
-    match machine.run_context_traced(&context, None, &[]) {
+    match machine.run_context_traced(&context, receiver, &[]) {
         Ok(answer) => Ok(answer),
         Err(unwind) => {
             let trace = unwind.trace().to_vec();
+            let line = failure_line(&block, source, &trace);
             Err(ScriptFailure {
-                error: EngineError::Run(unwind.fault()),
+                error: Box::new(EngineError::Run(unwind.fault())),
                 trace,
+                name: name.to_string(),
+                line,
+                lineofs: options.lineofs,
             })
         }
     }
+}
+
+/// The source line a failure names, when its innermost frame can be placed in
+/// the block.
+fn failure_line(block: &Block, source: &str, trace: &[FrameTrace]) -> Option<usize> {
+    let frame = trace.first()?;
+    let index = block
+        .contexts()
+        .iter()
+        .position(|record| record.object().name().to_string() == frame.name)
+        .or_else(|| block.top_level_index())?;
+    let position = block.source_position(index, frame.position)?;
+    line_at(source, position)
+}
+
+/// The one-based source line that holds `position`, in UTF-16 code units.
+fn line_at(source: &str, position: i32) -> Option<usize> {
+    let position = usize::try_from(position).ok()?;
+    Some(
+        1 + source
+            .encode_utf16()
+            .take(position)
+            .filter(|unit| *unit == u16::from(b'\n'))
+            .count(),
+    )
 }
