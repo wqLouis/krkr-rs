@@ -152,7 +152,7 @@ pub fn execute(
     code: &Code,
     frame: &mut Frame,
     argv: &[Variant],
-    context: Option<&Rc<ContextObject>>,
+    context: Option<&ContextObject>,
     ip: usize,
     opcode: i32,
 ) -> Result<Variant, Unwind> {
@@ -177,7 +177,7 @@ fn enter(
     code: &Code,
     frame: &mut Frame,
     argv: &[Variant],
-    context: Option<&Rc<ContextObject>>,
+    context: Option<&ContextObject>,
     ip: usize,
 ) -> Result<Variant, Unwind> {
     let distance = operand(code, ip, 1)?;
@@ -274,7 +274,7 @@ fn message_of(raise: &Raise) -> String {
 fn throw(
     frame: &Frame,
     code: &Code,
-    context: Option<&Rc<ContextObject>>,
+    context: Option<&ContextObject>,
     ip: usize,
 ) -> Result<Unwind, Fault> {
     let address = operand(code, ip, 1)?;
@@ -287,7 +287,7 @@ fn throw(
 }
 
 /// The trace line for the frame at `ip`.
-fn line_of(context: Option<&Rc<ContextObject>>, ip: usize) -> FrameTrace {
+fn line_of(context: Option<&ContextObject>, ip: usize) -> FrameTrace {
     let name = match context {
         Some(context) => context.name().to_string(),
         None => String::new(),

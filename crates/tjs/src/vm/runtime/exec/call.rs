@@ -50,9 +50,21 @@
 //! The result register receives what the call answered, and an operand address
 //! of `0` is the discard register: the call still happens and its answer is
 //! dropped. A call that fails raises; it does not answer a false.
+//!
+//! # The one value whose call is code
+//!
+//! A script context is code as well as a member surface, so its call is the one
+//! an object surface cannot answer: the surface has no frame for it, no receiver
+//! held as a value, and no channel for the raise its code makes.
+//! [`Dispatch::context`] is how the instruction finds one, and the call is run
+//! here: a call that names no member runs the context's own body with the
+//! receiver the call hands over, and a call that names one looks the name up
+//! through the value the call was made on and calls what it reaches. Every other
+//! value answers through its own surface.
 
 use std::rc::Rc;
 
+use crate::vm::codegen::context::ContextType;
 use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::natives::string::{OctetError, OctetMember, StringError, StringMember};
 use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
@@ -62,7 +74,7 @@ use crate::vm::runtime::variant::{Closure, Variant};
 
 use super::frame::{Code, Frame};
 use super::member::member_not_found;
-use super::{Fault, Raise};
+use super::{ContextObject, Fault, Machine, Raise};
 
 /// The flag a call instruction writes before an argument that passes one
 /// register: the engine's `fatNormal`.
@@ -89,8 +101,9 @@ pub fn handles(opcode: i32) -> bool {
 /// Executes a call instruction.
 ///
 /// `argv` is the list the calling frame was given, which is what the spread
-/// form reads.
+/// form reads, and `machine` is what runs the code a context callee is.
 pub fn execute(
+    machine: &Machine,
     code: &Code,
     frame: &mut Frame,
     argv: &[Variant],
@@ -124,7 +137,7 @@ pub fn execute(
     };
     let answer = match diverted {
         Some(answer) => answer,
-        None => object_call(opcode, &value, named, &arguments, frame.receiver())?,
+        None => object_call(machine, opcode, &value, named, &arguments, frame.receiver())?,
     };
     if result != 0 {
         frame.set(result, answer)?;
@@ -132,30 +145,99 @@ pub fn execute(
     Ok(())
 }
 
-/// The answer an object gives a call or a construction.
+/// The answer a value gives a call or a construction.
 fn object_call(
+    machine: &Machine,
     opcode: i32,
     value: &Variant,
     named: &TjsString,
     arguments: &[Variant],
     frame_receiver: Option<Rc<dyn Dispatch>>,
 ) -> Result<Variant, Fault> {
+    call_value(
+        machine,
+        value,
+        named,
+        arguments,
+        frame_receiver,
+        opcode == vm::NEW,
+    )
+}
+
+/// The answer a value gives a call, with `receiver` handed over when the value
+/// carries none of its own.
+fn call_value(
+    machine: &Machine,
+    value: &Variant,
+    named: &TjsString,
+    arguments: &[Variant],
+    receiver: Option<Rc<dyn Dispatch>>,
+    construct: bool,
+) -> Result<Variant, Fault> {
     let closure = as_closure(value)?;
     let object = closure.object.clone();
-    // the receiver the callee is handed: the value's own, else the frame's
+    // the receiver the callee is handed: the value's own, else the one the call
+    // hands over
     let receiver = match &closure.objthis {
         Some(objthis) => Some(objthis.clone()),
-        None => frame_receiver,
+        None => receiver,
     };
     let holder = match &object {
-        Some(holder) => holder.as_ref(),
+        Some(holder) => holder.clone(),
         None => return Err(not_callable(Some(named))),
     };
-    let called = match opcode {
-        vm::NEW => holder.create_new(named, Some(arguments), receiver.as_deref()),
-        _ => holder.func_call(named, Some(arguments), receiver.as_deref()),
+    // a value whose call is code is run by the machine, which is the only part
+    // that has a frame to run it in
+    if let Some(context) = holder.context() {
+        if construct {
+            // a context is not a class a script constructs: construction would
+            // run its code with an object it makes, which is not a call
+            return Err(not_callable(Some(named)));
+        }
+        return script_call(machine, context, &holder, named, arguments, receiver);
+    }
+    let called = if construct {
+        holder.create_new(named, Some(arguments), receiver.as_deref())
+    } else {
+        holder.func_call(named, Some(arguments), receiver.as_deref())
     };
     called.map_err(|error| call_fault(error, Some(named), value))
+}
+
+/// The answer a value whose call is code gives.
+///
+/// A context is code: a call that names no member runs the context's own body,
+/// and a call that names one is the member the name reaches — the context's own
+/// store, then its parent's, and, through the frame's own `this` view, the
+/// object behind the context — called with no name of its own.
+fn script_call(
+    machine: &Machine,
+    context: &ContextObject,
+    holder: &Rc<dyn Dispatch>,
+    named: &TjsString,
+    arguments: &[Variant],
+    receiver: Option<Rc<dyn Dispatch>>,
+) -> Result<Variant, Fault> {
+    // a property's context is not callable: the engine answers the invalid type
+    if context.kind() == ContextType::Property {
+        return Err(not_callable(Some(named)));
+    }
+    if named.is_empty() {
+        return machine.call_context(context, receiver, arguments);
+    }
+    // the receiver a named call works on: the one the call hands over, and the
+    // object the call was made on when it hands over none
+    let receiver = match receiver {
+        Some(receiver) => Some(receiver),
+        None => Some(holder.clone()),
+    };
+    let member = holder
+        .prop_get(named, MemberFlags::NONE, receiver.as_deref())
+        .map_err(|error| lookup_fault(error, named))?;
+    // the member is called with no name of its own, which is what the engine's
+    // base object does once the lookup has answered
+    let none = TjsString::new();
+    call_value(machine, &member, &none, arguments, receiver, false)
 }
 
 /// The answer a text gives a member call.
@@ -382,6 +464,18 @@ fn not_callable(name: Option<&TjsString>) -> Fault {
     Fault::Raised(Raise::NotCallable {
         name: name.cloned().unwrap_or_default(),
     })
+}
+
+/// The raise a name a call reaches answers when the lookup fails.
+///
+/// A name the callee does not hold is the language's own failure, which a script
+/// can catch, and the message names the member; any other failure of the object
+/// is the object's own.
+fn lookup_fault(error: ObjectError, name: &TjsString) -> Fault {
+    match error {
+        ObjectError::MemberNotFound => member_not_found(name),
+        other => Fault::Object(other),
+    }
 }
 
 /// The raise for an expansion whose value is not an array.
@@ -1020,6 +1114,264 @@ mod tests {
                 "the instruction {opcode} diverted"
             );
         }
+    }
+
+    /// The body a context runs: `%2 = %-1.base + %-3`, which is the receiver's
+    /// member and the first declared argument.
+    fn receiver_and_argument_code() -> Code {
+        Code {
+            code: vec![
+                vm::GPD,
+                register(2),
+                register(-1),
+                register(0),
+                vm::ADD,
+                register(2),
+                register(-3),
+                vm::SRV,
+                register(2),
+                vm::RET,
+            ],
+            data: vec![Variant::String(TjsString::from("base"))],
+            max_variable_count: 1,
+            variable_reserve_count: 2,
+            max_frame_count: 2,
+            func_decl_arg_count: 1,
+            ..Code::default()
+        }
+    }
+
+    /// A script context is code: an unnamed call runs its body with the receiver
+    /// the call hands it and the arguments the caller passed
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2788-2797`,
+    /// `:704-731` for the argument layout).
+    #[test]
+    fn an_unnamed_call_of_a_context_runs_its_code() {
+        let context = Rc::new(ContextObject::new(
+            receiver_and_argument_code(),
+            ContextType::Function,
+            "f",
+        ));
+        let this = Rc::new(CustomObject::new(Vec::new()));
+        this.prop_set(
+            &TjsString::from("base"),
+            MemberFlags::ENSURE,
+            &Variant::Integer(100),
+            None,
+        )
+        .expect("the receiver holds the member");
+        let this: Rc<dyn Dispatch> = this;
+        let callee: Rc<dyn Dispatch> = context;
+        let code = code_of(
+            vec![
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::CONST,
+                register(3),
+                register(1),
+                vm::CALL,
+                register(2),
+                register(1),
+                1,
+                register(3),
+                vm::SRV,
+                register(2),
+                vm::RET,
+            ],
+            vec![
+                Variant::Object(Closure {
+                    object: Some(callee),
+                    objthis: None,
+                }),
+                Variant::Integer(41),
+            ],
+        );
+        let answer = run(&code, Some(this), &[]).expect("the call runs");
+        assert!(
+            super::super::op::discern_equals(&answer, &Variant::Integer(141)),
+            "the receiver's member plus the argument: 100 + 41"
+        );
+    }
+
+    /// A named call of a context is the member the name reaches, called with no
+    /// name of its own (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2809-2821`).
+    #[test]
+    fn a_named_call_of_a_context_calls_the_member_it_names() {
+        let member = Rc::new(ContextObject::new(
+            Code {
+                code: vec![
+                    vm::CONST,
+                    register(1),
+                    register(0),
+                    vm::SRV,
+                    register(1),
+                    vm::RET,
+                ],
+                data: vec![Variant::Integer(7)],
+                variable_reserve_count: 2,
+                max_frame_count: 1,
+                ..Code::default()
+            },
+            ContextType::Function,
+            "m",
+        ));
+        let holder = Rc::new(ContextObject::new(Code::default(), ContextType::Class, "C"));
+        let member: Rc<dyn Dispatch> = member;
+        holder
+            .define(
+                &TjsString::from("m"),
+                Variant::Object(Closure {
+                    object: Some(member),
+                    objthis: None,
+                }),
+            )
+            .expect("the member is stored");
+        let callee: Rc<dyn Dispatch> = holder;
+        let code = code_of(
+            vec![
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::CALLD,
+                register(2),
+                register(1),
+                register(1),
+                0,
+                vm::SRV,
+                register(2),
+                vm::RET,
+            ],
+            vec![
+                Variant::Object(Closure {
+                    object: Some(callee),
+                    objthis: None,
+                }),
+                Variant::String(TjsString::from("m")),
+            ],
+        );
+        let answer = run(&code, None, &[]).expect("the call runs");
+        assert!(
+            super::super::op::discern_equals(&answer, &Variant::Integer(7)),
+            "the member answered seven"
+        );
+    }
+
+    /// A name a context does not hold is a missing member, which a script can
+    /// catch (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2248-2250`).
+    #[test]
+    fn a_named_call_of_a_context_that_holds_no_such_member_raises() {
+        let callee: Rc<dyn Dispatch> =
+            Rc::new(ContextObject::new(Code::default(), ContextType::Class, "C"));
+        let code = code_of(
+            vec![
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::CALLD,
+                register(2),
+                register(1),
+                register(1),
+                0,
+                vm::RET,
+            ],
+            vec![
+                Variant::Object(Closure {
+                    object: Some(callee),
+                    objthis: None,
+                }),
+                Variant::String(TjsString::from("nope")),
+            ],
+        );
+        assert!(
+            matches!(
+                run(&code, None, &[]),
+                Err(Fault::Raised(Raise::MemberNotFound { name }))
+                    if name == TjsString::from("nope")
+            ),
+            "the missing member raises its own name"
+        );
+    }
+
+    /// A property's context is not callable: the engine answers the invalid type
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:2799-2801`).
+    #[test]
+    fn a_property_context_is_not_callable() {
+        let callee: Rc<dyn Dispatch> = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::Property,
+            "p",
+        ));
+        let code = one_call(
+            &[vm::CALL, register(2), register(1), 0],
+            vec![Variant::Object(Closure {
+                object: Some(callee),
+                objthis: None,
+            })],
+        );
+        assert!(
+            matches!(
+                run(&code, None, &[]),
+                Err(Fault::Raised(Raise::NotCallable { .. }))
+            ),
+            "a property is not a function"
+        );
+    }
+
+    /// A call made on the frame's own `this` view: the context in front holds no
+    /// such member, so the object behind the context answers, which is the
+    /// engine's own view rule
+    /// (`reference/krkr2/cpp/core/tjs2/tjsInterCodeExec.cpp:239-247`).
+    #[test]
+    fn a_named_call_through_the_this_view_reaches_the_object_behind_the_context() {
+        let primary: Rc<dyn Dispatch> = Rc::new(ContextObject::new(
+            Code::default(),
+            ContextType::TopLevel,
+            "global",
+        ));
+        let callee = Callee::new(Variant::Integer(9));
+        let behind = Rc::new(CustomObject::new(Vec::new()));
+        behind
+            .prop_set(
+                &TjsString::from("f"),
+                MemberFlags::ENSURE,
+                &value(&callee, None),
+                None,
+            )
+            .expect("the object behind the context holds the member");
+        let behind: Rc<dyn Dispatch> = behind;
+        let view: Rc<dyn Dispatch> =
+            Rc::new(super::super::ObjThisContext::new(primary, Some(behind)));
+        let code = code_of(
+            vec![
+                vm::CONST,
+                register(1),
+                register(0),
+                vm::CALLD,
+                register(2),
+                register(1),
+                register(1),
+                0,
+                vm::SRV,
+                register(2),
+                vm::RET,
+            ],
+            vec![
+                Variant::Object(Closure {
+                    object: Some(view),
+                    objthis: None,
+                }),
+                Variant::String(TjsString::from("f")),
+            ],
+        );
+        let answer = run(&code, None, &[]).expect("the call runs");
+        assert!(
+            super::super::op::discern_equals(&answer, &Variant::Integer(9)),
+            "the object behind the context answered"
+        );
+        let (called, name, _, _) = callee.seen();
+        assert_eq!(called, 1, "the member value was called once");
+        assert_eq!(name, "", "a member is called with no name of its own");
     }
 
     /// The four opcodes are the ones handled, and no others.

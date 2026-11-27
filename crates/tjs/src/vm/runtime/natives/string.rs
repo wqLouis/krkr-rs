@@ -52,7 +52,7 @@ pub enum StringMember {
     Substr,
     /// The text a format string builds from the parameters.
     Sprintf,
-    /// The text with a pattern's matches replaced by another text.
+    /// The text with a pattern's matches expressed as another text.
     Replace,
     /// The text with its control units and quotes escaped.
     Escape,

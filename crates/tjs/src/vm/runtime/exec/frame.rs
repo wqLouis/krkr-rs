@@ -372,6 +372,13 @@ impl Dispatch for ObjThisContext {
         self.primary.invalidate()
     }
 
+    /// A view that stands in front of a context is the same call: the code a call
+    /// runs is the primary's, and the name is looked up through the view, so an
+    /// object behind the context answers a name the context does not hold.
+    fn context(&self) -> Option<&super::ContextObject> {
+        self.primary.context()
+    }
+
     fn func_call(
         &self,
         name: &TjsString,

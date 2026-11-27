@@ -33,6 +33,16 @@
 //! `CHGTHIS` is what makes a declared function a method: a receiver is a
 //! property of the closure, so rebinding it is enough to change what the
 //! function sees as `this`, including inside a block it calls.
+//!
+//! # The call
+//!
+//! A context is code, so a call of one is not a member surface's to answer: the
+//! code needs a frame, the receiver as a value, and the machine that runs it.
+//! [`Dispatch::context`] is how the caller finds the context it asks about, and
+//! the machine runs the body — an unnamed call with the receiver the call hands
+//! over, and a named call as the member the name reaches. This module therefore
+//! answers no call at all, and its surface is the member store and the class
+//! names.
 
 use std::cell::RefCell;
 use std::rc::{Rc, Weak};
@@ -67,7 +77,7 @@ pub fn handles(opcode: i32) -> bool {
 pub fn execute(
     code: &Code,
     frame: &mut Frame,
-    context: Option<&Rc<ContextObject>>,
+    context: Option<&ContextObject>,
     global: Option<&Rc<dyn Dispatch>>,
     ip: usize,
     opcode: i32,
@@ -151,7 +161,7 @@ pub fn execute(
 /// whose value is an object has its receiver rebound to the destination, so a
 /// class's functions become the instance's methods. The walk ignores properties:
 /// it publishes the values, not what a property would answer.
-fn publish(context: &Rc<ContextObject>, frame: &mut Frame) -> Result<(), Fault> {
+fn publish(context: &ContextObject, frame: &mut Frame) -> Result<(), Fault> {
     let destination = match frame.receiver() {
         Some(destination) => destination,
         None => {
@@ -187,10 +197,10 @@ fn publish(context: &Rc<ContextObject>, frame: &mut Frame) -> Result<(), Fault> 
 
 /// The object one code context is.
 ///
-/// It answers the members its store holds and, for a class, its parent's; it
-/// answers its own name and its parents' for a question about classes; and it
-/// answers no call, because running its code needs a frame this surface cannot
-/// be handed.
+/// It answers the members its store holds and, for a class, its parent's, and it
+/// answers its own name and its parents' for a question about classes. It is also
+/// code: [`Dispatch::context`] answers the context itself, and the machine runs
+/// the code, because a call of it needs a frame this surface cannot be handed.
 pub struct ContextObject {
     /// The code the context runs.
     code: Code,
@@ -371,35 +381,10 @@ impl Dispatch for ContextObject {
         self.members.invalidate()
     }
 
-    /// A context answers no call here.
-    ///
-    /// Running its code needs three things this surface does not carry: the
-    /// receiver as an owned handle (a frame's `this` register holds a value, so a
-    /// borrowed receiver cannot be placed in it), the machine the call runs in,
-    /// and a failure channel that can carry the code's own raise — the object
-    /// surface offers an object error instead. A context does not even hold a
-    /// handle to itself to hand [`super::Machine::run_context`], because a call
-    /// reaches it by `&self`. The call instruction is where all three are in
-    /// hand: it owns the callee's closure, it runs inside a machine, and it can
-    /// answer a [`Fault`].
-    fn func_call(
-        &self,
-        _name: &TjsString,
-        _argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
-    ) -> Result<Variant, ObjectError> {
-        Err(ObjectError::CallNotServed)
-    }
-
-    /// A context is not a class a script constructs: construction runs the
-    /// context's own code, which is the same frame problem.
-    fn create_new(
-        &self,
-        _name: &TjsString,
-        _argv: Option<&[Variant]>,
-        _objthis: Option<&dyn Dispatch>,
-    ) -> Result<Variant, ObjectError> {
-        Err(ObjectError::CallNotServed)
+    /// A context is code: the caller that has a machine runs its body, and this
+    /// surface has neither the frame nor the raise for it.
+    fn context(&self) -> Option<&ContextObject> {
+        Some(self)
     }
 }
 

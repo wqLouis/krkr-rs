@@ -6,17 +6,24 @@
 //! end that produces the intermediate code is `super::codegen`.
 //!
 //! The runtime is built one part at a time, bottom up, and the module grows
-//! with it. What it holds today is the **value layer**:
+//! with it. What it holds today is the value layer, the object model and the
+//! interpreter that runs a compiled block:
 //!
 //! | part | module | what it is |
 //! |---|---|---|
 //! | the string | [`string`] | the heap string a script's text values are |
 //! | the number conversion | [`number`] | the text-to-number rules a string's arithmetic uses |
 //! | the member table | [`hash`] | the table an object's members are stored in |
+//! | the object model | [`object`] | the member surface and the objects that hold members |
+//! | the variant | [`variant`] | the value a script holds, and its operators |
+//! | the interpreter | [`exec`] | the frame and the instructions a compiled block runs |
+//! | the engine adapter | [`bridge`] | an object the engine owns, seen as a dispatch object |
+//! | the script entry | [`engine`] | script text in, the top-level call out |
 //!
-//! Every part is safe Rust with no global state and no raw pointers: a
-//! value owns its storage and is borrowed or cloned, never passed as a
-//! handle a caller must free.
+//! Every part of the runtime is safe Rust: a value owns its storage and is
+//! borrowed or cloned, never passed as a handle a caller must free. The two
+//! modules that reach the engine — [`bridge`] and [`engine`] — do so through
+//! the crate's safe wrapper, so no raw pointer is named here.
 //!
 //! # The order the runtime is built in
 //!
@@ -45,7 +52,9 @@
 #![deny(unsafe_code)]
 
 pub mod array;
+pub mod bridge;
 pub mod dictionary;
+pub mod engine;
 pub mod exec;
 pub mod hash;
 pub mod member;

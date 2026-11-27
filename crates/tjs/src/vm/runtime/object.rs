@@ -40,6 +40,7 @@ use super::member::MemberMap;
 use super::number::Number;
 use super::string::TjsString;
 use super::variant::Variant;
+use crate::Tjs2ValueId;
 
 /// What a member surface call is asked to do.
 ///
@@ -298,6 +299,19 @@ pub trait Dispatch {
     /// the class question read that one list.
     fn add_class_name(&self, name: &TjsString) -> Result<(), ObjectError>;
 
+    /// The engine's retained id for the object, when the object stands for
+    /// one.
+    ///
+    /// An object the engine owns — the one a script's value names, reached
+    /// through the engine's interface — answers the id the engine knows it
+    /// by, so a value that holds it can cross into an engine call. Every
+    /// object the Rust object model owns answers `None`: it has no engine id,
+    /// and none is invented from its address, because an address is not a
+    /// handle.
+    fn engine_id(&self) -> Option<Tjs2ValueId> {
+        None
+    }
+
     /// Whether the object is still usable.
     fn is_valid(&self) -> bool;
 
@@ -314,6 +328,9 @@ pub trait Dispatch {
     /// not a function cannot serve the call and answers
     /// [`ObjectError::CallNotServed`], which is the engine's own refusal for a
     /// value it cannot invoke.
+    ///
+    /// A value whose call runs code is not served here: the caller asks
+    /// [`Self::context`] first and runs the code itself.
     fn func_call(
         &self,
         _name: &TjsString,
@@ -321,6 +338,19 @@ pub trait Dispatch {
         _objthis: Option<&dyn Dispatch>,
     ) -> Result<Variant, ObjectError> {
         Err(ObjectError::CallNotServed)
+    }
+
+    /// The script context this object's calls run, when its calls run code.
+    ///
+    /// A context is code as well as a member surface: its call needs a frame, a
+    /// receiver held as a value, and the machine that runs it, none of which this
+    /// surface carries. A caller that has them asks this before it asks
+    /// [`Self::func_call`], so the value whose call is code is found by the
+    /// machine that can run it. A view that stands in front of a context answers
+    /// the same call, because the name a call reaches is looked up through the
+    /// view.
+    fn context(&self) -> Option<&crate::vm::runtime::exec::ContextObject> {
+        None
     }
 
     /// Constructs an object.

@@ -51,6 +51,7 @@ use std::cell::{Ref, RefCell};
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+use crate::vm::codegen::context::ContextType;
 use crate::vm::codegen::opcode::vm;
 use crate::vm::runtime::object::{Dispatch, MemberFlags, ObjectError};
 use crate::vm::runtime::string::TjsString;
@@ -336,10 +337,26 @@ impl Machine {
     ///
     /// This is the entry a context object is invoked through: the object's code
     /// runs with `receiver` as its `this`, and the object itself is the context
-    /// the member registration publishes.
+    /// the member registration publishes. A top-level context that is handed no
+    /// receiver runs with the machine's global object, which is the scope a
+    /// script's own body runs in.
     pub fn run_context(
         &mut self,
-        context: &Rc<ContextObject>,
+        context: &ContextObject,
+        receiver: Option<Rc<dyn Dispatch>>,
+        argv: &[Variant],
+    ) -> Result<Variant, Fault> {
+        self.call_context(context, receiver, argv)
+    }
+
+    /// Runs one call of a context object's code from inside this machine.
+    ///
+    /// A call instruction runs the code of the value it calls while it is itself
+    /// borrowing the machine, so the entry it reaches borrows the machine: the
+    /// page pool is behind a cell and nothing else about it changes.
+    fn call_context(
+        &self,
+        context: &ContextObject,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
     ) -> Result<Variant, Fault> {
@@ -355,10 +372,17 @@ impl Machine {
     fn run_frame(
         &self,
         code: &Code,
-        context: Option<&Rc<ContextObject>>,
+        context: Option<&ContextObject>,
         receiver: Option<Rc<dyn Dispatch>>,
         argv: &[Variant],
     ) -> Result<Variant, Fault> {
+        // the scope a context's own code runs in: the receiver the call hands it,
+        // and the global object when a top-level context is handed none
+        let top_level = context.is_some_and(|context| context.kind() == ContextType::TopLevel);
+        let receiver = match receiver {
+            None if top_level => self.global.clone(),
+            receiver => receiver,
+        };
         let block = self.blocks.borrow_mut().allocate(code.block_len()?);
         let mut frame = Frame::new(block, code, receiver, self.global.clone(), argv)?;
         let answer = self.execute(code, &mut frame, argv, context, 0);
@@ -376,7 +400,7 @@ impl Machine {
         code: &Code,
         frame: &mut Frame,
         argv: &[Variant],
-        context: Option<&Rc<ContextObject>>,
+        context: Option<&ContextObject>,
         start: usize,
     ) -> Result<Variant, throw::Unwind> {
         let mut ip: usize = start;
@@ -590,7 +614,7 @@ impl Machine {
                 // the member instructions, then the two families, and then the
                 // parts another part owns
                 _ if member::handles(opcode) => member::execute(code, frame, ip, opcode)?,
-                _ if call::handles(opcode) => call::execute(code, frame, argv, ip, opcode)?,
+                _ if call::handles(opcode) => call::execute(self, code, frame, argv, ip, opcode)?,
                 // an exit from a protected region ends the context with the result
                 // the stream has stored so far
                 vm::EXTRY => return Ok(result),
@@ -637,10 +661,14 @@ impl Machine {
         let top = block
             .top_level()
             .ok_or(Fault::Broken("an evaluated script has no top level"))?;
-        // the scope the text runs in: this frame's receiver, and the global object
-        // when the frame has none
-        let receiver = frame.receiver().or_else(|| self.global.clone());
-        let answer = self.run_frame(top.object().code(), Some(top.object()), receiver, &[])?;
+        // the scope the text runs in is this frame's receiver, which the frame
+        // entry turns into the global object when the frame has none
+        let answer = self.run_frame(
+            top.object().code(),
+            Some(top.object()),
+            frame.receiver(),
+            &[],
+        )?;
         Ok(result_needed.then_some(answer))
     }
 

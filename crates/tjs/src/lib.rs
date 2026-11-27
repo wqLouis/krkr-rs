@@ -1076,6 +1076,28 @@ impl std::fmt::Debug for MemberRead {
     }
 }
 
+/// The shapes one member read tells apart.
+///
+/// [`MemberRead`] folds an absent member, a member that holds `void` and a
+/// member that holds `null` into [`MemberRead::Void`]. The runtime has to tell
+/// the three apart — an absent member raises where a `void` member answers the
+/// empty variant — so it reads through this shape and the public
+/// [`MemberRead`] is projected from it.
+pub(crate) enum MemberShape {
+    /// The member does not exist.
+    Absent,
+    /// The member holds the empty variant.
+    Void,
+    /// The member holds `null`.
+    Null,
+    /// The member holds an object; the handle owns the retention.
+    Object(DetachedValue),
+    /// The member holds a byte string; the bytes are a copy of the variant's.
+    Octet(Vec<u8>),
+    /// The member holds an integer, a real or a text.
+    Scalar(TjsValue),
+}
+
 /// Result of [`Tjs2Engine::eval_retained`] /
 /// [`Tjs2Engine::exec_script_retained_with_context`].
 ///
@@ -2565,11 +2587,12 @@ name), and none was available"
             .map_err(|_| "class name contains a NUL byte".to_string())?;
         let mut answer: c_int = 0;
         let mut error: *mut c_char = ptr::null_mut();
-        // SAFETY: self.inner is a live engine and id is a live retained id;
-        // the class name follows the ABI contract for the duration of the
-        // call.
-        let rc =
-            unsafe { tjs2_is_instance_of(self.inner, id, class.as_ptr(), &mut answer, &mut error) };
+        let rc = {
+            // SAFETY: self.inner is a live engine and id is a live retained
+            // id; the class name follows the ABI contract for the duration
+            // of the call.
+            unsafe { tjs2_is_instance_of(self.inner, id, class.as_ptr(), &mut answer, &mut error) }
+        };
         if rc != 0 {
             return Err(take_error_string(error));
         }
@@ -2863,23 +2886,53 @@ name), and none was available"
     ///
     /// The member is read through `PropGet` with the ordinary flags, so a
     /// property's getter runs and an array's numeric member is the element
-    /// it names.
+    /// it names. The retention of an object answer belongs to the returned
+    /// [`MemberRead::Object`].
     ///
     /// # Errors
     ///
     /// The VM's own error when the read raises, and a message when the
     /// member holds an object that cannot be retained.
     pub fn member_read(&self, id: Tjs2ValueId, membername: &str) -> Result<MemberRead, String> {
-        let raw = match self.member_raw(id, membername, 0) {
+        Ok(match self.member_read_exact(id, membername, 0)? {
+            MemberShape::Absent | MemberShape::Void | MemberShape::Null => MemberRead::Void,
+            MemberShape::Object(object) => MemberRead::Object(object),
+            MemberShape::Octet(bytes) => MemberRead::Octet(bytes),
+            MemberShape::Scalar(value) => MemberRead::Scalar(value),
+        })
+    }
+
+    /// Read a named property with an explicit `PropGet` flag set, keeping
+    /// absence, `void` and `null` apart.
+    ///
+    /// `flags` is the TJS `PropGet` flag set: [`TJS_IGNOREPROP`] reads a
+    /// property's own value, and [`TJS_MEMBERMUSTEXIST`] makes an absent
+    /// member an error rather than the empty variant. A dictionary answers an
+    /// absent member with `void` unless `TJS_MEMBERMUSTEXIST` is asked for,
+    /// which is why the flag travels with the read.
+    ///
+    /// # Errors
+    ///
+    /// The VM's own error when the read raises, and a message when the member
+    /// holds an object that cannot be retained or a byte string with no byte
+    /// payload.
+    pub(crate) fn member_read_exact(
+        &self,
+        id: Tjs2ValueId,
+        membername: &str,
+        flags: c_uint,
+    ) -> Result<MemberShape, String> {
+        let raw = match self.member_raw(id, membername, flags) {
             Ok(raw) => raw,
-            // A member that does not exist reads as void, the way a script
-            // read of an absent member does: the VM raises
-            // `Member "%1" does not exist`.
-            Err(error) if is_missing_member(&error) => return Ok(MemberRead::Void),
+            // A member that does not exist raises `Member "%1" does not
+            // exist`; the read keeps that apart from a member that holds the
+            // empty variant.
+            Err(error) if is_missing_member(&error) => return Ok(MemberShape::Absent),
             Err(error) => return Err(error),
         };
         match raw.ty {
-            VAL_VOID | VAL_NULL => Ok(MemberRead::Void),
+            VAL_VOID => Ok(MemberShape::Void),
+            VAL_NULL => Ok(MemberShape::Null),
             VAL_OBJECT => {
                 // The VM keeps the object it produced in the engine's
                 // most-recent-object slot, and the retention resolves
@@ -2890,7 +2943,7 @@ name), and none was available"
                 if id.is_null() {
                     return Err("member read: the object could not be retained".into());
                 }
-                Ok(MemberRead::Object(DetachedValue {
+                Ok(MemberShape::Object(DetachedValue {
                     engine: self.inner,
                     id,
                 }))
@@ -2899,7 +2952,7 @@ name), and none was available"
                 // A zero-length octet is an empty file: it carries no bytes
                 // and is not a failure.
                 if raw.array_count == 0 && !raw.string.is_null() {
-                    return Ok(MemberRead::Octet(Vec::new()));
+                    return Ok(MemberShape::Octet(Vec::new()));
                 }
                 // The octet's bytes live in the engine's last-string buffer
                 // and are valid until the next engine call, so they are
@@ -2915,9 +2968,9 @@ name), and none was available"
                         return Err("member read: the octet value has no bytes".into());
                     }
                 };
-                Ok(MemberRead::Octet(bytes))
+                Ok(MemberShape::Octet(bytes))
             }
-            _ => Ok(MemberRead::Scalar(take_value(&raw))),
+            _ => Ok(MemberShape::Scalar(take_value(&raw))),
         }
     }
 
@@ -3506,7 +3559,7 @@ fn take_error(e: *mut c_char) -> TjsError {
 /// The VM's own message names it: `Member "%1" does not exist`. Only that
 /// shape is an absent member: an error of the script's own that happens to
 /// carry the same words travels as the error it is.
-fn is_missing_member(error: &str) -> bool {
+pub(crate) fn is_missing_member(error: &str) -> bool {
     error.starts_with("Member \"") && error.ends_with("\" does not exist")
 }
 
